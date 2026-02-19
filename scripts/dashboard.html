@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Car System Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
+  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
+  #conn-dot { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; flex-shrink: 0; }
+  #conn-dot.stale { background: #f85149; }
+  #uptime { margin-left: auto; color: #8b949e; font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .card-header { background: #21262d; padding: 10px 16px; font-weight: 600; font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #30363d; display: flex; align-items: center; justify-content: space-between; }
+  .card-body { padding: 12px 16px; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #21262d; }
+  .row:last-child { border-bottom: none; }
+  .label { color: #8b949e; }
+  .value { font-weight: 500; font-variant-numeric: tabular-nums; }
+  .badge { padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .green  { color: #3fb950; }
+  .yellow { color: #e3b341; }
+  .red    { color: #f85149; }
+  .grey   { color: #6e7681; }
+  .bg-green  { background: #1a3d1f; color: #3fb950; }
+  .bg-yellow { background: #3d2e0a; color: #e3b341; }
+  .bg-red    { background: #3d0f0a; color: #f85149; }
+  .bg-grey   { background: #21262d; color: #6e7681; }
+  .big { font-size: 28px; font-weight: 700; text-align: center; padding: 8px 0 4px; }
+  .sub { font-size: 11px; color: #8b949e; text-align: center; margin-bottom: 8px; }
+  .hz-bar-bg { background: #21262d; border-radius: 4px; height: 6px; margin-top: 4px; overflow: hidden; }
+  .hz-bar    { height: 6px; border-radius: 4px; transition: width .4s; }
+  .divider   { border: none; border-top: 1px solid #21262d; margin: 8px 0; }
+  .card-wide { grid-column: span 2; }
+  .sens-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  .sens-table th { color: #6e7681; font-weight: 600; text-align: left; padding: 4px 6px; border-bottom: 1px solid #30363d; white-space: nowrap; }
+  .sens-table td { padding: 4px 6px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
+  .sens-table tr:last-child td { border-bottom: none; }
+  .init-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+  .init-cell { background: #21262d; border-radius: 6px; padding: 6px 10px; }
+  .init-cell .ilabel { font-size: 11px; color: #6e7681; }
+  .init-cell .ival { font-size: 13px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <div id="conn-dot"></div>
+  <h1>Car System Dashboard</h1>
+  <span id="uptime"></span>
+</header>
+<div class="grid" id="grid">
+  <!-- cards injected by JS -->
+</div>
+<script>
+const STALE_SEC = 1.5;
+
+function fixClass(label) {
+  if (label === 'RTK FIXED')  return 'bg-green';
+  if (label === 'RTK FLOAT')  return 'bg-yellow';
+  if (label.includes('FIX'))  return 'bg-yellow';
+  return 'bg-red';
+}
+function fusionClass(label) {
+  if (label === 'FUSION')    return 'bg-green';
+  if (label === 'INIT')      return 'bg-yellow';
+  if (label === 'SUSPENDED') return 'bg-yellow';
+  if (label === 'DISABLED')  return 'bg-red';
+  return 'bg-grey';
+}
+function initClass(label) {
+  if (label === 'initialized')  return 'green';
+  if (label === 'initializing') return 'yellow';
+  return 'grey';
+}
+function hzClass(hz) {
+  if (hz > 5)  return 'green';
+  if (hz > 0)  return 'yellow';
+  return 'red';
+}
+function staleSec(last_recv) {
+  if (last_recv === null || last_recv === undefined) return Infinity;
+  return (Date.now() / 1000) - last_recv;
+}
+function fmt(v, dec = 2) {
+  return typeof v === 'number' ? v.toFixed(dec) : '—';
+}
+function bool_badge(v) {
+  return v ? '<span class="badge bg-green">ACTIVE</span>' : '<span class="badge bg-grey">OFF</span>';
+}
+function hz_badge(hz, stale) {
+  const cls = stale > STALE_SEC ? 'red' : hzClass(hz);
+  return `<span class="value ${cls}">${hz.toFixed(1)} Hz</span>`;
+}
+function row(label, value) {
+  return `<div class="row"><span class="label">${label}</span><span>${value}</span></div>`;
+}
+function stale_overlay(isStale) {
+  return isStale ? '<span class="badge bg-red">STALE</span>' : '';
+}
+function acc_color(m) {
+  return m < 0.05 ? 'green' : m < 0.5 ? 'yellow' : 'red';
+}
+
+function render(s) {
+  const g = s.gnss;
+  const v = s.vehicle;
+  const e = s.esf;
+  const t = s.topics;
+
+  const gnssStale = staleSec(t['/gnss/fix'].last_recv);
+  const velStale  = staleSec(t['/gnss/velocity'].last_recv);
+  const vsStale   = staleSec(t['/vehicle/state'].last_recv);
+  const esfStale  = staleSec(t['/gnss/esf_status'].last_recv);
+
+  // ---- GNSS Fix card ----
+  const gnssCard = `
+    <div class="card">
+      <div class="card-header">GNSS Fix ${stale_overlay(gnssStale > STALE_SEC)}</div>
+      <div class="card-body">
+        <div class="row"><span class="label">Status</span>
+          <span class="badge ${gnssStale > STALE_SEC ? 'bg-grey' : fixClass(g.fix_label)}">${g.fix_label}</span></div>
+        ${row('Latitude',  `<span class="value">${fmt(g.latitude, 7)}&deg;</span>`)}
+        ${row('Longitude', `<span class="value">${fmt(g.longitude, 7)}&deg;</span>`)}
+        ${row('Altitude',  `<span class="value">${fmt(g.altitude_m, 2)} m</span>`)}
+        <hr class="divider">
+        ${row('Horiz Acc', `<span class="value ${acc_color(g.h_acc_m)}">${fmt(g.h_acc_m, 3)} m</span>`)}
+        ${row('Vert Acc',  `<span class="value ${acc_color(g.v_acc_m)}">${fmt(g.v_acc_m, 3)} m</span>`)}
+      </div>
+    </div>`;
+
+  // ---- GNSS Velocity + Position card ----
+  const velCard = `
+    <div class="card">
+      <div class="card-header">GNSS Velocity ${stale_overlay(velStale > STALE_SEC)}</div>
+      <div class="card-body">
+        <div class="big ${velStale > STALE_SEC ? 'grey' : 'green'}">${fmt(g.ground_speed_mps, 2)}</div>
+        <div class="sub">Ground Speed (m/s) &nbsp;|&nbsp; ${fmt(g.ground_speed_mps * 3.6, 1)} km/h</div>
+        ${row('Vel North', `<span class="value">${fmt(g.vel_n_mps, 3)} m/s</span>`)}
+        ${row('Vel East',  `<span class="value">${fmt(g.vel_e_mps, 3)} m/s</span>`)}
+        ${row('Vel Down',  `<span class="value">${fmt(g.vel_d_mps, 3)} m/s</span>`)}
+        <hr class="divider">
+        ${row('Local X',  `<span class="value">${fmt(g.pos_x_m, 2)} m</span>`)}
+        ${row('Local Y',  `<span class="value">${fmt(g.pos_y_m, 2)} m</span>`)}
+        ${row('Local Z',  `<span class="value">${fmt(g.pos_z_m, 2)} m</span>`)}
+        ${row('Heading',  `<span class="value">${fmt(g.heading_deg, 1)}&deg;</span>`)}
+      </div>
+    </div>`;
+
+  // ---- Vehicle State card ----
+  const wheelAvg  = (v.wheel_left_mps + v.wheel_right_mps) / 2;
+  const wheelDiff = Math.abs(v.wheel_left_mps - v.wheel_right_mps);
+  const vsCard = `
+    <div class="card">
+      <div class="card-header">Vehicle State ${stale_overlay(vsStale > STALE_SEC)}</div>
+      <div class="card-body">
+        <div class="big ${vsStale > STALE_SEC ? 'grey' : 'green'}">${fmt(v.v_ego_kmh, 1)}</div>
+        <div class="sub">Speed (km/h)</div>
+        ${row('Steering Angle',  `<span class="value">${fmt(v.steering_deg, 1)}&deg;</span>`)}
+        ${row('Steering Torque', `<span class="value">${fmt(v.steering_torque, 3)}</span>`)}
+        <hr class="divider">
+        ${row('Wheel Left',  `<span class="value">${fmt(v.wheel_left_mps, 3)} m/s</span>`)}
+        ${row('Wheel Right', `<span class="value">${fmt(v.wheel_right_mps, 3)} m/s</span>`)}
+        ${row('Wheel Avg',   `<span class="value">${fmt(wheelAvg, 3)} m/s</span>`)}
+        ${row('Wheel Diff',  `<span class="value ${wheelDiff > 0.5 ? 'yellow' : ''}">${fmt(wheelDiff, 3)} m/s</span>`)}
+        <hr class="divider">
+        <div class="row"><span class="label">Lat Control</span>${bool_badge(v.lat_active)}</div>
+        <div class="row"><span class="label">Long Control</span>${bool_badge(v.long_active)}</div>
+      </div>
+    </div>`;
+
+  // ---- Actuators card ----
+  const actCard = `
+    <div class="card">
+      <div class="card-header">Actuators / Output ${stale_overlay(vsStale > STALE_SEC)}</div>
+      <div class="card-body">
+        ${row('Cmd Accel',  `<span class="value">${fmt(v.actuators_accel, 3)}</span>`)}
+        ${row('Cmd Torque', `<span class="value">${fmt(v.actuators_torque, 3)}</span>`)}
+        <hr class="divider">
+        ${row('Out Accel',  `<span class="value">${fmt(v.car_output_accel, 3)}</span>`)}
+        ${row('Out Torque', `<span class="value">${fmt(v.car_output_torque, 3)}</span>`)}
+      </div>
+    </div>`;
+
+  // ---- ESF Calibration card ----
+  function initCell(label, val) {
+    return `<div class="init-cell"><div class="ilabel">${label}</div><div class="ival ${initClass(val)}">${val}</div></div>`;
+  }
+  const esfCalibCard = `
+    <div class="card">
+      <div class="card-header">ESF Calibration ${stale_overlay(esfStale > STALE_SEC)}</div>
+      <div class="card-body">
+        <div class="row"><span class="label">Fusion Mode</span>
+          <span class="badge ${esfStale > STALE_SEC ? 'bg-grey' : fusionClass(e.fusion_label)}">${e.fusion_label}</span></div>
+        ${row('Sensors', `<span class="value">${e.num_sens}</span>`)}
+        <hr class="divider">
+        <div class="init-grid">
+          ${initCell('Wheel Tick', e.wt_label)}
+          ${initCell('Mount Align', e.mnt_alg_label)}
+          ${initCell('INS', e.ins_label)}
+          ${initCell('IMU', e.imu_label)}
+        </div>
+      </div>
+    </div>`;
+
+  // ---- ESF Sensors table card ----
+  function calibCls(c) {
+    return c === 'calibrated' ? 'green' : c === 'calibrating' ? 'yellow' : 'grey';
+  }
+  const sensRows = (e.sensors || []).map(s => `
+    <tr>
+      <td>${s.type} <span style="color:#6e7681;font-size:11px">${s.type_name}</span></td>
+      <td class="${s.used ? 'green' : 'grey'}">${s.used ? 'Y' : 'N'}</td>
+      <td class="${s.ready ? 'green' : 'yellow'}">${s.ready ? 'Y' : 'N'}</td>
+      <td class="${calibCls(s.calib)}">${s.calib}</td>
+      <td style="color:#8b949e">${s.time}</td>
+      <td class="${s.freq > 0 ? 'green' : 'red'}">${s.freq} Hz</td>
+      <td class="${s.faults === 'none' ? '' : 'red'}">${s.faults}</td>
+    </tr>`).join('');
+  const esfSensCard = `
+    <div class="card card-wide">
+      <div class="card-header">ESF Sensors (${e.num_sens}) ${stale_overlay(esfStale > STALE_SEC)}</div>
+      <div class="card-body">
+        <table class="sens-table">
+          <thead><tr>
+            <th>Type</th><th>Used</th><th>Ready</th><th>Calib</th><th>Time Tag</th><th>Freq</th><th>Faults</th>
+          </tr></thead>
+          <tbody>${sensRows || '<tr><td colspan="7" style="color:#6e7681;text-align:center;padding:12px">No ESF data — waiting for gnss_node</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  // ---- Topic Health card ----
+  function topicRow(name, target_hz) {
+    const info  = t[name];
+    const stale = staleSec(info.last_recv);
+    const hz    = info.hz;
+    const pct   = Math.min(100, (hz / target_hz) * 100);
+    const barColor = stale > STALE_SEC ? '#f85149' : hz >= target_hz * 0.8 ? '#3fb950' : hz > 0 ? '#e3b341' : '#f85149';
+    const statusText = stale === Infinity ? 'never received'
+      : stale > STALE_SEC ? `stale (${stale.toFixed(1)}s ago)` : `${info.count} msgs`;
+    return `
+      <div style="padding:6px 0;border-bottom:1px solid #21262d">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="label" style="font-size:12px">${name}</span>${hz_badge(hz, stale)}
+        </div>
+        <div class="hz-bar-bg"><div class="hz-bar" style="width:${pct}%;background:${barColor}"></div></div>
+        <div style="font-size:11px;color:#6e7681;text-align:right;margin-top:2px">${statusText}</div>
+      </div>`;
+  }
+  const healthCard = `
+    <div class="card">
+      <div class="card-header">Topic Health</div>
+      <div class="card-body" style="padding-bottom:8px">
+        ${topicRow('/vehicle/state',   100)}
+        ${topicRow('/gnss/fix',          5)}
+        ${topicRow('/gnss/velocity',     5)}
+        ${topicRow('/gnss/odometry',     5)}
+        ${topicRow('/gnss/esf_status',   1)}
+      </div>
+    </div>`;
+
+  document.getElementById('grid').innerHTML =
+    gnssCard + velCard + vsCard + actCard + esfCalibCard + esfSensCard + healthCard;
+
+  // header dot: red if ALL main topics stale
+  const allStale = vsStale > 3 && gnssStale > 3 && velStale > 3;
+  document.getElementById('conn-dot').className = allStale ? 'stale' : '';
+
+  // uptime
+  const u = s.uptime_s;
+  const hh = Math.floor(u / 3600);
+  const mm = Math.floor((u % 3600) / 60);
+  const ss = Math.floor(u % 60);
+  document.getElementById('uptime').textContent =
+    `uptime ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) render(await r.json());
+  } catch (e) {
+    document.getElementById('conn-dot').className = 'stale';
+  }
+  setTimeout(poll, 500);
+}
+poll();
+</script>
+</body>
+</html>
