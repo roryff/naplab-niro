@@ -3,290 +3,815 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Car System Dashboard</title>
+<title>Car Control Dashboard</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
-  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; gap: 12px; }
-  header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
-  #conn-dot { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; flex-shrink: 0; }
-  #conn-dot.stale { background: #f85149; }
-  #uptime { margin-left: auto; color: #8b949e; font-size: 12px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 16px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
-  .card-header { background: #21262d; padding: 10px 16px; font-weight: 600; font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #30363d; display: flex; align-items: center; justify-content: space-between; }
-  .card-body { padding: 12px 16px; }
-  .row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #21262d; }
-  .row:last-child { border-bottom: none; }
-  .label { color: #8b949e; }
-  .value { font-weight: 500; font-variant-numeric: tabular-nums; }
-  .badge { padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-  .green  { color: #3fb950; }
-  .yellow { color: #e3b341; }
-  .red    { color: #f85149; }
-  .grey   { color: #6e7681; }
-  .bg-green  { background: #1a3d1f; color: #3fb950; }
-  .bg-yellow { background: #3d2e0a; color: #e3b341; }
-  .bg-red    { background: #3d0f0a; color: #f85149; }
-  .bg-grey   { background: #21262d; color: #6e7681; }
-  .big { font-size: 28px; font-weight: 700; text-align: center; padding: 8px 0 4px; }
-  .sub { font-size: 11px; color: #8b949e; text-align: center; margin-bottom: 8px; }
-  .hz-bar-bg { background: #21262d; border-radius: 4px; height: 6px; margin-top: 4px; overflow: hidden; }
-  .hz-bar    { height: 6px; border-radius: 4px; transition: width .4s; }
-  .divider   { border: none; border-top: 1px solid #21262d; margin: 8px 0; }
-  .card-wide { grid-column: span 2; }
-  .sens-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
-  .sens-table th { color: #6e7681; font-weight: 600; text-align: left; padding: 4px 6px; border-bottom: 1px solid #30363d; white-space: nowrap; }
-  .sens-table td { padding: 4px 6px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
-  .sens-table tr:last-child td { border-bottom: none; }
-  .init-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
-  .init-cell { background: #21262d; border-radius: 6px; padding: 6px 10px; }
-  .init-cell .ilabel { font-size: 11px; color: #6e7681; }
-  .init-cell .ival { font-size: 13px; font-weight: 600; }
+/* ── Reset / base ─────────────────────────────────────────────────────── */
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px}
+/* ── Header ──────────────────────────────────────────────────────────── */
+header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 18px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:10}
+header h1{font-size:17px;font-weight:600;color:#f0f6fc}
+#conn-dot{width:10px;height:10px;border-radius:50%;background:#3fb950;flex-shrink:0}
+#conn-dot.stale{background:#f85149}
+#uptime{margin-left:auto;color:#8b949e;font-size:12px}
+/* ── Layout ──────────────────────────────────────────────────────────── */
+.page{display:flex;flex-direction:column;gap:14px;padding:14px}
+.row-flex{display:flex;gap:14px;flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:14px}
+/* ── Card ────────────────────────────────────────────────────────────── */
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden;min-width:0}
+.card-header{background:#21262d;padding:9px 14px;font-weight:600;font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between}
+.card-body{padding:10px 14px}
+/* ── Rows ────────────────────────────────────────────────────────────── */
+.row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #21262d}
+.row:last-child{border-bottom:none}
+.label{color:#8b949e}
+.value{font-weight:500;font-variant-numeric:tabular-nums}
+/* ── Badges ──────────────────────────────────────────────────────────── */
+.badge{padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.green{color:#3fb950}.yellow{color:#e3b341}.red{color:#f85149}.grey{color:#6e7681}
+.bg-green{background:#1a3d1f;color:#3fb950}
+.bg-yellow{background:#3d2e0a;color:#e3b341}
+.bg-red{background:#3d0f0a;color:#f85149}
+.bg-grey{background:#21262d;color:#6e7681}
+.bg-cyan{background:#0a2d3d;color:#58d9f9}
+/* ── Typography helpers ──────────────────────────────────────────────── */
+.big{font-size:26px;font-weight:700;text-align:center;padding:6px 0 2px}
+.sub{font-size:11px;color:#8b949e;text-align:center;margin-bottom:6px}
+.divider{border:none;border-top:1px solid #21262d;margin:7px 0}
+/* ── Hz bar ──────────────────────────────────────────────────────────── */
+.hz-bar-bg{background:#21262d;border-radius:4px;height:5px;margin-top:3px;overflow:hidden}
+.hz-bar{height:5px;border-radius:4px;transition:width .4s}
+/* ── Map canvas ──────────────────────────────────────────────────────── */
+#map-wrap{position:relative;flex:1;min-width:320px}
+#map-canvas{display:block;width:100%;height:420px;background:#0a0f16;border-radius:4px;cursor:crosshair}
+#map-info{position:absolute;bottom:8px;left:8px;background:rgba(13,17,23,.85);padding:5px 9px;border-radius:6px;font-size:11px;color:#8b949e;pointer-events:none}
+/* ── Steering gauge ──────────────────────────────────────────────────── */
+#steer-canvas{display:block;margin:0 auto}
+/* ── Sparkline ───────────────────────────────────────────────────────── */
+.spark{display:block;width:100%;height:52px}
+.spark-wrap{margin-top:4px}
+.spark-label{font-size:10px;color:#3b454f;margin-bottom:1px}
+/* ── ESF sensor table ────────────────────────────────────────────────── */
+.sens-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}
+.sens-table th{color:#6e7681;font-weight:600;text-align:left;padding:4px 6px;border-bottom:1px solid #30363d;white-space:nowrap}
+.sens-table td{padding:4px 6px;border-bottom:1px solid #21262d;font-variant-numeric:tabular-nums}
+.sens-table tr:last-child td{border-bottom:none}
+/* ── Init grid ───────────────────────────────────────────────────────── */
+.init-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:7px}
+.init-cell{background:#21262d;border-radius:5px;padding:5px 9px}
+.init-cell .ilabel{font-size:10px;color:#6e7681}
+.init-cell .ival{font-size:12px;font-weight:600}
+/* ── Progress bar ────────────────────────────────────────────────────── */
+.prog-bg{background:#21262d;border-radius:4px;height:8px;overflow:hidden;margin-top:3px}
+.prog-fill{height:8px;border-radius:4px;transition:width .3s}
+/* ── Responsive ──────────────────────────────────────────────────────── */
+@media(max-width:900px){.row-flex{flex-direction:column}}
 </style>
 </head>
 <body>
 <header>
   <div id="conn-dot"></div>
-  <h1>Car System Dashboard</h1>
+  <h1>Car Control Dashboard</h1>
   <span id="uptime"></span>
 </header>
-<div class="grid" id="grid">
-  <!-- cards injected by JS -->
-</div>
-<script>
-const STALE_SEC = 1.5;
+<div class="page">
 
-function fixClass(label) {
-  if (label === 'RTK FIXED')  return 'bg-green';
-  if (label === 'RTK FLOAT')  return 'bg-yellow';
-  if (label.includes('FIX'))  return 'bg-yellow';
-  return 'bg-red';
-}
-function fusionClass(label) {
-  if (label === 'FUSION')    return 'bg-green';
-  if (label === 'INIT')      return 'bg-yellow';
-  if (label === 'SUSPENDED') return 'bg-yellow';
-  if (label === 'DISABLED')  return 'bg-red';
-  return 'bg-grey';
-}
-function initClass(label) {
-  if (label === 'initialized')  return 'green';
-  if (label === 'initializing') return 'yellow';
-  return 'grey';
-}
-function hzClass(hz) {
-  if (hz > 5)  return 'green';
-  if (hz > 0)  return 'yellow';
-  return 'red';
-}
-function staleSec(last_recv) {
-  if (last_recv === null || last_recv === undefined) return Infinity;
-  return (Date.now() / 1000) - last_recv;
-}
-function fmt(v, dec = 2) {
-  return typeof v === 'number' ? v.toFixed(dec) : '—';
-}
-function bool_badge(v) {
-  return v ? '<span class="badge bg-green">ACTIVE</span>' : '<span class="badge bg-grey">OFF</span>';
-}
-function hz_badge(hz, stale) {
-  const cls = stale > STALE_SEC ? 'red' : hzClass(hz);
-  return `<span class="value ${cls}">${hz.toFixed(1)} Hz</span>`;
-}
-function row(label, value) {
-  return `<div class="row"><span class="label">${label}</span><span>${value}</span></div>`;
-}
-function stale_overlay(isStale) {
-  return isStale ? '<span class="badge bg-red">STALE</span>' : '';
-}
-function acc_color(m) {
-  return m < 0.05 ? 'green' : m < 0.5 ? 'yellow' : 'red';
-}
+  <!-- ── ROW 1: ENU Map + Controller panel ──────────────────────────── -->
+  <div class="row-flex" style="align-items:flex-start">
 
-function render(s) {
-  const g = s.gnss;
-  const v = s.vehicle;
-  const e = s.esf;
-  const t = s.topics;
-
-  const gnssStale = staleSec(t['/gnss/fix'].last_recv);
-  const velStale  = staleSec(t['/gnss/velocity'].last_recv);
-  const vsStale   = staleSec(t['/vehicle/state'].last_recv);
-  const esfStale  = staleSec(t['/gnss/esf_status'].last_recv);
-
-  // ---- GNSS Fix card ----
-  const gnssCard = `
-    <div class="card">
-      <div class="card-header">GNSS Fix ${stale_overlay(gnssStale > STALE_SEC)}</div>
-      <div class="card-body">
-        <div class="row"><span class="label">Status</span>
-          <span class="badge ${gnssStale > STALE_SEC ? 'bg-grey' : fixClass(g.fix_label)}">${g.fix_label}</span></div>
-        ${row('Latitude',  `<span class="value">${fmt(g.latitude, 7)}&deg;</span>`)}
-        ${row('Longitude', `<span class="value">${fmt(g.longitude, 7)}&deg;</span>`)}
-        ${row('Altitude',  `<span class="value">${fmt(g.altitude_m, 2)} m</span>`)}
-        <hr class="divider">
-        ${row('Horiz Acc', `<span class="value ${acc_color(g.h_acc_m)}">${fmt(g.h_acc_m, 3)} m</span>`)}
-        ${row('Vert Acc',  `<span class="value ${acc_color(g.v_acc_m)}">${fmt(g.v_acc_m, 3)} m</span>`)}
+    <!-- Map -->
+    <div class="card" style="flex:3;min-width:320px">
+      <div class="card-header">
+        <span>ENU Map</span>
+        <span id="map-status-badge" class="badge bg-grey">NO PATH</span>
       </div>
-    </div>`;
-
-  // ---- GNSS Velocity + Position card ----
-  const velCard = `
-    <div class="card">
-      <div class="card-header">GNSS Velocity ${stale_overlay(velStale > STALE_SEC)}</div>
-      <div class="card-body">
-        <div class="big ${velStale > STALE_SEC ? 'grey' : 'green'}">${fmt(g.ground_speed_mps, 2)}</div>
-        <div class="sub">Ground Speed (m/s) &nbsp;|&nbsp; ${fmt(g.ground_speed_mps * 3.6, 1)} km/h</div>
-        ${row('Vel North', `<span class="value">${fmt(g.vel_n_mps, 3)} m/s</span>`)}
-        ${row('Vel East',  `<span class="value">${fmt(g.vel_e_mps, 3)} m/s</span>`)}
-        ${row('Vel Down',  `<span class="value">${fmt(g.vel_d_mps, 3)} m/s</span>`)}
-        <hr class="divider">
-        ${row('Local X',  `<span class="value">${fmt(g.pos_x_m, 2)} m</span>`)}
-        ${row('Local Y',  `<span class="value">${fmt(g.pos_y_m, 2)} m</span>`)}
-        ${row('Local Z',  `<span class="value">${fmt(g.pos_z_m, 2)} m</span>`)}
-        ${row('Heading',  `<span class="value">${fmt(g.heading_deg, 1)}&deg;</span>`)}
+      <div class="card-body" style="padding:8px;position:relative">
+        <div id="map-wrap">
+          <canvas id="map-canvas"></canvas>
+          <div id="map-info">Waiting for path data…</div>
+        </div>
       </div>
-    </div>`;
+    </div>
 
-  // ---- Vehicle State card ----
-  const wheelAvg  = (v.wheel_left_mps + v.wheel_right_mps) / 2;
-  const wheelDiff = Math.abs(v.wheel_left_mps - v.wheel_right_mps);
-  const vsCard = `
-    <div class="card">
-      <div class="card-header">Vehicle State ${stale_overlay(vsStale > STALE_SEC)}</div>
+    <!-- Controller panel -->
+    <div class="col" style="flex:1;min-width:260px">
+
+      <!-- Status + targets -->
+      <div class="card">
+        <div class="card-header">
+          <span>Path Controller</span>
+          <span id="pf-status-badge" class="badge bg-grey">IDLE</span>
+        </div>
+        <div class="card-body">
+          <div class="row">
+            <span class="label">Target Speed</span>
+            <span><span id="tgt-speed" class="value">—</span> <span class="grey">m/s</span></span>
+          </div>
+          <div class="row">
+            <span class="label">Actual Speed</span>
+            <span><span id="act-speed" class="value">—</span> <span class="grey">m/s</span></span>
+          </div>
+          <div class="prog-bg" style="margin-bottom:6px">
+            <div id="speed-prog" class="prog-fill" style="background:#3fb950;width:0%"></div>
+          </div>
+          <div class="row">
+            <span class="label">Lateral Error</span>
+            <span><span id="lat-err-val" class="value">—</span> <span class="grey">m</span></span>
+          </div>
+          <div class="row">
+            <span class="label">Heading Error</span>
+            <span><span id="hdg-err-val" class="value">—</span> <span class="grey">deg</span></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Steering gauge -->
+      <div class="card">
+        <div class="card-header">Steering Angle</div>
+        <div class="card-body" style="padding:8px 4px 4px">
+          <canvas id="steer-canvas" width="240" height="140"></canvas>
+          <div style="display:flex;justify-content:space-around;font-size:11px;margin-top:2px">
+            <span><span style="color:#f0a500">■</span> Target <span id="steer-tgt-num" class="value">—</span>°</span>
+            <span><span style="color:#58d9f9">■</span> Measured <span id="steer-meas-num" class="value">—</span>°</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Error sparklines -->
+      <div class="card">
+        <div class="card-header">Error Histories</div>
+        <div class="card-body" style="padding:8px 10px">
+          <div class="spark-wrap">
+            <div class="spark-label">Lateral Error (m)  <span id="lat-range" style="color:#3b454f"></span></div>
+            <svg id="spark-lat" class="spark" viewBox="0 0 240 52" preserveAspectRatio="none"></svg>
+          </div>
+          <hr class="divider">
+          <div class="spark-wrap">
+            <div class="spark-label">Heading Error (deg)  <span id="hdg-range" style="color:#3b454f"></span></div>
+            <svg id="spark-hdg" class="spark" viewBox="0 0 240 52" preserveAspectRatio="none"></svg>
+          </div>
+          <hr class="divider">
+          <div class="spark-wrap">
+            <div class="spark-label">Speed (m/s)  <span id="spd-range" style="color:#3b454f"></span></div>
+            <svg id="spark-spd" class="spark" viewBox="0 0 240 52" preserveAspectRatio="none"></svg>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /controller col -->
+  </div><!-- /row1 -->
+
+  <!-- ── ROW 2: Info cards grid ─────────────────────────────────────── -->
+  <div class="row-flex">
+
+    <!-- GNSS Fix -->
+    <div class="card" style="flex:1;min-width:220px">
+      <div class="card-header">
+        <span>GNSS Fix</span>
+        <span id="gnss-stale-badge"></span>
+      </div>
       <div class="card-body">
-        <div class="big ${vsStale > STALE_SEC ? 'grey' : 'green'}">${fmt(v.v_ego_kmh, 1)}</div>
+        <div class="row"><span class="label">Status</span><span id="fix-badge" class="badge bg-grey">—</span></div>
+        <div class="row"><span class="label">Latitude</span><span id="lat-val" class="value">—</span></div>
+        <div class="row"><span class="label">Longitude</span><span id="lon-val" class="value">—</span></div>
+        <div class="row"><span class="label">Altitude</span><span><span id="alt-val" class="value">—</span> m</span></div>
+        <hr class="divider">
+        <div class="row"><span class="label">H-Acc</span><span id="hacc-val" class="value">—</span></div>
+        <div class="row"><span class="label">V-Acc</span><span id="vacc-val" class="value">—</span></div>
+      </div>
+    </div>
+
+    <!-- GNSS Velocity + ENU -->
+    <div class="card" style="flex:1;min-width:220px">
+      <div class="card-header">GNSS Velocity</div>
+      <div class="card-body">
+        <div class="big green" id="gspd-big">—</div>
+        <div class="sub">Ground Speed — <span id="gspd-kmh">—</span> km/h</div>
+        <div class="row"><span class="label">Vel North</span><span id="vel-n" class="value">— m/s</span></div>
+        <div class="row"><span class="label">Vel East</span><span id="vel-e" class="value">— m/s</span></div>
+        <div class="row"><span class="label">Vel Down</span><span id="vel-d" class="value">— m/s</span></div>
+        <hr class="divider">
+        <div class="row"><span class="label">ENU X (E)</span><span id="pos-x" class="value">— m</span></div>
+        <div class="row"><span class="label">ENU Y (N)</span><span id="pos-y" class="value">— m</span></div>
+        <div class="row"><span class="label">Heading</span><span id="pos-h" class="value">—°</span></div>
+      </div>
+    </div>
+
+    <!-- Vehicle State -->
+    <div class="card" style="flex:1;min-width:220px">
+      <div class="card-header">
+        <span>Vehicle State</span>
+        <span id="vs-stale-badge"></span>
+      </div>
+      <div class="card-body">
+        <div class="big green" id="speed-big">—</div>
         <div class="sub">Speed (km/h)</div>
-        ${row('Steering Angle',  `<span class="value">${fmt(v.steering_deg, 1)}&deg;</span>`)}
-        ${row('Steering Torque', `<span class="value">${fmt(v.steering_torque, 3)}</span>`)}
+        <div class="row"><span class="label">Steer Wheel</span><span><span id="sw-val" class="value">—</span>°</span></div>
+        <div class="row"><span class="label">Steer Torque</span><span id="stq-val" class="value">—</span></div>
         <hr class="divider">
-        ${row('Wheel Left',  `<span class="value">${fmt(v.wheel_left_mps, 3)} m/s</span>`)}
-        ${row('Wheel Right', `<span class="value">${fmt(v.wheel_right_mps, 3)} m/s</span>`)}
-        ${row('Wheel Avg',   `<span class="value">${fmt(wheelAvg, 3)} m/s</span>`)}
-        ${row('Wheel Diff',  `<span class="value ${wheelDiff > 0.5 ? 'yellow' : ''}">${fmt(wheelDiff, 3)} m/s</span>`)}
+        <div class="row"><span class="label">Wheel L</span><span><span id="whl-l" class="value">—</span> m/s</span></div>
+        <div class="row"><span class="label">Wheel R</span><span><span id="whl-r" class="value">—</span> m/s</span></div>
+        <div class="row"><span class="label">Wheel Δ</span><span id="whl-d" class="value">—</span></div>
         <hr class="divider">
-        <div class="row"><span class="label">Lat Control</span>${bool_badge(v.lat_active)}</div>
-        <div class="row"><span class="label">Long Control</span>${bool_badge(v.long_active)}</div>
+        <div class="row"><span class="label">Lat Ctrl</span><span id="lat-ctrl-badge"></span></div>
+        <div class="row"><span class="label">Long Ctrl</span><span id="long-ctrl-badge"></span></div>
       </div>
-    </div>`;
+    </div>
 
-  // ---- Actuators card ----
-  const actCard = `
-    <div class="card">
-      <div class="card-header">Actuators / Output ${stale_overlay(vsStale > STALE_SEC)}</div>
+    <!-- Actuators -->
+    <div class="card" style="flex:1;min-width:200px">
+      <div class="card-header">Actuators / Output</div>
       <div class="card-body">
-        ${row('Cmd Accel',  `<span class="value">${fmt(v.actuators_accel, 3)}</span>`)}
-        ${row('Cmd Torque', `<span class="value">${fmt(v.actuators_torque, 3)}</span>`)}
+        <div class="row"><span class="label">Cmd Accel</span><span id="cmd-acc" class="value">—</span></div>
+        <div class="row"><span class="label">Cmd Torque</span><span id="cmd-tq" class="value">—</span></div>
         <hr class="divider">
-        ${row('Out Accel',  `<span class="value">${fmt(v.car_output_accel, 3)}</span>`)}
-        ${row('Out Torque', `<span class="value">${fmt(v.car_output_torque, 3)}</span>`)}
+        <div class="row"><span class="label">Out Accel</span><span id="out-acc" class="value">—</span></div>
+        <div class="row"><span class="label">Out Torque</span><span id="out-tq" class="value">—</span></div>
       </div>
-    </div>`;
+    </div>
 
-  // ---- ESF Calibration card ----
-  function initCell(label, val) {
-    return `<div class="init-cell"><div class="ilabel">${label}</div><div class="ival ${initClass(val)}">${val}</div></div>`;
-  }
-  const esfCalibCard = `
-    <div class="card">
-      <div class="card-header">ESF Calibration ${stale_overlay(esfStale > STALE_SEC)}</div>
+    <!-- ESF Calibration -->
+    <div class="card" style="flex:1;min-width:200px">
+      <div class="card-header">
+        <span>ESF Calibration</span>
+        <span id="esf-stale-badge"></span>
+      </div>
       <div class="card-body">
-        <div class="row"><span class="label">Fusion Mode</span>
-          <span class="badge ${esfStale > STALE_SEC ? 'bg-grey' : fusionClass(e.fusion_label)}">${e.fusion_label}</span></div>
-        ${row('Sensors', `<span class="value">${e.num_sens}</span>`)}
+        <div class="row"><span class="label">Fusion Mode</span><span id="fusion-badge" class="badge bg-grey">—</span></div>
+        <div class="row"><span class="label">Sensors</span><span id="esf-nsens" class="value">—</span></div>
         <hr class="divider">
         <div class="init-grid">
-          ${initCell('Wheel Tick', e.wt_label)}
-          ${initCell('Mount Align', e.mnt_alg_label)}
-          ${initCell('INS', e.ins_label)}
-          ${initCell('IMU', e.imu_label)}
+          <div class="init-cell"><div class="ilabel">Wheel Tick</div><div id="wt-label" class="ival grey">—</div></div>
+          <div class="init-cell"><div class="ilabel">Mount Align</div><div id="mnt-label" class="ival grey">—</div></div>
+          <div class="init-cell"><div class="ilabel">INS</div><div id="ins-label" class="ival grey">—</div></div>
+          <div class="init-cell"><div class="ilabel">IMU</div><div id="imu-label" class="ival grey">—</div></div>
         </div>
       </div>
-    </div>`;
+    </div>
 
-  // ---- ESF Sensors table card ----
-  function calibCls(c) {
-    return c === 'calibrated' ? 'green' : c === 'calibrating' ? 'yellow' : 'grey';
+    <!-- Topic Health -->
+    <div class="card" style="flex:1;min-width:220px">
+      <div class="card-header">Topic Health</div>
+      <div class="card-body" id="topic-health" style="padding-bottom:6px"></div>
+    </div>
+
+  </div><!-- /row2 -->
+
+  <!-- ── ROW 3: ESF Sensors table (full width) ───────────────────────── -->
+  <div class="card">
+    <div class="card-header" id="esf-sens-header">ESF Sensors</div>
+    <div class="card-body" style="overflow-x:auto">
+      <table class="sens-table">
+        <thead><tr>
+          <th>Type</th><th>Used</th><th>Ready</th><th>Calib</th><th>Time Tag</th><th>Freq</th><th>Faults</th>
+        </tr></thead>
+        <tbody id="esf-sens-tbody">
+          <tr><td colspan="7" style="color:#6e7681;text-align:center;padding:10px">Waiting for ESF data…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /page -->
+
+<script>
+'use strict';
+// ═══════════════════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════════════════
+const STALE_SEC       = 1.5;
+const POLL_MS         = 200;    // status poll interval
+const PATH_POLL_MS    = 2000;   // path re-fetch interval
+const MAX_TRAIL       = 400;    // vehicle position history points
+const SW_TO_AXLE      = 30.0 / 460.0;     // steering-wheel → front-axle deg
+const MAX_AXLE_DEG    = 30.0;             // front-axle range ±
+
+// ═══════════════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════════════
+let gPath      = null;   // {waypoints:[{x,y}], length_m}
+let gPathTime  = 0;
+let gTrail     = [];     // [{x,y}] vehicle history
+let gLastS     = null;   // last API status
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Formatting helpers
+// ═══════════════════════════════════════════════════════════════════════════
+const fmt     = (v,d=2)  => (typeof v==='number') ? v.toFixed(d) : '—';
+const staleSec= lr        => lr==null ? Infinity : (Date.now()/1000) - lr;
+const bool_badge = (v,on='ACTIVE',off='OFF') =>
+  v ? `<span class="badge bg-green">${on}</span>`
+    : `<span class="badge bg-grey">${off}</span>`;
+const stale_badge = isStale => isStale
+  ? '<span class="badge bg-red" style="font-size:10px">STALE</span>' : '';
+
+function fixClass(lbl){
+  if(lbl==='RTK FIXED') return 'bg-green';
+  if(lbl==='RTK FLOAT') return 'bg-yellow';
+  if(lbl.includes('FIX')) return 'bg-yellow';
+  return 'bg-red';
+}
+function fusionClass(lbl){
+  if(lbl==='FUSION')    return 'bg-green';
+  if(lbl==='INIT')      return 'bg-yellow';
+  if(lbl==='SUSPENDED') return 'bg-yellow';
+  if(lbl==='DISABLED')  return 'bg-red';
+  return 'bg-grey';
+}
+function initClass(lbl){
+  if(lbl==='initialized')  return 'green';
+  if(lbl==='initializing') return 'yellow';
+  return 'grey';
+}
+function hzColor(hz, stale){
+  if(stale > STALE_SEC) return '#f85149';
+  return hz > 5 ? '#3fb950' : hz > 0 ? '#e3b341' : '#f85149';
+}
+function errColor(v, warn, crit){
+  const a=Math.abs(v);
+  return a>crit?'red':a>warn?'yellow':'green';
+}
+function setText(id,v){ const el=document.getElementById(id); if(el) el.textContent=v; }
+function setHTML(id,v){ const el=document.getElementById(id); if(el) el.innerHTML=v; }
+function setClass(id,c){ const el=document.getElementById(id); if(el) el.className=c; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Main render
+// ═══════════════════════════════════════════════════════════════════════════
+function render(s){
+  gLastS = s;
+  const {vehicle:v, gnss:g, esf:e, controller:c, topics:t, uptime_s:u} = s;
+
+  // ── Staleness flags ─────────────────────────────────────────────────────
+  const vsStale   = staleSec(t['/vehicle/state']?.last_recv);
+  const gnssStale = staleSec(t['/gnss/fix']?.last_recv);
+  const esfStale  = staleSec(t['/gnss/esf_status']?.last_recv);
+  const ctrlStale = staleSec(t['/cmd_vel']?.last_recv);
+
+  // ── Header ───────────────────────────────────────────────────────────────
+  const allStale = vsStale > 3 && gnssStale > 3;
+  setClass('conn-dot', allStale ? 'stale' : '');
+  const hh=Math.floor(u/3600), mm=Math.floor((u%3600)/60), ss=Math.floor(u%60);
+  setText('uptime',`uptime ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`);
+
+  // ── Path follower status ─────────────────────────────────────────────────
+  const pfBadgeEl = document.getElementById('pf-status-badge');
+  if(pfBadgeEl){
+    const lbl = ctrlStale > 3 ? 'OFFLINE' : (c.state_label || 'IDLE');
+    pfBadgeEl.textContent = lbl;
+    pfBadgeEl.className   = 'badge ' +
+      (lbl==='FOLLOWING'?'bg-green': lbl==='STOPPING'?'bg-yellow': ctrlStale>3?'bg-red':'bg-grey');
   }
-  const sensRows = (e.sensors || []).map(s => `
+
+  // ── Controller card ──────────────────────────────────────────────────────
+  const tgtSpd = ctrlStale < STALE_SEC ? c.target_speed_mps : null;
+  const actSpd = v.v_ego_kmh / 3.6;
+  setText('tgt-speed', tgtSpd!==null ? fmt(tgtSpd,2) : '—');
+  setText('act-speed', fmt(actSpd,2));
+  const maxSpd = 15;
+  const ratio  = Math.min(1, actSpd/maxSpd);
+  const progEl = document.getElementById('speed-prog');
+  if(progEl){ progEl.style.width=(ratio*100)+'%'; progEl.style.background=ratio>0.85?'#f85149':ratio>0.5?'#e3b341':'#3fb950'; }
+
+  const latE = c.lateral_error_m;
+  const hdgE = c.heading_error_deg;
+  const latEl= document.getElementById('lat-err-val');
+  const hdgEl= document.getElementById('hdg-err-val');
+  if(latEl){ latEl.textContent=fmt(latE,3); latEl.className='value '+errColor(latE,0.3,0.8); }
+  if(hdgEl){ hdgEl.textContent=fmt(hdgE,2); hdgEl.className='value '+errColor(hdgE,5,15); }
+
+  // ── Steering gauge ────────────────────────────────────────────────────────
+  const measAxleDeg = v.steering_deg * SW_TO_AXLE;
+  const tgtAxleDeg  = c.target_steer_deg;   // already in front-axle deg
+  setText('steer-tgt-num',  fmt(tgtAxleDeg,1));
+  setText('steer-meas-num', fmt(measAxleDeg,1));
+  drawSteeringGauge(tgtAxleDeg, measAxleDeg);
+
+  // ── Sparklines ────────────────────────────────────────────────────────────
+  drawSparkline('spark-lat', c.lat_err_history,   '#f0a500', 'lat-range');
+  drawSparkline('spark-hdg', c.hdg_err_history,   '#58d9f9', 'hdg-range');
+  drawSparkline('spark-spd', c.speed_history,     '#3fb950', 'spd-range');
+
+  // ── GNSS Fix card ─────────────────────────────────────────────────────────
+  setHTML ('gnss-stale-badge', stale_badge(gnssStale > STALE_SEC));
+  setHTML ('fix-badge', `<span class="badge ${gnssStale>STALE_SEC?'bg-grey':fixClass(g.fix_label)}">${g.fix_label}</span>`);
+  setText ('lat-val',  fmt(g.latitude,  7)+'°');
+  setText ('lon-val',  fmt(g.longitude, 7)+'°');
+  setText ('alt-val',  fmt(g.altitude_m, 2));
+  const haccEl=document.getElementById('hacc-val');
+  const vaccEl=document.getElementById('vacc-val');
+  if(haccEl){ haccEl.textContent=fmt(g.h_acc_m,3)+' m'; haccEl.className='value '+errColor(g.h_acc_m,0.05,0.3); }
+  if(vaccEl){ vaccEl.textContent=fmt(g.v_acc_m,3)+' m'; vaccEl.className='value '+errColor(g.v_acc_m,0.1,0.5); }
+
+  // ── GNSS Velocity ─────────────────────────────────────────────────────────
+  const gspdEl=document.getElementById('gspd-big');
+  if(gspdEl){ gspdEl.textContent=fmt(g.ground_speed_mps,2); gspdEl.className='big '+(staleSec(t['/gnss/velocity']?.last_recv)>STALE_SEC?'grey':'green'); }
+  setText('gspd-kmh', fmt(g.ground_speed_mps*3.6,1));
+  setText('vel-n', fmt(g.vel_n_mps,3)+' m/s');
+  setText('vel-e', fmt(g.vel_e_mps,3)+' m/s');
+  setText('vel-d', fmt(g.vel_d_mps,3)+' m/s');
+  setText('pos-x', fmt(g.pos_x_m,2)+' m');
+  setText('pos-y', fmt(g.pos_y_m,2)+' m');
+  setText('pos-h', fmt(g.heading_deg,1)+'°');
+
+  // ── Vehicle State card ────────────────────────────────────────────────────
+  setHTML('vs-stale-badge', stale_badge(vsStale > STALE_SEC));
+  const spdBig=document.getElementById('speed-big');
+  if(spdBig){ spdBig.textContent=fmt(v.v_ego_kmh,1); spdBig.className='big '+(vsStale>STALE_SEC?'grey':'green'); }
+  setText('sw-val',  fmt(v.steering_deg,1));
+  setText('stq-val', fmt(v.steering_torque,3));
+  setText('whl-l',   fmt(v.wheel_left_mps,3));
+  setText('whl-r',   fmt(v.wheel_right_mps,3));
+  const wdiff = Math.abs(v.wheel_left_mps-v.wheel_right_mps);
+  const wdEl = document.getElementById('whl-d');
+  if(wdEl){ wdEl.textContent=fmt(wdiff,3)+' m/s'; wdEl.className='value '+(wdiff>0.5?'yellow':''); }
+  setHTML('lat-ctrl-badge',  bool_badge(v.lat_active));
+  setHTML('long-ctrl-badge', bool_badge(v.long_active));
+
+  // ── Actuators ─────────────────────────────────────────────────────────────
+  setText('cmd-acc', fmt(v.actuators_accel,3));
+  setText('cmd-tq',  fmt(v.actuators_torque,3));
+  setText('out-acc', fmt(v.car_output_accel,3));
+  setText('out-tq',  fmt(v.car_output_torque,3));
+
+  // ── ESF Calibration ───────────────────────────────────────────────────────
+  setHTML('esf-stale-badge', stale_badge(esfStale > STALE_SEC));
+  const fusEl=document.getElementById('fusion-badge');
+  if(fusEl){ fusEl.textContent=e.fusion_label; fusEl.className='badge '+(esfStale>STALE_SEC?'bg-grey':fusionClass(e.fusion_label)); }
+  setText('esf-nsens', e.num_sens);
+  setText('wt-label',  e.wt_label);  setClass('wt-label',  'ival '+initClass(e.wt_label));
+  setText('mnt-label', e.mnt_alg_label); setClass('mnt-label','ival '+initClass(e.mnt_alg_label));
+  setText('ins-label', e.ins_label); setClass('ins-label', 'ival '+initClass(e.ins_label));
+  setText('imu-label', e.imu_label); setClass('imu-label', 'ival '+initClass(e.imu_label));
+
+  // ── ESF Sensors table ─────────────────────────────────────────────────────
+  const calibCls=c=>(c==='calibrated'?'green':c==='calibrating'?'yellow':'grey');
+  document.getElementById('esf-sens-header').textContent=`ESF Sensors (${e.num_sens})`;
+  const srows=(e.sensors||[]).map(s=>`
     <tr>
-      <td>${s.type} <span style="color:#6e7681;font-size:11px">${s.type_name}</span></td>
-      <td class="${s.used ? 'green' : 'grey'}">${s.used ? 'Y' : 'N'}</td>
-      <td class="${s.ready ? 'green' : 'yellow'}">${s.ready ? 'Y' : 'N'}</td>
+      <td>${s.type} <span style="color:#6e7681;font-size:10px">${s.type_name}</span></td>
+      <td class="${s.used?'green':'grey'}">${s.used?'Y':'N'}</td>
+      <td class="${s.ready?'green':'yellow'}">${s.ready?'Y':'N'}</td>
       <td class="${calibCls(s.calib)}">${s.calib}</td>
       <td style="color:#8b949e">${s.time}</td>
-      <td class="${s.freq > 0 ? 'green' : 'red'}">${s.freq} Hz</td>
-      <td class="${s.faults === 'none' ? '' : 'red'}">${s.faults}</td>
+      <td class="${s.freq>0?'green':'red'}">${s.freq} Hz</td>
+      <td class="${s.faults==='none'?'':'red'}">${s.faults}</td>
     </tr>`).join('');
-  const esfSensCard = `
-    <div class="card card-wide">
-      <div class="card-header">ESF Sensors (${e.num_sens}) ${stale_overlay(esfStale > STALE_SEC)}</div>
-      <div class="card-body">
-        <table class="sens-table">
-          <thead><tr>
-            <th>Type</th><th>Used</th><th>Ready</th><th>Calib</th><th>Time Tag</th><th>Freq</th><th>Faults</th>
-          </tr></thead>
-          <tbody>${sensRows || '<tr><td colspan="7" style="color:#6e7681;text-align:center;padding:12px">No ESF data — waiting for gnss_node</td></tr>'}</tbody>
-        </table>
-      </div>
-    </div>`;
+  document.getElementById('esf-sens-tbody').innerHTML =
+    srows || '<tr><td colspan="7" style="color:#6e7681;text-align:center;padding:10px">No ESF data</td></tr>';
 
-  // ---- Topic Health card ----
-  function topicRow(name, target_hz) {
-    const info  = t[name];
-    const stale = staleSec(info.last_recv);
-    const hz    = info.hz;
-    const pct   = Math.min(100, (hz / target_hz) * 100);
-    const barColor = stale > STALE_SEC ? '#f85149' : hz >= target_hz * 0.8 ? '#3fb950' : hz > 0 ? '#e3b341' : '#f85149';
-    const statusText = stale === Infinity ? 'never received'
-      : stale > STALE_SEC ? `stale (${stale.toFixed(1)}s ago)` : `${info.count} msgs`;
-    return `
-      <div style="padding:6px 0;border-bottom:1px solid #21262d">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <span class="label" style="font-size:12px">${name}</span>${hz_badge(hz, stale)}
-        </div>
-        <div class="hz-bar-bg"><div class="hz-bar" style="width:${pct}%;background:${barColor}"></div></div>
-        <div style="font-size:11px;color:#6e7681;text-align:right;margin-top:2px">${statusText}</div>
-      </div>`;
+  // ── Topic Health ──────────────────────────────────────────────────────────
+  const TOPICS_CFG = [
+    ['/vehicle/state',        100, 'Vehicle State'],
+    ['/gnss/fix',               5, 'GNSS Fix'],
+    ['/gnss/velocity',          5, 'GNSS Velocity'],
+    ['/gnss/odometry',          5, 'GNSS Odometry'],
+    ['/cmd_vel',               20, 'cmd_vel'],
+    ['/lateral_error',         20, 'Lateral Error'],
+    ['/path_following_status',  1, 'Path Status'],
+    ['/path_visualization',     1, 'Path Viz'],
+    ['/gnss/esf_status',        1, 'ESF Status'],
+  ];
+  const healthEl = document.getElementById('topic-health');
+  if(healthEl){
+    healthEl.innerHTML = TOPICS_CFG.map(([name, tgt, label])=>{
+      const info  = t[name] || {};
+      const stale = staleSec(info.last_recv);
+      const hz    = info.hz || 0;
+      const pct   = Math.min(100, (hz/tgt)*100);
+      const col   = hzColor(hz, stale);
+      const statusText = stale===Infinity ? 'never received'
+        : stale > STALE_SEC ? `stale (${stale.toFixed(1)}s)` : `${info.count||0} msgs`;
+      return `
+        <div style="padding:5px 0;border-bottom:1px solid #21262d">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span class="label" style="font-size:11px">${label}</span>
+            <span class="value" style="color:${col};font-size:11px">${hz.toFixed(1)} Hz</span>
+          </div>
+          <div class="hz-bar-bg"><div class="hz-bar" style="width:${pct}%;background:${col}"></div></div>
+          <div style="font-size:10px;color:#6e7681;text-align:right;margin-top:1px">${statusText}</div>
+        </div>`;
+    }).join('');
   }
-  const healthCard = `
-    <div class="card">
-      <div class="card-header">Topic Health</div>
-      <div class="card-body" style="padding-bottom:8px">
-        ${topicRow('/vehicle/state',   100)}
-        ${topicRow('/gnss/fix',          5)}
-        ${topicRow('/gnss/velocity',     5)}
-        ${topicRow('/gnss/odometry',     5)}
-        ${topicRow('/gnss/esf_status',   1)}
-      </div>
-    </div>`;
 
-  document.getElementById('grid').innerHTML =
-    gnssCard + velCard + vsCard + actCard + esfCalibCard + esfSensCard + healthCard;
-
-  // header dot: red if ALL main topics stale
-  const allStale = vsStale > 3 && gnssStale > 3 && velStale > 3;
-  document.getElementById('conn-dot').className = allStale ? 'stale' : '';
-
-  // uptime
-  const u = s.uptime_s;
-  const hh = Math.floor(u / 3600);
-  const mm = Math.floor((u % 3600) / 60);
-  const ss = Math.floor(u % 60);
-  document.getElementById('uptime').textContent =
-    `uptime ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+  // ── ENU Map ────────────────────────────────────────────────────────────────
+  // Push vehicle position to trail
+  if(g.pos_x_m!==0 || g.pos_y_m!==0){
+    gTrail.push({x:g.pos_x_m, y:g.pos_y_m});
+    if(gTrail.length > MAX_TRAIL) gTrail.shift();
+  }
+  drawMap(g, c);
 }
 
-async function poll() {
-  try {
-    const r = await fetch('/api/status');
-    if (r.ok) render(await r.json());
-  } catch (e) {
-    document.getElementById('conn-dot').className = 'stale';
+// ═══════════════════════════════════════════════════════════════════════════
+// ENU Map canvas
+// ═══════════════════════════════════════════════════════════════════════════
+function drawMap(g, c){
+  const canvas = document.getElementById('map-canvas');
+  const dpr    = window.devicePixelRatio || 1;
+  const W      = canvas.clientWidth;
+  const H      = canvas.clientHeight;
+  if(canvas.width !== W*dpr || canvas.height !== H*dpr){
+    canvas.width  = W*dpr;
+    canvas.height = H*dpr;
   }
-  setTimeout(poll, 500);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  // Collect all points to determine bounding box
+  const pts = [];
+  if(gPath && gPath.waypoints.length){
+    for(const p of gPath.waypoints) pts.push(p);
+  }
+  for(const p of gTrail) pts.push(p);
+  if(g.pos_x_m!==0||g.pos_y_m!==0) pts.push({x:g.pos_x_m, y:g.pos_y_m});
+
+  if(pts.length < 2){ drawMapNoData(ctx,W,H); return; }
+
+  let xmin=Infinity,xmax=-Infinity,ymin=Infinity,ymax=-Infinity;
+  for(const p of pts){
+    xmin=Math.min(xmin,p.x); xmax=Math.max(xmax,p.x);
+    ymin=Math.min(ymin,p.y); ymax=Math.max(ymax,p.y);
+  }
+  const PAD = 30;
+  const rx  = xmax-xmin || 1, ry = ymax-ymin || 1;
+  const scale = Math.min((W-2*PAD)/rx, (H-2*PAD)/ry);
+  const cx  = (x) => PAD + (x-xmin)*scale;
+  const cy  = (y) => H - PAD - (y-ymin)*scale;   // flip Y
+
+  // Grid lines
+  ctx.strokeStyle='#1c2330'; ctx.lineWidth=1;
+  const gridStep = niceStep(Math.max(rx,ry)/6);
+  const x0g=Math.ceil(xmin/gridStep)*gridStep;
+  for(let x=x0g; x<=xmax; x+=gridStep){
+    ctx.beginPath(); ctx.moveTo(cx(x),PAD); ctx.lineTo(cx(x),H-PAD); ctx.stroke();
+    ctx.fillStyle='#3b454f'; ctx.font='9px monospace'; ctx.fillText(x.toFixed(0)+'m',cx(x)+2,H-PAD-2);
+  }
+  const y0g=Math.ceil(ymin/gridStep)*gridStep;
+  for(let y=y0g; y<=ymax; y+=gridStep){
+    ctx.beginPath(); ctx.moveTo(PAD,cy(y)); ctx.lineTo(W-PAD,cy(y)); ctx.stroke();
+    ctx.fillStyle='#3b454f'; ctx.font='9px monospace'; ctx.fillText(y.toFixed(0)+'m',PAD+2,cy(y)-3);
+  }
+
+  // Origin marker
+  ctx.beginPath(); ctx.arc(cx(0),cy(0),5,0,2*Math.PI);
+  ctx.fillStyle='#ffffff22'; ctx.fill();
+  ctx.strokeStyle='#ffffff44'; ctx.lineWidth=1; ctx.stroke();
+
+  // Path
+  if(gPath && gPath.waypoints.length >= 2){
+    ctx.beginPath();
+    ctx.moveTo(cx(gPath.waypoints[0].x), cy(gPath.waypoints[0].y));
+    for(let i=1;i<gPath.waypoints.length;i++)
+      ctx.lineTo(cx(gPath.waypoints[i].x), cy(gPath.waypoints[i].y));
+    ctx.strokeStyle='#1a5f7a'; ctx.lineWidth=3; ctx.stroke();
+
+    // Path highlight (thinner cyan on top)
+    ctx.beginPath();
+    ctx.moveTo(cx(gPath.waypoints[0].x), cy(gPath.waypoints[0].y));
+    for(let i=1;i<gPath.waypoints.length;i++)
+      ctx.lineTo(cx(gPath.waypoints[i].x), cy(gPath.waypoints[i].y));
+    ctx.strokeStyle='#58d9f9'; ctx.lineWidth=1.5; ctx.stroke();
+
+    // Start / end markers
+    const s=gPath.waypoints[0], e2=gPath.waypoints[gPath.waypoints.length-1];
+    ctx.beginPath(); ctx.arc(cx(s.x),cy(s.y),5,0,2*Math.PI);
+    ctx.fillStyle='#3fb950'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx(e2.x),cy(e2.y),5,0,2*Math.PI);
+    ctx.fillStyle='#f85149'; ctx.fill();
+  }
+
+  // Vehicle trail (fading dots)
+  if(gTrail.length >= 2){
+    for(let i=1;i<gTrail.length;i++){
+      const alpha = 0.05 + 0.6*(i/gTrail.length);
+      ctx.beginPath();
+      ctx.moveTo(cx(gTrail[i-1].x),cy(gTrail[i-1].y));
+      ctx.lineTo(cx(gTrail[i].x),  cy(gTrail[i].y));
+      ctx.strokeStyle=`rgba(63,185,80,${alpha})`;
+      ctx.lineWidth=1.5; ctx.stroke();
+    }
+  }
+
+  // Cross-track error line (vehicle → nearest path point)
+  if(gPath && gPath.waypoints.length && gLastS){
+    const vx=g.pos_x_m, vy=g.pos_y_m;
+    let best=gPath.waypoints[0], bestD=Infinity;
+    for(const p of gPath.waypoints){
+      const d=(p.x-vx)**2+(p.y-vy)**2;
+      if(d<bestD){bestD=d;best=p;}
+    }
+    const errM = Math.sqrt(bestD);
+    if(errM < 20){
+      ctx.beginPath();
+      ctx.moveTo(cx(vx),cy(vy)); ctx.lineTo(cx(best.x),cy(best.y));
+      ctx.strokeStyle='rgba(248,81,73,0.7)'; ctx.lineWidth=1.5;
+      ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  // Vehicle arrow
+  const vx=g.pos_x_m, vy=g.pos_y_m;
+  const headRad = (g.heading_deg - 90) * Math.PI/180;  // ENU: 0°=E,90°=N → rotate
+  drawArrow(ctx, cx(vx), cy(vy), headRad, 12, '#ffffff');
+
+  // Map info overlay
+  const infoEl=document.getElementById('map-info');
+  if(infoEl){
+    const pathLen = gPath ? gPath.length_m.toFixed(0)+'m' : '—';
+    const trailLen = gTrail.length ? (gTrail.length*0.2).toFixed(0)+'s' : '—';
+    infoEl.textContent = `Path ${pathLen}  |  Trail ${trailLen}  |  Scale ${(1/scale).toFixed(1)} m/px`;
+  }
+
+  // Map status badge
+  const mapBadge=document.getElementById('map-status-badge');
+  if(mapBadge){
+    if(!gPath) { mapBadge.textContent='NO PATH'; mapBadge.className='badge bg-grey'; }
+    else if(gLastS?.controller?.active){ mapBadge.textContent='FOLLOWING'; mapBadge.className='badge bg-green'; }
+    else { mapBadge.textContent='PATH LOADED'; mapBadge.className='badge bg-cyan'; }
+  }
 }
+
+function drawMapNoData(ctx, W, H){
+  ctx.fillStyle='#3b454f'; ctx.font='13px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('Waiting for GNSS + path data…', W/2, H/2);
+  ctx.textAlign='left';
+  const infoEl=document.getElementById('map-info');
+  if(infoEl) infoEl.textContent='No data';
+}
+
+function drawArrow(ctx, x, y, headingRad, size, color){
+  ctx.save();
+  ctx.translate(x, y);
+  // headingRad from ENU: East=0, CCW positiv. Canvas: right=0, CW positive.
+  // ENU to canvas: angle = -headingRad + π/2  → already done via (heading_deg-90)
+  ctx.rotate(headingRad);
+  ctx.beginPath();
+  ctx.moveTo(0, -size);          // tip (forward)
+  ctx.lineTo(-size*0.5, size*0.6);
+  ctx.lineTo(0, size*0.2);
+  ctx.lineTo(size*0.5,  size*0.6);
+  ctx.closePath();
+  ctx.fillStyle=color;
+  ctx.fill();
+  // Outline
+  ctx.strokeStyle='#00000088'; ctx.lineWidth=1; ctx.stroke();
+  ctx.restore();
+}
+
+function niceStep(raw){
+  const mag=Math.pow(10, Math.floor(Math.log10(raw)));
+  const f=raw/mag;
+  return (f<1.5?1:f<3.5?2:f<7.5?5:10)*mag;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Steering gauge
+// ═══════════════════════════════════════════════════════════════════════════
+function drawSteeringGauge(tgtDeg, measDeg){
+  const canvas=document.getElementById('steer-canvas');
+  const W=canvas.width, H=canvas.height;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  const cx2=W/2, cy2=H-18, R=Math.min(W/2,H)-22;
+  const MAX=MAX_AXLE_DEG;
+  const startA = Math.PI;          // 180° (left)
+  const endA   = 2*Math.PI;        // 360° (right) → top=270°=straight
+
+  function degToAngle(deg){ return 1.5*Math.PI + (deg/MAX)*(Math.PI/2); }
+  // Clamp to ±MAX
+  const t=Math.max(-MAX,Math.min(MAX,tgtDeg));
+  const m=Math.max(-MAX,Math.min(MAX,measDeg));
+
+  // Background arc
+  ctx.beginPath(); ctx.arc(cx2,cy2,R,startA,endA);
+  ctx.strokeStyle='#21262d'; ctx.lineWidth=14; ctx.lineCap='butt'; ctx.stroke();
+
+  // Tick marks every 5°
+  for(let d=-MAX;d<=MAX;d+=5){
+    const a=degToAngle(d);
+    const inner=d%10===0?R-20:R-12;
+    ctx.beginPath();
+    ctx.moveTo(cx2+Math.cos(a)*inner, cy2+Math.sin(a)*inner);
+    ctx.lineTo(cx2+Math.cos(a)*(R+2),  cy2+Math.sin(a)*(R+2));
+    ctx.strokeStyle=d%10===0?'#8b949e':'#3b454f'; ctx.lineWidth=d%10===0?1.5:0.8; ctx.stroke();
+    if(d%10===0){
+      ctx.fillStyle='#6e7681'; ctx.font='9px monospace'; ctx.textAlign='center';
+      const tr=inner-9;
+      ctx.fillText(d, cx2+Math.cos(a)*tr, cy2+Math.sin(a)*tr+3);
+    }
+  }
+
+  // Measured arc  (cyan)
+  const mA=degToAngle(m);
+  ctx.beginPath(); ctx.arc(cx2,cy2,R,startA,mA, m<0);
+  ctx.strokeStyle='#58d9f9'; ctx.lineWidth=10; ctx.lineCap='round'; ctx.stroke();
+
+  // Target needle (orange)
+  const tA=degToAngle(t);
+  ctx.beginPath();
+  ctx.moveTo(cx2+Math.cos(tA)*(R-22), cy2+Math.sin(tA)*(R-22));
+  ctx.lineTo(cx2+Math.cos(tA)*(R+6),  cy2+Math.sin(tA)*(R+6));
+  ctx.strokeStyle='#f0a500'; ctx.lineWidth=3; ctx.lineCap='round'; ctx.stroke();
+
+  // Center dot
+  ctx.beginPath(); ctx.arc(cx2,cy2,5,0,2*Math.PI);
+  ctx.fillStyle='#e6edf3'; ctx.fill();
+
+  // Straight-ahead line
+  const sa=degToAngle(0);
+  ctx.beginPath();
+  ctx.moveTo(cx2+Math.cos(sa)*(R-16), cy2+Math.sin(sa)*(R-16));
+  ctx.lineTo(cx2+Math.cos(sa)*(R+5),  cy2+Math.sin(sa)*(R+5));
+  ctx.strokeStyle='#ffffff44'; ctx.lineWidth=1.5; ctx.stroke();
+
+  // Labels
+  ctx.fillStyle='#6e7681'; ctx.font='10px sans-serif'; ctx.textAlign='left';
+  ctx.fillText('L', 6, cy2+4);
+  ctx.textAlign='right';
+  ctx.fillText('R', W-6, cy2+4);
+  ctx.textAlign='center';
+  ctx.fillStyle='#8b949e'; ctx.font='11px sans-serif';
+  ctx.fillText('Front Axle', cx2, cy2+16);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sparklines (SVG)
+// ═══════════════════════════════════════════════════════════════════════════
+function drawSparkline(svgId, history, color, rangeId){
+  const svg=document.getElementById(svgId);
+  if(!svg) return;
+  const W=240, H=52, PAD=3;
+  if(!history || history.length < 2){ svg.innerHTML=''; return; }
+
+  const vals = history.map(p=>p.v);
+  let mn=Math.min(...vals), mx=Math.max(...vals);
+  const span = mx-mn;
+  if(span < 0.001){ mn -= 0.5; mx += 0.5; }
+
+  const n=vals.length;
+  const pts = vals.map((v,i)=>{
+    const px = PAD + (i/(n-1))*(W-2*PAD);
+    const py = (H-PAD) - ((v-mn)/(mx-mn))*(H-2*PAD);
+    return `${px.toFixed(1)},${py.toFixed(1)}`;
+  }).join(' ');
+
+  // Zero line
+  const zeroY = (H-PAD) - ((0-mn)/(mx-mn))*(H-2*PAD);
+  const zeroLine = (mn<=0&&mx>=0)
+    ? `<line x1="${PAD}" y1="${zeroY.toFixed(1)}" x2="${W-PAD}" y2="${zeroY.toFixed(1)}" stroke="#30363d" stroke-width="1" stroke-dasharray="2,2"/>`
+    : '';
+
+  // Fill polygon
+  const first=vals.map((_,i)=>({px:PAD+(i/(n-1))*(W-2*PAD)}));
+  const polyPts = pts + ` ${first[n-1].px.toFixed(1)},${H-PAD} ${PAD},${H-PAD}`;
+
+  svg.innerHTML = `
+    ${zeroLine}
+    <polygon points="${polyPts}" fill="${color}" fill-opacity="0.12"/>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>`;
+
+  const rangeEl=document.getElementById(rangeId);
+  if(rangeEl) rangeEl.textContent=`[${mn.toFixed(2)}, ${mx.toFixed(2)}]`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Path fetching
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchPath(){
+  try{
+    const r=await fetch('/api/path');
+    if(!r.ok) return;
+    const d=await r.json();
+    if(d.waypoints && d.waypoints.length >= 2 && d.updated_at !== gPathTime){
+      gPath    = d;
+      gPathTime = d.updated_at;
+    }
+  } catch(e){}
+  setTimeout(fetchPath, PATH_POLL_MS);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Poll loop
+// ═══════════════════════════════════════════════════════════════════════════
+async function poll(){
+  try{
+    const r=await fetch('/api/status');
+    if(r.ok) render(await r.json());
+  } catch(e){
+    setClass('conn-dot','stale');
+  }
+  setTimeout(poll, POLL_MS);
+}
+
+// ── Resize map canvas on window resize ─────────────────────────────────────
+window.addEventListener('resize', ()=>{ if(gLastS) drawMap(gLastS.gnss, gLastS.controller); });
+
+// ── Boot ────────────────────────────────────────────────────────────────────
+fetchPath();
 poll();
 </script>
 </body>

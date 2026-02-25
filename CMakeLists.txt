@@ -70,21 +70,13 @@ ament_target_dependencies(path_follower_node
   nav_msgs 
   geometry_msgs
 )
-
-add_executable(test_maneuver_node src/test_maneuver_node.cpp)
-ament_target_dependencies(test_maneuver_node 
-  rclcpp 
-  std_msgs
-  nav_msgs 
-  geometry_msgs
-)
+target_link_libraries(path_follower_node ${cpp_typesupport_target})
 
 # Install executables
 install(TARGETS
   gnss_node
   comma_node
   path_follower_node
-  test_maneuver_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

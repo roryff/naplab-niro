@@ -1,483 +1,588 @@
+/**
+ * @file path_follower_node.cpp
+ * @brief ROS 2 path follower node using Stanley lateral control.
+ *
+ * Inputs
+ * ------
+ *   gnss/pose        (geometry_msgs/PoseStamped)   – ENU position + yaw from gnss_node
+ *   vehicle/state    (car_control/VehicleState)     – speed, steering angle from comma_node
+ *   enable_path_following (std_msgs/Bool)           – rising edge starts, any message while
+ *                                                     active stops path following
+ *
+ * Outputs (to future torque-control node)
+ * ----------------------------------------
+ *   cmd_vel          (geometry_msgs/Twist)
+ *       linear.x   = desired forward speed  [m/s]
+ *       angular.z  = desired front-axle steering angle  [rad]  (positive = left)
+ *
+ * Diagnostics
+ * -----------
+ *   path_visualization  (nav_msgs/Path)        – sampled path in ENU/map frame
+ *   lateral_error       (std_msgs/Float64)     – signed cross-track error [m]
+ *   heading_error       (std_msgs/Float64)     – heading error [rad]
+ *   path_following_status (std_msgs/Bool)      – true while actively following
+ */
+
 #include <rclcpp/rclcpp.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <nav_msgs/msg/path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <std_msgs/msg/float64.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <std_msgs/msg/float64.hpp>
+#include "car_control/msg/vehicle_state.hpp"
+
+#include <algorithm>
 #include <cmath>
-#include <vector>
+#include <limits>
 #include <mutex>
+#include <vector>
 
-/**
- * @brief Simple path structure for recording and following
- */
-struct PathPoint {
-    double x;        // Local ENU x (east)
-    double y;        // Local ENU y (north)
-    double heading;  // Heading in radians
-    double lat;      // Original latitude
-    double lon;      // Original longitude
-};
+// ============================================================
+// Tuning constants (overridable via ROS 2 parameters)
+// ============================================================
 
-/**
- * @brief ROS2 Path Follower Node for autonomous vehicle control
- * 
- * This node records and follows paths using Stanley controller.
- * Works with gnss_node for position and comma_node for vehicle control.
- * 
- * Subscriptions:
- *   - gnss/odometry (nav_msgs/Odometry): Current vehicle pose and velocity
- *   - gnss/fix (sensor_msgs/NavSatFix): GPS coordinates for path recording
- *   - vehicle/steering_angle (std_msgs/Float64): Current steering wheel angle [deg]
- *   - vehicle/speed (std_msgs/Float64): Current vehicle speed [km/h]
- *   - path/enable_recording (std_msgs/Bool): Start/stop path recording
- *   - path/enable_following (std_msgs/Bool): Start/stop path following
- * 
- * Publications:
- *   - control/steering_angle (std_msgs/Float64): Desired steering angle [deg]
- *   - control/speed (std_msgs/Float64): Desired speed [km/h]
- *   - path/following_active (std_msgs/Bool): Path following status
- *   - path/visualization (nav_msgs/Path): Path for visualization
- *   - path/lateral_error (std_msgs/Float64): Cross-track error [m]
- *   - path/heading_error (std_msgs/Float64): Heading error [rad]
- */
-class PathFollowerNode : public rclcpp::Node
+static constexpr double CONTROL_HZ          = 20.0;         // control loop rate
+static constexpr double WHEELBASE           = 2.79;         // Kia Niro [m]
+static constexpr double MAX_STEER_ANGLE     = 0.5236;       // ≈ 30 deg front axle [rad]
+static constexpr double MIN_SPEED           = 0.3;          // [m/s] – stop threshold
+static constexpr double DEFAULT_SPEED       = 4.0;          // [m/s]
+static constexpr double STOP_DISTANCE       = 3.0;          // distance from end to start stopping [m]
+static constexpr double SOFT_START_DURATION = 3.0;          // ramp gains over first N seconds
+
+// Default Stanley gains
+static constexpr double DEFAULT_K_PSI      = 1.0;   // heading-error gain
+static constexpr double DEFAULT_K_CTE      = 0.5;   // cross-track-error gain
+static constexpr double DEFAULT_K_SOFT     = 1.0;   // softening term (avoids div-by-zero)
+static constexpr double DEFAULT_K_D_STEER  = 0.1;   // steering-rate damping gain
+
+// ============================================================
+// Piecewise-linear path in ENU frame
+// ============================================================
+class Path
 {
 public:
-    PathFollowerNode() : Node("path_follower_node"), 
-                         path_(),
-                         closest_point_idx_(0),
-                         recording_(false),
-                         following_(false)
+    Path() = default;
+
+    void clear()
     {
-        // Declare parameters
-        this->declare_parameter("wheelbase", 2.7);  // meters
-        this->declare_parameter("max_steering_angle_deg", 30.0);
-        this->declare_parameter("max_steering_wheel_angle_deg", 460.0);
-        this->declare_parameter("lookahead_distance", 5.0);  // meters
-        this->declare_parameter("stanley_k_e", 0.5);  // Cross-track error gain
-        this->declare_parameter("stanley_k_v", 1.0);  // Softening term
-        this->declare_parameter("max_speed_kmh", 30.0);
-        this->declare_parameter("min_recording_distance", 2.0);  // Min distance between recorded points
-        
-        // Get parameters
-        wheelbase_ = this->get_parameter("wheelbase").as_double();
-        max_steering_angle_ = this->get_parameter("max_steering_angle_deg").as_double() * M_PI / 180.0;
-        max_steering_wheel_angle_ = this->get_parameter("max_steering_wheel_angle_deg").as_double();
-        lookahead_distance_ = this->get_parameter("lookahead_distance").as_double();
-        k_e_ = this->get_parameter("stanley_k_e").as_double();
-        k_v_ = this->get_parameter("stanley_k_v").as_double();
-        max_speed_ = this->get_parameter("max_speed_kmh").as_double();
-        min_recording_distance_ = this->get_parameter("min_recording_distance").as_double();
-        
-        // Subscribers
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "gnss/odometry", 10,
-            std::bind(&PathFollowerNode::odomCallback, this, std::placeholders::_1));
-        
-        fix_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-            "gnss/fix", 10,
-            std::bind(&PathFollowerNode::fixCallback, this, std::placeholders::_1));
-        
-        steering_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-            "vehicle/steering_angle", 10,
-            std::bind(&PathFollowerNode::steeringCallback, this, std::placeholders::_1));
-        
-        speed_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-            "vehicle/speed", 10,
-            std::bind(&PathFollowerNode::speedCallback, this, std::placeholders::_1));
-        
-        record_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "path/enable_recording", 10,
-            std::bind(&PathFollowerNode::recordCallback, this, std::placeholders::_1));
-        
-        follow_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "path/enable_following", 10,
-            std::bind(&PathFollowerNode::followCallback, this, std::placeholders::_1));
-        
-        // Publishers
-        steering_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            "control/steering_angle", 10);
-        speed_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            "control/speed", 10);
-        status_pub_ = this->create_publisher<std_msgs::msg::Bool>(
-            "path/following_active", 10);
-        path_viz_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-            "path/visualization", 10);
-        lateral_error_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            "path/lateral_error", 10);
-        heading_error_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            "path/heading_error", 10);
-        
-        // Control timer (20 Hz)
+        wpts_.clear();
+        s_.clear();
+    }
+
+    bool isEmpty() const { return wpts_.empty(); }
+
+    void addWaypoint(double x, double y)
+    {
+        if (wpts_.empty()) {
+            s_.push_back(0.0);
+        } else {
+            double dx = x - wpts_.back().first;
+            double dy = y - wpts_.back().second;
+            s_.push_back(s_.back() + std::hypot(dx, dy));
+        }
+        wpts_.emplace_back(x, y);
+    }
+
+    double totalLength() const
+    {
+        return s_.empty() ? 0.0 : s_.back();
+    }
+
+    /**
+     * Find arc-length of the point on the path closest to (qx, qy).
+     * @param hint  Start index for search (updated in place; prevents backward jumps).
+     */
+    double findClosest(double qx, double qy, size_t & hint) const
+    {
+        if (wpts_.size() < 2) return 0.0;
+
+        double best_sq  = std::numeric_limits<double>::max();
+        double best_s   = s_[hint];
+        size_t end_idx  = std::min(wpts_.size() - 1, hint + 300);
+
+        for (size_t i = hint; i < end_idx; ++i) {
+            double ax = wpts_[i].first,     ay = wpts_[i].second;
+            double bx = wpts_[i+1].first,   by = wpts_[i+1].second;
+            double dx = bx - ax,            dy = by - ay;
+            double seg2 = dx*dx + dy*dy;
+            if (seg2 < 1e-12) continue;
+
+            double t = ((qx-ax)*dx + (qy-ay)*dy) / seg2;
+            t = std::clamp(t, 0.0, 1.0);
+
+            double px = ax + t*dx, py = ay + t*dy;
+            double d2 = (qx-px)*(qx-px) + (qy-py)*(qy-py);
+
+            if (d2 < best_sq) {
+                best_sq  = d2;
+                best_s   = s_[i] + t * std::sqrt(seg2);
+                hint     = i;
+            }
+        }
+        return best_s;
+    }
+
+    /** Position at arc-length s. */
+    std::pair<double,double> position(double s) const { return interp(s); }
+
+    /** Path tangent heading [rad] (ENU convention: East=0, CCW positive). */
+    double heading(double s) const
+    {
+        constexpr double ds = 0.2;
+        auto [x0, y0] = interp(std::max(0.0, s - ds));
+        auto [x1, y1] = interp(std::min(totalLength(), s + ds));
+        return std::atan2(y1 - y0, x1 - x0);
+    }
+
+    /**
+     * Signed cross-track error at position (qx, qy) for path point at arc-length s.
+     * Positive = vehicle is to the LEFT of the path.
+     */
+    double crossTrackError(double qx, double qy, double s) const
+    {
+        auto [px, py] = interp(s);
+        double h  = heading(s);
+        // Left-hand normal of path direction
+        double nx =  std::sin(h);
+        double ny = -std::cos(h);
+        return (qx - px)*nx + (qy - py)*ny;
+    }
+
+    /**
+     * Signed heading error: path_heading – car_heading, wrapped to [-π, π].
+     * Positive = car is pointing to the right of the path.
+     */
+    double headingError(double s, double car_heading) const
+    {
+        double err = heading(s) - car_heading;
+        // Wrap
+        while (err >  M_PI) err -= 2.0*M_PI;
+        while (err < -M_PI) err += 2.0*M_PI;
+        return err;
+    }
+
+    const std::vector<std::pair<double,double>>& waypoints() const { return wpts_; }
+
+private:
+    std::vector<std::pair<double,double>> wpts_;
+    std::vector<double>                   s_;
+
+    std::pair<double,double> interp(double s) const
+    {
+        if (wpts_.empty()) return {0.0, 0.0};
+        if (s <= 0.0)              return wpts_.front();
+        if (s >= s_.back())        return wpts_.back();
+
+        auto it  = std::lower_bound(s_.begin(), s_.end(), s);
+        size_t i = std::distance(s_.begin(), it);
+        if (i == 0) return wpts_[0];
+        i = std::min(i, wpts_.size() - 1);
+
+        double t = (s_[i] - s_[i-1] > 1e-12) ?
+                   (s - s_[i-1]) / (s_[i] - s_[i-1]) : 0.0;
+        t = std::clamp(t, 0.0, 1.0);
+
+        return {
+            wpts_[i-1].first  + t*(wpts_[i].first  - wpts_[i-1].first),
+            wpts_[i-1].second + t*(wpts_[i].second - wpts_[i-1].second)
+        };
+    }
+};
+
+// ============================================================
+// PathFollowerNode
+// ============================================================
+class PathFollowerNode : public rclcpp::Node
+{
+    enum class State { IDLE, FOLLOWING, STOPPING };
+
+public:
+        PathFollowerNode()
+        : Node("path_follower_node"),
+            state_(State::IDLE),
+            path_start_time_(this->now()),
+            hint_front_(0)
+    {
+        // ---- Parameters --------------------------------------------------------
+        this->declare_parameter("desired_speed_mps", DEFAULT_SPEED);
+        this->declare_parameter("stop_distance",     STOP_DISTANCE);
+        this->declare_parameter("k_psi",             DEFAULT_K_PSI);
+        this->declare_parameter("k_cte",             DEFAULT_K_CTE);
+        this->declare_parameter("k_soft",            DEFAULT_K_SOFT);
+        this->declare_parameter("k_d_steer",         DEFAULT_K_D_STEER);
+
+        // ---- Subscriptions -----------------------------------------------------
+        gnss_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "gnss/pose", 10,
+            std::bind(&PathFollowerNode::gnssPoseCallback, this, std::placeholders::_1));
+
+        vehicle_state_sub_ = this->create_subscription<car_control::msg::VehicleState>(
+            "vehicle/state", 10,
+            std::bind(&PathFollowerNode::vehicleStateCallback, this, std::placeholders::_1));
+
+        enable_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "enable_path_following", 10,
+            std::bind(&PathFollowerNode::enableCallback, this, std::placeholders::_1));
+
+        // ---- Publishers --------------------------------------------------------
+        cmd_vel_pub_   = this->create_publisher<geometry_msgs::msg::Twist>(
+            "cmd_vel", 10);
+        auto latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+        path_vis_pub_  = this->create_publisher<nav_msgs::msg::Path>(
+            "path_visualization", latched_qos);
+        lat_err_pub_   = this->create_publisher<std_msgs::msg::Float64>(
+            "lateral_error", 10);
+        hdg_err_pub_   = this->create_publisher<std_msgs::msg::Float64>(
+            "heading_error", 10);
+        status_pub_    = this->create_publisher<std_msgs::msg::Bool>(
+            "path_following_status", latched_qos);
+
+        // ---- Build test path ---------------------------------------------------
+        //  Sinusoidal path starting at ENU origin (= first GNSS fix).
+        //  Adjust parameters to suit the test environment.
+        createSinusoidalPath(
+            500.0,   // total length [m]
+            3.0,     // initial lateral amplitude [m]
+            8.0,     // final   lateral amplitude [m]
+            80.0,    // initial wavelength [m]
+            50.0,    // final   wavelength [m]
+            1.0);    // waypoint spacing   [m]
+
+        publishPathVisualization();
+
+        // ---- Control timer -----------------------------------------------------
+        using namespace std::chrono_literals;
         control_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(50),
+            std::chrono::duration<double>(1.0 / CONTROL_HZ),
             std::bind(&PathFollowerNode::controlLoop, this));
-        
-        RCLCPP_INFO(this->get_logger(), "Path Follower Node initialized");
-        RCLCPP_INFO(this->get_logger(), "  Wheelbase: %.2f m", wheelbase_);
-        RCLCPP_INFO(this->get_logger(), "  Max steering: %.1f deg", max_steering_angle_ * 180.0 / M_PI);
-        RCLCPP_INFO(this->get_logger(), "  Lookahead: %.2f m", lookahead_distance_);
+
+        RCLCPP_INFO(this->get_logger(),
+            "PathFollowerNode ready.  Path length: %.1f m.  "
+            "Publish 'true' on ~/enable_path_following to start.",
+            path_.totalLength());
     }
 
 private:
-    /**
-     * @brief Main control loop - runs at 20 Hz
-     */
-    void controlLoop()
+    // =========================================================================
+    // Callbacks
+    // =========================================================================
+
+    void gnssPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
-        if (!following_ || path_.empty()) {
-            return;
-        }
-        
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        
-        // Find closest point on path
-        findClosestPoint();
-        
-        // Calculate errors
-        double cross_track_error = calculateCrossTrackError();
-        double heading_error = calculateHeadingError();
-        
-        // Stanley controller
-        double steering_angle = stanleyControl(cross_track_error, heading_error);
-        
-        // Publish commands
-        auto steering_msg = std_msgs::msg::Float64();
-        auto speed_msg = std_msgs::msg::Float64();
-        
-        // Convert steering angle to steering wheel angle
-        double steering_wheel_angle = (steering_angle * 180.0 / M_PI) * 
-                                       (max_steering_wheel_angle_ / (max_steering_angle_ * 180.0 / M_PI));
-        steering_msg.data = steering_wheel_angle;  // degrees
-        speed_msg.data = max_speed_;  // km/h
-        
-        steering_cmd_pub_->publish(steering_msg);
-        speed_cmd_pub_->publish(speed_msg);
-        
-        // Publish errors for monitoring
-        auto lat_err_msg = std_msgs::msg::Float64();
-        auto head_err_msg = std_msgs::msg::Float64();
-        lat_err_msg.data = cross_track_error;
-        head_err_msg.data = heading_error;
-        lateral_error_pub_->publish(lat_err_msg);
-        heading_error_pub_->publish(head_err_msg);
-        
-        // Check if we've reached the end
-        if (closest_point_idx_ >= path_.size() - 5) {
-            RCLCPP_INFO(this->get_logger(), "Path end reached, stopping");
-            stopFollowing();
-        }
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        car_x_ = msg->pose.position.x;
+        car_y_ = msg->pose.position.y;
+
+        // Extract yaw from quaternion (standard ROS convention)
+        const auto & q = msg->pose.orientation;
+        car_heading_ = std::atan2(
+            2.0*(q.w*q.z + q.x*q.y),
+            1.0 - 2.0*(q.y*q.y + q.z*q.z));
+
+        gnss_valid_ = true;
     }
-    
-    /**
-     * @brief Stanley lateral controller
-     */
-    double stanleyControl(double cross_track_error, double heading_error)
+
+    void vehicleStateCallback(const car_control::msg::VehicleState::SharedPtr msg)
     {
-        // Stanley control law: δ = ψ + arctan(k_e * e / (k_v + v))
-        double v = current_speed_ / 3.6;  // Convert km/h to m/s
-        
-        double steering_angle = heading_error + 
-                                std::atan2(k_e_ * cross_track_error, k_v_ + v);
-        
-        // Clamp to limits
-        steering_angle = std::max(-max_steering_angle_, 
-                                  std::min(max_steering_angle_, steering_angle));
-        
-        return steering_angle;
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        // v_ego is in km/h (comma_node converts m/s → km/h)
+        car_speed_mps_ = static_cast<double>(msg->v_ego) / 3.6;
+
+        // steering_angle_deg is the steering-wheel angle [deg].
+        // Convert to front-axle angle [rad] via the mechanical ratio.
+        // Kia Niro: ~460 deg lock-to-lock steering wheel → ~30 deg front axle
+        constexpr double RATIO = MAX_STEER_ANGLE / (460.0 * M_PI / 180.0);
+        car_steer_rad_ = static_cast<double>(msg->steering_angle_deg) * (M_PI / 180.0) * RATIO;
     }
-    
-    /**
-     * @brief Find closest point on path to current position
-     */
-    void findClosestPoint()
+
+    void enableCallback(const std_msgs::msg::Bool::SharedPtr msg)
     {
-        double min_dist = std::numeric_limits<double>::max();
-        size_t search_start = (closest_point_idx_ > 10) ? closest_point_idx_ - 10 : 0;
-        size_t search_end = std::min(closest_point_idx_ + 50, path_.size());
-        
-        for (size_t i = search_start; i < search_end; ++i) {
-            double dx = path_[i].x - current_x_;
-            double dy = path_[i].y - current_y_;
-            double dist = std::sqrt(dx*dx + dy*dy);
-            
-            if (dist < min_dist) {
-                min_dist = dist;
-                closest_point_idx_ = i;
-            }
-        }
-    }
-    
-    /**
-     * @brief Calculate cross-track error (lateral distance from path)
-     */
-    double calculateCrossTrackError()
-    {
-        if (closest_point_idx_ >= path_.size()) return 0.0;
-        
-        const auto& closest = path_[closest_point_idx_];
-        
-        // Vector from closest point to vehicle
-        double dx = current_x_ - closest.x;
-        double dy = current_y_ - closest.y;
-        
-        // Path direction at closest point
-        double path_heading = closest.heading;
-        
-        // Cross-track error is perpendicular distance
-        // Positive error means vehicle is to the right of the path
-        double error = -dx * std::sin(path_heading) + dy * std::cos(path_heading);
-        
-        return error;
-    }
-    
-    /**
-     * @brief Calculate heading error relative to path
-     */
-    double calculateHeadingError()
-    {
-        if (closest_point_idx_ >= path_.size()) return 0.0;
-        
-        double path_heading = path_[closest_point_idx_].heading;
-        double error = path_heading - current_heading_;
-        
-        // Normalize to [-pi, pi]
-        while (error > M_PI) error -= 2.0 * M_PI;
-        while (error < -M_PI) error += 2.0 * M_PI;
-        
-        return error;
-    }
-    
-    /**
-     * @brief Odometry callback - updates current vehicle state
-     */
-    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        
-        current_x_ = msg->pose.pose.position.x;
-        current_y_ = msg->pose.pose.position.y;
-        
-        // Extract yaw from quaternion
-        double qx = msg->pose.pose.orientation.x;
-        double qy = msg->pose.pose.orientation.y;
-        double qz = msg->pose.pose.orientation.z;
-        double qw = msg->pose.pose.orientation.w;
-        current_heading_ = std::atan2(2.0 * (qw*qz + qx*qy), 
-                                      1.0 - 2.0 * (qy*qy + qz*qz));
-        
-        // Record path if enabled
-        if (recording_) {
-            recordPoint();
-        }
-        
-        // Publish path visualization periodically
-        static int viz_counter = 0;
-        if (++viz_counter >= 10) {
-            publishPathVisualization();
-            viz_counter = 0;
-        }
-    }
-    
-    /**
-     * @brief GPS fix callback - saves lat/lon with path points
-     */
-    void fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        current_lat_ = msg->latitude;
-        current_lon_ = msg->longitude;
-    }
-    
-    /**
-     * @brief Steering angle callback
-     */
-    void steeringCallback(const std_msgs::msg::Float64::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        current_steering_angle_ = msg->data * M_PI / 180.0;  // Convert to radians
-    }
-    
-    /**
-     * @brief Speed callback
-     */
-    void speedCallback(const std_msgs::msg::Float64::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        current_speed_ = msg->data;  // km/h
-    }
-    
-    /**
-     * @brief Record path callback
-     */
-    void recordCallback(const std_msgs::msg::Bool::SharedPtr msg)
-    {
-        if (msg->data && !recording_ && !following_) {
-            // Start recording
-            path_.clear();
-            recording_ = true;
-            RCLCPP_INFO(this->get_logger(), "Started path recording");
-        } else if (!msg->data && recording_) {
-            // Stop recording
-            recording_ = false;
-            RCLCPP_INFO(this->get_logger(), "Stopped path recording. Recorded %zu points", path_.size());
-        }
-    }
-    
-    /**
-     * @brief Follow path callback
-     */
-    void followCallback(const std_msgs::msg::Bool::SharedPtr msg)
-    {
-        if (msg->data && !following_ && !recording_) {
-            // Start following
-            if (path_.empty()) {
-                RCLCPP_WARN(this->get_logger(), "Cannot start following: path is empty");
+        if (!msg->data) return;  // Only react to rising edge / 'true' messages
+
+        if (state_ == State::IDLE) {
+            if (!gnss_valid_) {
+                RCLCPP_WARN(this->get_logger(), "Cannot start: no GNSS fix received yet.");
                 return;
             }
-            
-            following_ = true;
-            closest_point_idx_ = 0;
-            
-            auto status_msg = std_msgs::msg::Bool();
-            status_msg.data = true;
-            status_pub_->publish(status_msg);
-            
-            RCLCPP_INFO(this->get_logger(), "Started path following with %zu points", path_.size());
-        } else if (!msg->data && following_) {
-            stopFollowing();
-        }
-    }
-    
-    /**
-     * @brief Stop path following
-     */
-    void stopFollowing()
-    {
-        following_ = false;
-        
-        auto status_msg = std_msgs::msg::Bool();
-        status_msg.data = false;
-        status_pub_->publish(status_msg);
-        
-        // Send zero commands
-        auto steering_msg = std_msgs::msg::Float64();
-        auto speed_msg = std_msgs::msg::Float64();
-        steering_msg.data = 0.0;
-        speed_msg.data = 0.0;
-        steering_cmd_pub_->publish(steering_msg);
-        speed_cmd_pub_->publish(speed_msg);
-        
-        RCLCPP_INFO(this->get_logger(), "Stopped path following");
-    }
-    
-    /**
-     * @brief Record a point on the path
-     */
-    void recordPoint()
-    {
-        // Only record if we've moved enough distance from last point
-        if (!path_.empty()) {
-            const auto& last = path_.back();
-            double dx = current_x_ - last.x;
-            double dy = current_y_ - last.y;
-            double dist = std::sqrt(dx*dx + dy*dy);
-            
-            if (dist < min_recording_distance_) {
-                return;  // Too close to last point
+            if (path_.isEmpty()) {
+                RCLCPP_WARN(this->get_logger(), "Cannot start: path is empty.");
+                return;
             }
-        }
-        
-        PathPoint point;
-        point.x = current_x_;
-        point.y = current_y_;
-        point.heading = current_heading_;
-        point.lat = current_lat_;
-        point.lon = current_lon_;
-        
-        path_.push_back(point);
-        
-        if (path_.size() % 10 == 0) {
-            RCLCPP_INFO(this->get_logger(), "Recorded %zu points", path_.size());
+            // Reset state for a fresh start
+            hint_front_   = 0;
+            {
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                prev_steer_rad_ = car_steer_rad_;
+            }
+            path_start_time_ = this->now();
+            state_ = State::FOLLOWING;
+
+            RCLCPP_INFO(this->get_logger(), "Path following STARTED.");
+            publishStatus(true);
+
+        } else if (state_ == State::FOLLOWING || state_ == State::STOPPING) {
+            RCLCPP_INFO(this->get_logger(), "Path following STOPPED by user.");
+            state_ = State::IDLE;
+            publishCmd(0.0, 0.0);
+            publishStatus(false);
         }
     }
-    
+
+    // =========================================================================
+    // Control loop (20 Hz)
+    // =========================================================================
+    void controlLoop()
+    {
+        if (state_ == State::IDLE) return;
+
+        // Snapshot latest vehicle state
+        double car_x, car_y, car_heading, car_speed, car_steer;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            car_x       = car_x_;
+            car_y       = car_y_;
+            car_heading = car_heading_;
+            car_speed   = car_speed_mps_;
+            car_steer   = car_steer_rad_;
+        }
+
+        // --- Stopping check --------------------------------------------------
+        if (state_ == State::STOPPING && car_speed <= MIN_SPEED) {
+            RCLCPP_INFO(this->get_logger(), "Path end reached. Returning to IDLE.");
+            state_ = State::IDLE;
+            publishCmd(0.0, 0.0);
+            publishStatus(false);
+            return;
+        }
+
+        // --- Project front axle onto path ------------------------------------
+        double cos_h  = std::cos(car_heading);
+        double sin_h  = std::sin(car_heading);
+        double front_x = car_x + WHEELBASE * cos_h;
+        double front_y = car_y + WHEELBASE * sin_h;
+
+        double s_front = path_.findClosest(front_x, front_y, hint_front_);
+
+        // Also find rear axle arc-length for heading error reference
+        size_t hint_rear = (hint_front_ > 0) ? hint_front_ - 1 : 0;
+        double s_rear    = path_.findClosest(car_x, car_y, hint_rear);
+
+        // --- Check if approaching end of path --------------------------------
+        double remaining = path_.totalLength() - s_rear;
+        if (remaining < this->get_parameter("stop_distance").as_double() &&
+            state_ == State::FOLLOWING)
+        {
+            RCLCPP_INFO(this->get_logger(),
+                "Approaching path end (%.1f m remaining). Slowing down...", remaining);
+            state_ = State::STOPPING;
+        }
+
+        // --- Stanley controller ----------------------------------------------
+        // Cross-track error: referenced at front axle
+        double e   = path_.crossTrackError(front_x, front_y, s_front);
+        // Heading error: referenced at rear axle (more stable)
+        double psi = path_.headingError(s_rear, car_heading);
+
+        // Soft-start ramp
+        double elapsed = (this->now() - path_start_time_).seconds();
+        double ramp    = std::min(1.0, elapsed / SOFT_START_DURATION);
+
+        double k_psi     = ramp * this->get_parameter("k_psi").as_double();
+        double k_cte     = ramp * this->get_parameter("k_cte").as_double();
+        double k_soft    =        this->get_parameter("k_soft").as_double();
+        double k_d_steer = ramp * this->get_parameter("k_d_steer").as_double();
+
+        double steer_cmd = 0.0;
+        if (state_ == State::FOLLOWING) {
+            double v_eff  = std::max(0.5, car_speed);  // avoid div-by-zero
+            steer_cmd = k_psi * psi
+                      + std::atan2(k_cte * e, k_soft + v_eff)
+                      + k_d_steer * (prev_steer_rad_ - car_steer);
+            steer_cmd = std::clamp(steer_cmd, -MAX_STEER_ANGLE, MAX_STEER_ANGLE);
+        }
+        prev_steer_rad_ = car_steer;
+
+        // --- Desired speed ---------------------------------------------------
+        double desired_speed = (state_ == State::STOPPING) ? 0.0
+            : this->get_parameter("desired_speed_mps").as_double();
+
+        // --- Publish ---------------------------------------------------------
+        publishCmd(desired_speed, steer_cmd);
+        publishDiagnostics(e, psi);
+
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "[%s]  s=%.1f/%.1f m | CTE=%.3f m | Psi=%.2f° | steer_cmd=%.2f° | v=%.2f m/s",
+            (state_ == State::FOLLOWING) ? "FOLLOWING" : "STOPPING",
+            s_rear, path_.totalLength(),
+            e, psi * 180.0 / M_PI,
+            steer_cmd * 180.0 / M_PI,
+            car_speed);
+    }
+
+    // =========================================================================
+    // Path generation
+    // =========================================================================
+
     /**
-     * @brief Publish path visualization
+     * @brief Generate a sinusoidal path in ENU starting at the origin (0, 0).
+     *
+     * The path starts at the ENU origin, which corresponds to the first GNSS fix
+     * recorded by gnss_node.  Position the vehicle at that fix before enabling
+     * path following.
+     *
+     * @param total_length   Total arc length of the path      [m]
+     * @param init_amp       Lateral amplitude at the start    [m]
+     * @param final_amp      Lateral amplitude at the end      [m]
+     * @param init_wl        Wavelength at the start           [m]
+     * @param final_wl       Wavelength at the end             [m]
+     * @param spacing        Distance between waypoints        [m]
      */
+    void createSinusoidalPath(double total_length,
+                              double init_amp,  double final_amp,
+                              double init_wl,   double final_wl,
+                              double spacing)
+    {
+        path_.clear();
+        hint_front_ = 0;
+
+        const double sinusoid_len = total_length - 60.0;   // leave a straight run-out
+        const int    n_sin        = static_cast<int>(sinusoid_len / spacing);
+        const int    n_tot        = static_cast<int>(total_length / spacing);
+
+        // Origin waypoint
+        path_.addWaypoint(0.0, 0.0);
+
+        // Sinusoidal section
+        for (int i = 1; i <= n_sin; ++i) {
+            double x        = i * spacing;
+            double progress = x / sinusoid_len;
+            double amp      = init_amp + (final_amp - init_amp) * progress;
+            double wl       = init_wl  + (final_wl  - init_wl)  * progress;
+            double y        = amp * std::sin(2.0 * M_PI / wl * x);
+            path_.addWaypoint(x, y);
+        }
+
+        // Taper the lateral offset back to zero over 15 m, then run straight
+        const double last_s   = sinusoid_len;
+        const double last_amp = init_amp + (final_amp - init_amp) * 1.0;
+        const double last_wl  = init_wl  + (final_wl  - init_wl)  * 1.0;
+        const double last_y   = last_amp * std::sin(2.0 * M_PI / last_wl * last_s);
+        constexpr double TAPER_LEN = 15.0;
+
+        for (int i = n_sin + 1; i <= n_tot; ++i) {
+            double x      = i * spacing;
+            double d_end  = x - sinusoid_len;
+            double taper  = std::max(0.0, 1.0 - d_end / TAPER_LEN);
+            path_.addWaypoint(x, last_y * taper);
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+            "Sinusoidal path created: %.1f m total, %d waypoints.",
+            path_.totalLength(), n_tot + 1);
+    }
+
+    // =========================================================================
+    // Publish helpers
+    // =========================================================================
+
+    /**
+     * Publish the control command.
+     * @param desired_speed_mps  Desired forward speed [m/s]
+     * @param steer_angle_rad    Desired front-axle steering angle [rad]
+     *                           (positive = left, i.e. counter-clockwise yaw rate)
+     */
+    void publishCmd(double desired_speed_mps, double steer_angle_rad)
+    {
+        geometry_msgs::msg::Twist cmd;
+        cmd.linear.x  = desired_speed_mps;
+        cmd.angular.z = steer_angle_rad;
+        cmd_vel_pub_->publish(cmd);
+    }
+
+    void publishStatus(bool active)
+    {
+        std_msgs::msg::Bool msg;
+        msg.data = active;
+        status_pub_->publish(msg);
+    }
+
+    void publishDiagnostics(double lateral_error, double heading_error)
+    {
+        std_msgs::msg::Float64 lat_msg, hdg_msg;
+        lat_msg.data = lateral_error;
+        hdg_msg.data = heading_error;
+        lat_err_pub_->publish(lat_msg);
+        hdg_err_pub_->publish(hdg_msg);
+    }
+
     void publishPathVisualization()
     {
-        if (path_.empty()) return;
-        
-        auto path_msg = nav_msgs::msg::Path();
-        path_msg.header.stamp = this->now();
+        if (path_.isEmpty()) return;
+
+        nav_msgs::msg::Path path_msg;
+        path_msg.header.stamp    = this->now();
         path_msg.header.frame_id = "map";
-        
-        for (const auto& point : path_) {
-            geometry_msgs::msg::PoseStamped pose;
-            pose.header = path_msg.header;
-            pose.pose.position.x = point.x;
-            pose.pose.position.y = point.y;
-            pose.pose.position.z = 0.0;
-            
-            // Convert heading to quaternion
-            pose.pose.orientation.x = 0.0;
-            pose.pose.orientation.y = 0.0;
-            pose.pose.orientation.z = std::sin(point.heading / 2.0);
-            pose.pose.orientation.w = std::cos(point.heading / 2.0);
-            
-            path_msg.poses.push_back(pose);
+
+        const double total = path_.totalLength();
+        const int    N     = 200;
+        const double step  = total / (N - 1);
+
+        for (int i = 0; i < N; ++i) {
+            double s = i * step;
+            auto [x, y] = path_.position(s);
+
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header = path_msg.header;
+            ps.pose.position.x = x;
+            ps.pose.position.y = y;
+            ps.pose.position.z = 0.0;
+
+            double h = path_.heading(s);
+            ps.pose.orientation.w = std::cos(h / 2.0);
+            ps.pose.orientation.x = 0.0;
+            ps.pose.orientation.y = 0.0;
+            ps.pose.orientation.z = std::sin(h / 2.0);
+
+            path_msg.poses.push_back(ps);
         }
-        
-        path_viz_pub_->publish(path_msg);
+
+        path_vis_pub_->publish(path_msg);
     }
-    
-    // ROS2 communication
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr steering_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr speed_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr record_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr follow_sub_;
-    
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr steering_cmd_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr speed_cmd_pub_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr status_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_viz_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr lateral_error_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_error_pub_;
-    
-    rclcpp::TimerBase::SharedPtr control_timer_;
-    
-    // Path data
-    std::vector<PathPoint> path_;
-    size_t closest_point_idx_;
-    
-    // State
-    std::mutex state_mutex_;
-    bool recording_;
-    bool following_;
-    
-    // Current vehicle state
-    double current_x_ = 0.0;
-    double current_y_ = 0.0;
-    double current_heading_ = 0.0;
-    double current_lat_ = 0.0;
-    double current_lon_ = 0.0;
-    double current_speed_ = 0.0;  // km/h
-    double current_steering_angle_ = 0.0;  // radians
-    
-    // Parameters
-    double wheelbase_;
-    double max_steering_angle_;
-    double max_steering_wheel_angle_;
-    double lookahead_distance_;
-    double k_e_;  // Stanley cross-track gain
-    double k_v_;  // Stanley softening term
-    double max_speed_;
-    double min_recording_distance_;
+
+    // =========================================================================
+    // Member variables
+    // =========================================================================
+
+    // State machine
+    State            state_;
+    rclcpp::Time     path_start_time_;
+
+    // Vehicle state (written by callbacks, read by control loop)
+    std::mutex       data_mutex_;
+    double           car_x_         = 0.0;
+    double           car_y_         = 0.0;
+    double           car_heading_   = 0.0;
+    double           car_speed_mps_ = 0.0;
+    double           car_steer_rad_ = 0.0;
+    double           prev_steer_rad_= 0.0;
+    bool             gnss_valid_    = false;
+
+    // Path
+    Path             path_;
+    size_t           hint_front_;   // search hint – prevents backward jumps
+
+    // ROS 2 handles
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  gnss_pose_sub_;
+    rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr   vehicle_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              enable_sub_;
+
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr           cmd_vel_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                 path_vis_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              lat_err_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              hdg_err_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 status_pub_;
+
+    rclcpp::TimerBase::SharedPtr                                      control_timer_;
 };
 
 int main(int argc, char** argv)
