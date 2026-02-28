@@ -28,15 +28,27 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
+
+# ---------------------------------------------------------------
+# OSQP – fetch and build from source with 64-bit integers
+# ---------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+  osqp
+  GIT_REPOSITORY https://github.com/osqp/osqp
+  GIT_TAG        master
+  GIT_SHALLOW    TRUE
+)
+set(OSQP_USE_LONG     ON  CACHE BOOL "Use 64-bit integers in OSQP" FORCE)
+set(OSQP_USE_FLOAT    OFF CACHE BOOL "Use double precision in OSQP" FORCE)
+set(OSQP_BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(OSQP_BUILD_DEMO_EXE  OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(osqp)
+# ---------------------------------------------------------------
 
 # Expose the package's own include/ directory to all targets
 include_directories(include)
@@ -72,17 +84,24 @@ ament_target_dependencies(path_follower_node
 )
 target_link_libraries(path_follower_node ${cpp_typesupport_target})
 
+add_executable(steering_mpc_node src/steering_mpc_node.cpp)
+ament_target_dependencies(steering_mpc_node rclcpp std_msgs geometry_msgs)
+target_include_directories(steering_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
+target_link_libraries(steering_mpc_node osqpstatic ${cpp_typesupport_target})
+
 # Install executables
 install(TARGETS
   gnss_node
   comma_node
   path_follower_node
+  steering_mpc_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
 # Install Python scripts
 install(PROGRAMS
   scripts/dashboard_server.py
+  scripts/drive_recorder.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -95,6 +114,12 @@ install(FILES
 # Install launch files
 install(DIRECTORY
   launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# Install config files
+install(DIRECTORY
+  config
   DESTINATION share/${PROJECT_NAME}
 )
 

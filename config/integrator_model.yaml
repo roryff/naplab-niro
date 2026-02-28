@@ -1,0 +1,19 @@
+# Integrator forward model (exported from best_int.pkl)
+# Used by steering_mpc_node
+
+tau_r: 0.05
+gain_r: 20.0
+leak: 0.2
+u0: 0.02
+rate_clip: 500.0
+max_angle_deg: 450.0
+delay_s: 0.0
+
+# Controller (optional overrides)
+dt: 0.1
+horizon: 10
+rate_up: 1.0333333333333334
+rate_down: 1.8333333333333333
+torque_limit: 1.0
+weight_angle: 1.0
+weight_torque: 0.01

@@ -23,9 +23,11 @@ using json = nlohmann::json;
 class CommaNode : public rclcpp::Node
 {
 public:
-    CommaNode() : Node("comma_node"), socket_fd_(-1), running_(true)
+    CommaNode() : Node("comma_node"), socket_fd_(-1), running_(true), listener_fd_(-1)
     {
         // Declare parameters
+        this->declare_parameter("use_tcp_tunnel", false);
+        this->declare_parameter("tcp_listen_port", 5555);
         this->declare_parameter("adb_host", "127.0.0.1");
         this->declare_parameter("adb_port", 5555);
         this->declare_parameter("reconnect_interval_sec", 5.0);
@@ -68,13 +70,23 @@ public:
         sender_thread_ = std::thread(&CommaNode::adb_sender_loop, this);
         reader_thread_ = std::thread(&CommaNode::adb_reader_loop, this);
         
-        RCLCPP_INFO(this->get_logger(), "Comma ADB Node initialized with 100 Hz timer-based publishing");
+        bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
+        if (use_tcp_tunnel) {
+            RCLCPP_INFO(this->get_logger(), "Comma TCP Tunnel Node initialized (listening mode) with 100 Hz timer-based publishing");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Comma ADB Node initialized with 100 Hz timer-based publishing");
+        }
     }
     
     ~CommaNode()
     {
         running_ = false;
-        // Close socket FIRST to unblock recv() in reader thread
+        // Close listener socket if in TCP tunnel mode
+        if (listener_fd_ >= 0) {
+            close(listener_fd_);
+            listener_fd_ = -1;
+        }
+        // Close data socket FIRST to unblock recv() in reader thread
         if (socket_fd_ >= 0) {
             close(socket_fd_);
             socket_fd_ = -1;
@@ -115,6 +127,94 @@ private:
     
     void adb_reader_loop()
     {
+        bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
+        
+        if (use_tcp_tunnel) {
+            tcp_listener_loop();
+        } else {
+            adb_connection_loop();
+        }
+    }
+    
+    void tcp_listener_loop()
+    {
+        // TCP tunnel listen mode - accept incoming connections
+        int port = this->get_parameter("tcp_listen_port").as_int();
+        
+        // Create and bind listener socket
+        listener_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listener_fd_ < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to create listener socket");
+            return;
+        }
+        
+        // Allow socket reuse
+        int reuse = 1;
+        setsockopt(listener_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+        
+        if (bind(listener_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to bind listener socket on port %d", port);
+            close(listener_fd_);
+            listener_fd_ = -1;
+            return;
+        }
+        
+        if (listen(listener_fd_, 5) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to listen on port %d", port);
+            close(listener_fd_);
+            listener_fd_ = -1;
+            return;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "TCP tunnel listening on port %d", port);
+        
+        while (running_) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            
+            int client_fd = accept(listener_fd_, (struct sockaddr*)&client_addr, &client_len);
+            if (client_fd < 0) {
+                if (running_) {
+                    RCLCPP_WARN(this->get_logger(), "Accept failed");
+                }
+                continue;
+            }
+            
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            RCLCPP_INFO(this->get_logger(), "Client connected from %s:%d", client_ip, ntohs(client_addr.sin_port));
+            
+            // Apply socket optimizations
+            optimize_socket(client_fd);
+            
+            // Use this client socket for communication
+            socket_fd_ = client_fd;
+            
+            // Read messages until connection closes
+            while (running_ && socket_fd_ == client_fd) {
+                read_adb_messages();
+            }
+            
+            // Connection closed, wait for next client
+            if (socket_fd_ == client_fd) {
+                socket_fd_ = -1;
+            }
+        }
+        
+        if (listener_fd_ >= 0) {
+            close(listener_fd_);
+            listener_fd_ = -1;
+        }
+    }
+    
+    void adb_connection_loop()
+    {
         // Blocking receive loop - no polling
         while (running_) {
             if (socket_fd_ < 0) {
@@ -149,6 +249,24 @@ private:
         }
     }
     
+    void optimize_socket(int fd)
+    {
+        // ===== LOW LATENCY SOCKET OPTIMIZATIONS =====
+        
+        // 1. Disable Nagle's algorithm - send small packets immediately
+        int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        
+        // 2. Reduce socket buffer sizes to minimize buffering delay
+        int small_buffer = 8192;  // 8KB instead of default ~200KB
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small_buffer, sizeof(small_buffer));
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer));
+        
+        // 3. Set socket priority for real-time traffic (requires CAP_NET_ADMIN or root)
+        int priority = 6;  // High priority (0-7 scale)
+        setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
+    }
+    
     void try_connect()
     {
         std::string host = this->get_parameter("adb_host").as_string();
@@ -161,20 +279,7 @@ private:
             return;
         }
         
-        // ===== LOW LATENCY SOCKET OPTIMIZATIONS =====
-        
-        // 1. Disable Nagle's algorithm - send small packets immediately
-        int nodelay = 1;
-        setsockopt(socket_fd_, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        
-        // 2. Reduce socket buffer sizes to minimize buffering delay
-        int small_buffer = 8192;  // 8KB instead of default ~200KB
-        setsockopt(socket_fd_, SOL_SOCKET, SO_RCVBUF, &small_buffer, sizeof(small_buffer));
-        setsockopt(socket_fd_, SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer));
-        
-        // 3. Set socket priority for real-time traffic (requires CAP_NET_ADMIN or root)
-        int priority = 6;  // High priority (0-7 scale)
-        setsockopt(socket_fd_, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
+        optimize_socket(socket_fd_);
         
         // BLOCKING recv - no timeout, wait for data
         // Reader thread processes messages immediately (minimal latency)
@@ -449,6 +554,7 @@ private:
     std::thread sender_thread_;
     std::thread reader_thread_;
     int socket_fd_;
+    int listener_fd_;  // For TCP tunnel listen mode
     std::atomic<bool> running_;
     
     // Control state (for sending commands)

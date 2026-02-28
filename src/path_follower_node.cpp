@@ -33,8 +33,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <vector>
 
 // ============================================================
@@ -210,6 +212,8 @@ public:
         this->declare_parameter("k_cte",             DEFAULT_K_CTE);
         this->declare_parameter("k_soft",            DEFAULT_K_SOFT);
         this->declare_parameter("k_d_steer",         DEFAULT_K_D_STEER);
+        this->declare_parameter<std::string>("path_csv_file", "");  // empty = sinusoidal
+        this->declare_parameter<bool>("auto_enable", false);
 
         // ---- Subscriptions -----------------------------------------------------
         gnss_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -237,16 +241,27 @@ public:
         status_pub_    = this->create_publisher<std_msgs::msg::Bool>(
             "path_following_status", latched_qos);
 
-        // ---- Build test path ---------------------------------------------------
-        //  Sinusoidal path starting at ENU origin (= first GNSS fix).
-        //  Adjust parameters to suit the test environment.
-        createSinusoidalPath(
-            500.0,   // total length [m]
-            3.0,     // initial lateral amplitude [m]
-            8.0,     // final   lateral amplitude [m]
-            80.0,    // initial wavelength [m]
-            50.0,    // final   wavelength [m]
-            1.0);    // waypoint spacing   [m]
+        // Debug topics for rosbag / evaluation
+        progress_pub_  = this->create_publisher<std_msgs::msg::Float64>("path_follower/progress_m",      10);
+        remaining_pub_ = this->create_publisher<std_msgs::msg::Float64>("path_follower/remaining_m",     10);
+        steer_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>("path_follower/steer_cmd_deg",   10);
+        car_speed_pub_ = this->create_publisher<std_msgs::msg::Float64>("path_follower/car_speed_mps",   10);
+        ramp_pub_      = this->create_publisher<std_msgs::msg::Float64>("path_follower/soft_start_ramp", 10);
+
+        // ---- Build path --------------------------------------------------------
+        //  If path_csv_file is set, load recorded drive.  Otherwise use sinusoidal test path.
+        std::string csv_file = this->get_parameter("path_csv_file").as_string();
+        if (!csv_file.empty()) {
+            loadPathFromCSV(csv_file);
+        } else {
+            createSinusoidalPath(
+                500.0,   // total length [m]
+                3.0,     // initial lateral amplitude [m]
+                8.0,     // final   lateral amplitude [m]
+                80.0,    // initial wavelength [m]
+                50.0,    // final   wavelength [m]
+                1.0);    // waypoint spacing   [m]
+        }
 
         publishPathVisualization();
 
@@ -260,6 +275,12 @@ public:
             "PathFollowerNode ready.  Path length: %.1f m.  "
             "Publish 'true' on ~/enable_path_following to start.",
             path_.totalLength());
+
+        auto_enable_ = this->get_parameter("auto_enable").as_bool();
+        if (auto_enable_) {
+            RCLCPP_INFO(this->get_logger(),
+                "auto_enable=true: path following will start automatically after first GNSS fix.");
+        }
     }
 
 private:
@@ -279,7 +300,21 @@ private:
             2.0*(q.w*q.z + q.x*q.y),
             1.0 - 2.0*(q.y*q.y + q.z*q.z));
 
+        bool was_valid = gnss_valid_;
         gnss_valid_ = true;
+
+        // Auto-enable: fire once, 1 second after the first GNSS fix
+        if (auto_enable_ && !was_valid && !auto_enable_fired_) {
+            auto_enable_fired_ = true;
+            auto_enable_timer_ = this->create_wall_timer(
+                std::chrono::seconds(1),
+                [this]() {
+                    auto_enable_timer_.reset();  // one-shot
+                    auto msg = std::make_shared<std_msgs::msg::Bool>();
+                    msg->data = true;
+                    enableCallback(msg);
+                });
+        }
     }
 
     void vehicleStateCallback(const car_control::msg::VehicleState::SharedPtr msg)
@@ -410,6 +445,14 @@ private:
         publishCmd(desired_speed, steer_cmd);
         publishDiagnostics(e, psi);
 
+        // Debug topics
+        auto f64 = [](double v) { std_msgs::msg::Float64 m; m.data = v; return m; };
+        progress_pub_ ->publish(f64(s_rear));                        // arc-length progress [m]
+        remaining_pub_->publish(f64(remaining));                     // meters to path end
+        steer_cmd_pub_->publish(f64(steer_cmd * 180.0 / M_PI));     // front-axle steer cmd [deg]
+        car_speed_pub_->publish(f64(car_speed));                     // actual vehicle speed [m/s]
+        ramp_pub_     ->publish(f64(ramp));                          // soft-start ramp [0..1]
+
         RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | Psi=%.2f° | steer_cmd=%.2f° | v=%.2f m/s",
             (state_ == State::FOLLOWING) ? "FOLLOWING" : "STOPPING",
@@ -479,6 +522,53 @@ private:
         RCLCPP_INFO(this->get_logger(),
             "Sinusoidal path created: %.1f m total, %d waypoints.",
             path_.totalLength(), n_tot + 1);
+    }
+
+    /**
+     * @brief Load a path from a CSV file recorded by drive_recorder.
+     *
+     * Expected CSV format (first line may be a header starting with '#' or 'x'):
+     *   x,y
+     *   1.23,4.56
+     *   ...
+     */
+    void loadPathFromCSV(const std::string& filename)
+    {
+        path_.clear();
+        hint_front_ = 0;
+
+        std::ifstream f(filename);
+        if (!f.is_open()) {
+            RCLCPP_ERROR(this->get_logger(), "Cannot open path CSV: %s", filename.c_str());
+            return;
+        }
+
+        int count = 0;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            // Skip header line that starts with letters
+            if (line[0] == 'x' || line[0] == 'X') continue;
+
+            std::replace(line.begin(), line.end(), ',', ' ');
+            std::istringstream ss(line);
+            double x = 0.0, y = 0.0;
+            if (!(ss >> x >> y)) continue;
+            path_.addWaypoint(x, y);
+            ++count;
+        }
+
+        if (count < 2) {
+            RCLCPP_ERROR(this->get_logger(),
+                "CSV file '%s' has fewer than 2 waypoints – falling back to sinusoidal path.",
+                filename.c_str());
+            createSinusoidalPath(500.0, 3.0, 8.0, 80.0, 50.0, 1.0);
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+            "Loaded path from '%s': %d waypoints, %.1f m total.",
+            filename.c_str(), count, path_.totalLength());
     }
 
     // =========================================================================
@@ -565,7 +655,9 @@ private:
     double           car_speed_mps_ = 0.0;
     double           car_steer_rad_ = 0.0;
     double           prev_steer_rad_= 0.0;
-    bool             gnss_valid_    = false;
+    bool             gnss_valid_        = false;
+    bool             auto_enable_       = false;
+    bool             auto_enable_fired_ = false;
 
     // Path
     Path             path_;
@@ -581,8 +673,15 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              lat_err_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              hdg_err_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 status_pub_;
+    // Debug publishers
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              progress_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              remaining_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              steer_cmd_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              car_speed_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              ramp_pub_;
 
     rclcpp::TimerBase::SharedPtr                                      control_timer_;
+    rclcpp::TimerBase::SharedPtr                                      auto_enable_timer_;
 };
 
 int main(int argc, char** argv)

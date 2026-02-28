@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -53,7 +54,7 @@ public:
                  fusion_disabled_warned_(false)
     {
         // Declare parameters
-        this->declare_parameter("host", "192.168.10.61");
+        this->declare_parameter("host", "ublox.lan");
         this->declare_parameter("port", 7799);
         this->declare_parameter("reconnect_interval_sec", 5.0);
         this->declare_parameter("auto_set_origin", true);
@@ -177,11 +178,28 @@ private:
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(port);
 
+        // Resolve hostname or parse IPv4 literal.
         if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-            RCLCPP_ERROR(this->get_logger(), "Invalid address: %s", host.c_str());
-            close(socket_fd_);
-            socket_fd_ = -1;
-            return;
+            struct addrinfo hints;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            struct addrinfo* result = nullptr;
+            int gai = getaddrinfo(host.c_str(), nullptr, &hints, &result);
+            if (gai != 0 || result == nullptr) {
+                RCLCPP_ERROR(this->get_logger(), "Invalid address: %s", host.c_str());
+                if (result) {
+                    freeaddrinfo(result);
+                }
+                close(socket_fd_);
+                socket_fd_ = -1;
+                return;
+            }
+
+            auto* addr_in = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
+            server_addr.sin_addr = addr_in->sin_addr;
+            freeaddrinfo(result);
         }
 
         int ret = connect(socket_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr));
@@ -431,16 +449,20 @@ private:
         pose_msg.pose.position.y = north;
         pose_msg.pose.position.z = navsat_msg.altitude - origin_alt_;
         
-        // Set orientation from heading
-        double heading = pvt.headVeh * 1e-5 * M_PI / 180.0; // Convert to radians
-        pose_msg.pose.orientation.w = std::cos(heading / 2.0);
+        // headVeh: NED heading (CW from North), in 1e-5 deg. Valid when flags2 bit 5 set.
+        // IMU/ADR sensor fusion keeps this valid continuously even without GNSS fix.
+        // ENU yaw (CCW from East) = π/2 − NED_heading.
+        if ((pvt.flags2 >> 5) & 0x01) {
+            last_valid_enu_yaw_ = M_PI / 2.0 - pvt.headVeh * 1e-5 * M_PI / 180.0;
+        }
+        // else: hold last valid heading (fusion momentarily unavailable)
+        double enu_yaw = last_valid_enu_yaw_;
+        pose_msg.pose.orientation.w = std::cos(enu_yaw / 2.0);
         pose_msg.pose.orientation.x = 0.0;
         pose_msg.pose.orientation.y = 0.0;
-        pose_msg.pose.orientation.z = std::sin(heading / 2.0);
-        
+        pose_msg.pose.orientation.z = std::sin(enu_yaw / 2.0);
+
         pose_publisher_->publish(pose_msg);
-        
-        // Publish velocity (NED frame: North-East-Down)
         auto velocity_msg = geometry_msgs::msg::TwistStamped();
         velocity_msg.header = navsat_msg.header;
         velocity_msg.twist.linear.x = pvt.velN * 1e-3; // mm/s to m/s (North)
@@ -813,6 +835,8 @@ private:
     uint8_t alignment_status_;   // From ESF-ALG flags
     bool calibration_complete_;
     bool fusion_disabled_warned_;
+    // Heading state
+    double last_valid_enu_yaw_  = 0.0;  // ENU yaw [rad], held when headVehValid drops
 };
 
 int main(int argc, char** argv)

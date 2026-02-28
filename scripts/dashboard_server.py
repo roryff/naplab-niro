@@ -51,15 +51,16 @@ _MAX_HISTORY = 300   # samples kept for sparklines
 _state = {
     # ── Topic health ─────────────────────────────────────────────────────────
     "topics": {
-        "/vehicle/state":          {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/gnss/fix":               {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/gnss/velocity":          {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/gnss/odometry":          {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/gnss/esf_status":        {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/cmd_vel":                {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/path_visualization":     {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/lateral_error":          {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/path_following_status":  {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/vehicle/state":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/fix":                {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/velocity":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/odometry":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/esf_status":         {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/path_follower/cmd_vel":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/cmd_vel":                 {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/path_visualization":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/lateral_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/path_following_status":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
     },
 
     # ── Vehicle state ────────────────────────────────────────────────────────
@@ -109,18 +110,24 @@ _state = {
         "sensors":       [],
     },
 
-    # ── Path-follower controller ──────────────────────────────────────────────
+    # ── Path-follower / MPC controller ────────────────────────────────────────
     "controller": {
-        "active":             False,
-        "state_label":        "IDLE",
-        "target_speed_mps":   0.0,
-        "target_steer_deg":   0.0,     # front-axle angle from cmd_vel [deg]
-        "lateral_error_m":    0.0,
-        "heading_error_deg":  0.0,
-        "lat_err_history":    [],      # [{t, v}, ...]
-        "hdg_err_history":    [],
-        "speed_history":      [],
-        "steer_cmd_history":  [],
+        "active":              False,
+        "state_label":         "IDLE",
+        # path_follower_node output (path_follower/cmd_vel)
+        "target_speed_mps":    0.0,
+        "target_steer_deg":    0.0,    # desired front-axle angle [deg], positive = left
+        # steering_mpc_node output (cmd_vel)
+        "mpc_torque":          0.0,    # MPC torque command [-1, 1]
+        "mpc_accel_cmd":       0.0,    # accel command from MPC speed P-ctrl [-1,1]
+        # diagnostics
+        "lateral_error_m":     0.0,
+        "heading_error_deg":   0.0,
+        "lat_err_history":     [],     # [{t, v}, ...]
+        "hdg_err_history":     [],
+        "speed_history":       [],
+        "steer_cmd_history":   [],     # desired front-axle angle [deg]
+        "torque_history":      [],     # MPC torque output
     },
 
     "uptime_s": 0.0,
@@ -192,11 +199,14 @@ class DashboardNode(Node):
         self.create_subscription(EsfStatus,    "/gnss/esf_status", self._cb_esf,      10)
 
         # Path-follower topics
-        self.create_subscription(Twist,   "/cmd_vel",               self._cb_cmd_vel,   10)
-        self.create_subscription(Path,    "/path_visualization",    self._cb_path,      latched_qos)
-        self.create_subscription(Float64, "/lateral_error",         self._cb_lat_err,   10)
-        self.create_subscription(Float64, "/heading_error",         self._cb_hdg_err,   10)
-        self.create_subscription(Bool,    "/path_following_status", self._cb_pf_status, latched_qos)
+        # path_follower/cmd_vel: desired steer angle [rad] + desired speed [m/s]
+        self.create_subscription(Twist,   "/path_follower/cmd_vel",  self._cb_pf_cmd,    10)
+        # cmd_vel: MPC torque [-1,1] + accel command [-1,1]
+        self.create_subscription(Twist,   "/cmd_vel",                self._cb_cmd_vel,   10)
+        self.create_subscription(Path,    "/path_visualization",     self._cb_path,      latched_qos)
+        self.create_subscription(Float64, "/lateral_error",          self._cb_lat_err,   10)
+        self.create_subscription(Float64, "/heading_error",          self._cb_hdg_err,   10)
+        self.create_subscription(Bool,    "/path_following_status",  self._cb_pf_status, latched_qos)
 
     # ── Existing callbacks ───────────────────────────────────────────────────
 
@@ -205,7 +215,8 @@ class DashboardNode(Node):
             _touch_topic("/vehicle/state")
             v = _state["vehicle"]
             v["v_ego_kmh"]         = round(float(msg.v_ego), 2)
-            v["steering_deg"]      = round(float(msg.steering_angle_deg), 2)
+            # Negate: positive = left (CCW) to match conventional sign convention
+            v["steering_deg"]      = round(-float(msg.steering_angle_deg), 2)
             v["steering_torque"]   = round(float(msg.steering_torque), 3)
             v["wheel_left_mps"]    = round(float(msg.rear_wheel_speed_left), 3)
             v["wheel_right_mps"]   = round(float(msg.rear_wheel_speed_right), 3)
@@ -274,14 +285,24 @@ class DashboardNode(Node):
 
     # ── Path-follower callbacks ──────────────────────────────────────────────
 
+    def _cb_pf_cmd(self, msg: Twist):
+        """path_follower/cmd_vel: angular.z = desired front-axle angle [rad], linear.x = speed [m/s]"""
+        with _state_lock:
+            _touch_topic("/path_follower/cmd_vel")
+            c = _state["controller"]
+            c["target_speed_mps"] = round(float(msg.linear.x), 3)
+            deg = math.degrees(float(msg.angular.z))  # positive = left
+            c["target_steer_deg"] = round(deg, 3)
+            _push_history(c["steer_cmd_history"], deg)
+
     def _cb_cmd_vel(self, msg: Twist):
+        """cmd_vel (steering_mpc output): angular.z = torque [-1,1], linear.x = accel cmd [-1,1]"""
         with _state_lock:
             _touch_topic("/cmd_vel")
             c = _state["controller"]
-            c["target_speed_mps"] = round(float(msg.linear.x), 3)
-            deg = math.degrees(float(msg.angular.z))
-            c["target_steer_deg"] = round(deg, 3)
-            _push_history(c["steer_cmd_history"], deg)
+            c["mpc_torque"]    = round(float(msg.angular.z), 4)
+            c["mpc_accel_cmd"] = round(float(msg.linear.x), 3)
+            _push_history(c["torque_history"], float(msg.angular.z))
 
     def _cb_lat_err(self, msg: Float64):
         with _state_lock:
@@ -352,6 +373,7 @@ class Handler(BaseHTTPRequestHandler):
                 ctrl["hdg_err_history"]   = list(ctrl["hdg_err_history"])
                 ctrl["speed_history"]     = list(ctrl["speed_history"])
                 ctrl["steer_cmd_history"] = list(ctrl["steer_cmd_history"])
+                ctrl["torque_history"]    = list(ctrl["torque_history"])
                 payload = {
                     "topics":     topics_clean,
                     "vehicle":    dict(_state["vehicle"]),
