@@ -29,6 +29,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 
 #include <algorithm>
@@ -212,6 +213,7 @@ public:
         this->declare_parameter("k_cte",             DEFAULT_K_CTE);
         this->declare_parameter("k_soft",            DEFAULT_K_SOFT);
         this->declare_parameter("k_d_steer",         DEFAULT_K_D_STEER);
+        this->declare_parameter("steer_ref_traj_n",  40);
         this->declare_parameter<std::string>("path_csv_file", "");  // empty = sinusoidal
 
         // ---- Subscriptions -----------------------------------------------------
@@ -241,11 +243,13 @@ public:
             "path_following_status", latched_qos);
 
         // Debug topics for rosbag / evaluation
-        progress_pub_  = this->create_publisher<std_msgs::msg::Float64>("path_follower/progress_m",      10);
-        remaining_pub_ = this->create_publisher<std_msgs::msg::Float64>("path_follower/remaining_m",     10);
-        steer_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64>("path_follower/steer_cmd_deg",   10);
-        car_speed_pub_ = this->create_publisher<std_msgs::msg::Float64>("path_follower/car_speed_mps",   10);
-        ramp_pub_      = this->create_publisher<std_msgs::msg::Float64>("path_follower/soft_start_ramp", 10);
+        progress_pub_    = this->create_publisher<std_msgs::msg::Float64>("path_follower/progress_m",      10);
+        remaining_pub_   = this->create_publisher<std_msgs::msg::Float64>("path_follower/remaining_m",     10);
+        steer_cmd_pub_   = this->create_publisher<std_msgs::msg::Float64>("path_follower/steer_cmd_deg",   10);
+        car_speed_pub_   = this->create_publisher<std_msgs::msg::Float64>("path_follower/car_speed_mps",   10);
+        ramp_pub_        = this->create_publisher<std_msgs::msg::Float64>("path_follower/soft_start_ramp", 10);
+        steer_ref_traj_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "path_follower/steer_ref_traj_deg", 10);
 
         // ---- Build path --------------------------------------------------------
         //  If path_csv_file is set, load recorded drive.  Otherwise use sinusoidal test path.
@@ -406,15 +410,44 @@ private:
         double k_soft    =        this->get_parameter("k_soft").as_double();
         double k_d_steer = ramp * this->get_parameter("k_d_steer").as_double();
 
-        double steer_cmd = 0.0;
+        double steer_cmd   = 0.0;
         if (state_ == State::FOLLOWING) {
             double v_eff  = std::max(0.5, car_speed);  // avoid div-by-zero
             steer_cmd = k_psi * psi
                       + std::atan2(k_cte * e, k_soft + v_eff)
                       + k_d_steer * (prev_steer_rad_ - car_steer);
+
             steer_cmd = std::clamp(steer_cmd, -MAX_STEER_ANGLE, MAX_STEER_ANGLE);
         }
         prev_steer_rad_ = car_steer;
+
+        // Publish reference trajectory for MPC (N future steering angles)
+        // ref_traj[k] = current desired angle + path heading change from s_front to s_front+k*dt*v
+        // Converts road-wheel radians to steering-wheel degrees (ratio 15.33 * 180/pi = 878.8)
+        static constexpr double SW_RAD_TO_DEG = 15.33 * (180.0 / M_PI);  // sw-deg per road-wheel rad
+        {
+            int traj_n = this->get_parameter("steer_ref_traj_n").as_int();
+            double traj_dt = 1.0 / CONTROL_HZ;
+            double v_traj = std::max(0.5, car_speed);
+            double base_heading = path_.heading(s_front);
+            double base_sw_deg = steer_cmd * SW_RAD_TO_DEG;  // current desired angle in SW deg
+
+            std_msgs::msg::Float64MultiArray traj_msg;
+            traj_msg.data.resize(traj_n);
+            for (int k = 0; k < traj_n; ++k) {
+                double s_k = std::min(s_front + k * traj_dt * v_traj, path_.totalLength());
+                double dh = path_.heading(s_k) - base_heading;
+                // Wrap dh to [-pi, pi]
+                while (dh >  M_PI) dh -= 2.0 * M_PI;
+                while (dh < -M_PI) dh += 2.0 * M_PI;
+                traj_msg.data[k] = base_sw_deg + dh * SW_RAD_TO_DEG;
+            }
+            // Clamp to physical steering limit in SW degrees
+            static constexpr double MAX_SW_DEG = MAX_STEER_ANGLE * SW_RAD_TO_DEG;
+            for (auto& v : traj_msg.data)
+                v = std::clamp(v, -MAX_SW_DEG, MAX_SW_DEG);
+            steer_ref_traj_pub_->publish(traj_msg);
+        }
 
         // --- Desired speed ---------------------------------------------------
         double desired_speed = (state_ == State::STOPPING) ? 0.0
@@ -426,11 +459,11 @@ private:
 
         // Debug topics
         auto f64 = [](double v) { std_msgs::msg::Float64 m; m.data = v; return m; };
-        progress_pub_ ->publish(f64(s_rear));                        // arc-length progress [m]
-        remaining_pub_->publish(f64(remaining));                     // meters to path end
-        steer_cmd_pub_->publish(f64(steer_cmd * 180.0 / M_PI));     // front-axle steer cmd [deg]
-        car_speed_pub_->publish(f64(car_speed));                     // actual vehicle speed [m/s]
-        ramp_pub_     ->publish(f64(ramp));                          // soft-start ramp [0..1]
+        progress_pub_   ->publish(f64(s_rear));                         // arc-length progress [m]
+        remaining_pub_  ->publish(f64(remaining));                      // meters to path end
+        steer_cmd_pub_  ->publish(f64(steer_cmd * 180.0 / M_PI));      // front-axle steer cmd [deg]
+        car_speed_pub_  ->publish(f64(car_speed));                      // actual vehicle speed [m/s]
+        ramp_pub_       ->publish(f64(ramp));                           // soft-start ramp [0..1]
 
         RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | Psi=%.2f° | steer_cmd=%.2f° | v=%.2f m/s",
@@ -656,6 +689,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              steer_cmd_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              car_speed_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              ramp_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr    steer_ref_traj_pub_;
 
     rclcpp::TimerBase::SharedPtr                                      control_timer_;
 };

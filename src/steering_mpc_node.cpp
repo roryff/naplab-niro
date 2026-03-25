@@ -16,20 +16,38 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 
 namespace {
 
-constexpr double kDefaultTauR = 0.2;
-constexpr double kDefaultGainR = 40.0;
+// tau_r: first-order time constant of the steering rate actuator [s].
+// Measured from rosbag: at max torque the rate builds with tau ≈ 0.78s.
+// The original value of 0.2s made the model 4× too optimistic → MPC started
+// turning too late because it expected the actuator to respond much faster.
+constexpr double kDefaultTauR = 0.78;
+// gain_r: steady-state steering-wheel rate per unit torque [sw-deg/s].
+// Measured: ~121 sw-deg change in 4s at max torque → ~30 sw-deg/s sustained.
+// With tau_r=0.78, gain_r=36 predicts 116 sw-deg over 4s (vs actual 121, 4% low).
+// Previous gain_r=40 over-predicted by 25%, compounding the tau_r error.
+constexpr double kDefaultGainR = 36.0;
 constexpr double kDefaultLeak = 0.0;
 constexpr double kDefaultU0 = 0.0;
 constexpr double kDefaultRateClip = 500.0;
 constexpr double kDefaultMaxAngleDeg = 450.0;
 constexpr double kDefaultDelayS = 0.0;
 constexpr double kDefaultDt = 0.1;
-constexpr int kDefaultHorizon = 10;
+// horizon: prediction steps. With tau_r=0.78s we need at least 5τ/dt steps to
+// fully model the actuator settling. At 20 Hz (dt=0.05s): 5×0.78/0.05 = 78 steps
+// ideally, 40 as a practical balance (2s lookahead). At 10 Hz (dt=0.1s) use 30.
+// The original value of 10 covered only 0.5–1.0s, less than one time constant.
+constexpr int kDefaultHorizon = 40;
+// lookahead_s: when > 0, the MPC references a target angle extrapolated ahead in time.
+// Now that the path follower publishes a full reference trajectory (steer_ref_traj_deg),
+// this should be set to 0.0 to avoid double look-ahead.
+// When using the MPC without the updated path follower, set to 0.5–0.7s.
+constexpr double kDefaultLookaheadS = 0.0;
 constexpr double kDefaultRateUp = 3.1 / 3.0;
 constexpr double kDefaultRateDown = 5.5 / 3.0;
 constexpr double kDefaultTorqueLimit  = 1.0;
@@ -56,6 +74,7 @@ struct ControllerParams {
   double torque_limit = kDefaultTorqueLimit;
   double weight_angle = kDefaultWeightAngle;
   double weight_torque = kDefaultWeightTorque;
+  double lookahead_s = kDefaultLookaheadS;
 };
 
 // Simple YAML parser for "key: value" lines (no nesting).
@@ -90,6 +109,7 @@ bool loadConfig(const std::string& path, IntegratorParams& ip, ControllerParams&
     else if (key == "torque_limit") cp.torque_limit = std::stod(val);
     else if (key == "weight_angle") cp.weight_angle = std::stod(val);
     else if (key == "weight_torque") cp.weight_torque = std::stod(val);
+    else if (key == "lookahead_s") cp.lookahead_s = std::stod(val);
   }
   return true;
 }
@@ -107,6 +127,7 @@ class SteeringMpcNode : public rclcpp::Node {
     declare_parameter<double>("torque_limit",   kDefaultTorqueLimit);
     declare_parameter<double>("weight_angle",    kDefaultWeightAngle);
     declare_parameter<double>("weight_torque",   kDefaultWeightTorque);
+    declare_parameter<double>("lookahead_s",     kDefaultLookaheadS);
     declare_parameter<double>("kp_speed",        kDefaultKpSpeed);
     declare_parameter<double>("max_speed_mps",   kDefaultMaxSpeedMps);
     declare_parameter<double>("desired_speed_mps", 0.0);
@@ -125,7 +146,9 @@ class SteeringMpcNode : public rclcpp::Node {
     ctrl_.rate_down = get_parameter("rate_down").as_double();
     ctrl_.torque_limit = get_parameter("torque_limit").as_double();
     ctrl_.weight_angle = get_parameter("weight_angle").as_double();
-    ctrl_.weight_torque = get_parameter("weight_torque").as_double();    kp_speed_          = get_parameter("kp_speed").as_double();
+    ctrl_.weight_torque = get_parameter("weight_torque").as_double();
+    ctrl_.lookahead_s = get_parameter("lookahead_s").as_double();
+    kp_speed_          = get_parameter("kp_speed").as_double();
     max_speed_mps_     = get_parameter("max_speed_mps").as_double();
     // Initialize desired speed from parameter so accel runs immediately at startup
     desired_speed_mps_ = get_parameter("desired_speed_mps").as_double();
@@ -141,7 +164,8 @@ class SteeringMpcNode : public rclcpp::Node {
           // Kia Niro: 460 deg lock-to-lock ↔ 0.5236 rad (30 deg) front axle
           constexpr double MAX_FRONT_RAD   = 0.5236;
           constexpr double MAX_WHEEL_DEG   = 460.0;
-          desired_angle_ = msg->angular.z * (MAX_WHEEL_DEG / MAX_FRONT_RAD);
+          double new_desired = msg->angular.z * (MAX_WHEEL_DEG / MAX_FRONT_RAD);
+          desired_angle_ = new_desired;
           // Speed comes from desired_speed_mps parameter, not from path_follower
         });
 
@@ -182,6 +206,14 @@ class SteeringMpcNode : public rclcpp::Node {
     // Publish cmd_vel to comma_node: angular.z = steering torque [-1,1], linear.x = accel cmd [-1,1]
     pub_cmd_vel_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
 
+    // Subscribe to reference trajectory from path follower (N future steering angles in SW deg)
+    sub_ref_traj_ = create_subscription<std_msgs::msg::Float64MultiArray>(
+        "path_follower/steer_ref_traj_deg", 10,
+        [this](std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          ref_traj_ = msg->data;
+        });
+
     // Debug topics for rosbag / rqt_plot evaluation
     pub_dbg_desired_angle_  = create_publisher<std_msgs::msg::Float64>("mpc/desired_angle_deg",  10);
     pub_dbg_actual_angle_   = create_publisher<std_msgs::msg::Float64>("mpc/actual_angle_deg",   10);
@@ -211,6 +243,8 @@ class SteeringMpcNode : public rclcpp::Node {
  private:
   void runMpcStep() {
     double angle_deg, rate_deg_s, desired, u_prev, desired_speed, vehicle_speed;
+    double lookahead_ref;
+    std::vector<double> ref_traj_snap;
     bool active;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -221,6 +255,8 @@ class SteeringMpcNode : public rclcpp::Node {
       u_prev        = u_prev_;
       desired_speed = std::clamp(desired_speed_mps_, -max_speed_mps_, max_speed_mps_);
       vehicle_speed = vehicle_speed_mps_;
+      lookahead_ref = desired;
+      ref_traj_snap = ref_traj_;
     }
 
     // Do not run MPC when path following is inactive — hold brake
@@ -232,7 +268,16 @@ class SteeringMpcNode : public rclcpp::Node {
       return;
     }
 
-    double u_cmd = solveMpc(angle_deg, rate_deg_s, desired, u_prev);
+    // Do not run MPC when path following is inactive — hold brake
+    if (!active) {
+      geometry_msgs::msg::Twist brake;
+      brake.linear.x  = -1.0;  // full brake
+      brake.angular.z =  0.0;
+      pub_cmd_vel_->publish(brake);
+      return;
+    }
+
+    double u_cmd = solveMpc(angle_deg, rate_deg_s, lookahead_ref, u_prev, ref_traj_snap);
     u_cmd = std::max(-ctrl_.torque_limit, std::min(ctrl_.torque_limit, u_cmd));
     u_prev_ = u_cmd;
 
@@ -248,7 +293,7 @@ class SteeringMpcNode : public rclcpp::Node {
 
     // Publish debug topics
     auto f64 = [](double v) { std_msgs::msg::Float64 m; m.data = v; return m; };
-    pub_dbg_desired_angle_ ->publish(f64(desired));              // MPC target [deg sw]
+    pub_dbg_desired_angle_ ->publish(f64(lookahead_ref));        // MPC target [deg sw] (with lookahead)
     pub_dbg_actual_angle_  ->publish(f64(angle_deg));            // Actual sw angle [deg]
     pub_dbg_angle_error_   ->publish(f64(desired - angle_deg));  // Error [deg] (> 0 = need more left)
     pub_dbg_actual_rate_   ->publish(f64(rate_deg_s));           // Measured sw rate [deg/s]
@@ -263,7 +308,8 @@ class SteeringMpcNode : public rclcpp::Node {
       desired, angle_deg, u_cmd, desired_speed, vehicle_speed, accel_cmd);
   }
 
-  double solveMpc(double angle_deg, double rate_deg_s, double desired_angle, double u_prev) {
+  double solveMpc(double angle_deg, double rate_deg_s, double desired_angle, double u_prev,
+                  const std::vector<double>& ref_traj) {
     const int n = N_;
     if (n < 1) return u_prev;
 
@@ -295,7 +341,7 @@ class SteeringMpcNode : public rclcpp::Node {
     for (int j = 0; j < n; j++) P_p[j + 1] = P_p[j] + (j + 1);
     std::vector<OSQPFloat> q(n, 0.0);
 
-    const double ref = desired_angle;
+    const bool use_traj = (!ref_traj.empty() && (int)ref_traj.size() >= n);
     for (int k = 0; k < n; k++) {
       double c_rate_new = a_rate * c_rate;
       std::vector<double> G_rate_new(n, 0.0);
@@ -312,7 +358,8 @@ class SteeringMpcNode : public rclcpp::Node {
       G_ang = G_ang_new;
       G_rate = G_rate_new;
 
-      double d = c_ang - ref;
+      double ref_k = use_traj ? ref_traj[k] : desired_angle;
+      double d = c_ang - ref_k;
       for (int j = 0; j < n; j++)
         q[j] += 2.0 * wa * d * G_ang[j];
       for (int i = 0; i < n; i++)
@@ -396,8 +443,10 @@ class SteeringMpcNode : public rclcpp::Node {
   IntegratorParams integrator_;
   ControllerParams ctrl_;
   int N_;
+  std::vector<double>                                               ref_traj_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr      sub_path_cmd_;
   rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr sub_vehicle_state_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_ref_traj_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr            sub_pf_status_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr         pub_cmd_vel_;
   // Debug publishers (rosbag / rqt_plot)
