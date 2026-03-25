@@ -516,10 +516,12 @@ function render(s){
   if(recStatus && !modalOpen){
     if(_recActive){
       recStatus.innerHTML = '<span style="color:#f47174">&#9679; Recording\u2026</span>';
-    } else if(!hasGnssRec && !rec.filename){
+    } else if(!hasGnssRec){
       recStatus.innerHTML = gnssStale >= STALE_SEC
         ? '<span style="color:#f85149">\u26A0 No GNSS data</span>'
         : '<span style="color:#e3b341">\u26A0 Waiting for GNSS fix\u2026</span>';
+    } else {
+      recStatus.textContent = '';
     }
   }
 
