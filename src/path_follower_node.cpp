@@ -44,6 +44,7 @@
 // ============================================================
 
 static constexpr double CONTROL_HZ          = 20.0;         // control loop rate
+static constexpr double GNSS_STALE_SEC      = 1.5;          // stop if no GNSS for this long
 static constexpr double WHEELBASE           = 2.79;         // Kia Niro [m]
 static constexpr double MAX_STEER_ANGLE     = 0.5236;       // ≈ 30 deg front axle [rad]
 static constexpr double MIN_SPEED           = 0.3;          // [m/s] – stop threshold
@@ -203,6 +204,7 @@ public:
         : Node("path_follower_node"),
             state_(State::IDLE),
             path_start_time_(this->now()),
+            last_gnss_time_(this->now()),
             hint_front_(0)
     {
         // ---- Parameters --------------------------------------------------------
@@ -293,7 +295,8 @@ private:
             2.0*(q.w*q.z + q.x*q.y),
             1.0 - 2.0*(q.y*q.y + q.z*q.z));
 
-        gnss_valid_ = true;
+        gnss_valid_     = true;
+        last_gnss_time_ = this->now();
     }
 
     void vehicleStateCallback(const car_control::msg::VehicleState::SharedPtr msg)
@@ -311,7 +314,16 @@ private:
 
     void enableCallback(const std_msgs::msg::Bool::SharedPtr msg)
     {
-        if (!msg->data) return;  // Only react to rising edge / 'true' messages
+        // false = explicit stop request
+        if (!msg->data) {
+            if (state_ == State::FOLLOWING || state_ == State::STOPPING) {
+                RCLCPP_INFO(this->get_logger(), "Path following STOPPED by user.");
+                state_ = State::IDLE;
+                publishCmd(0.0, 0.0);
+                publishStatus(false);
+            }
+            return;
+        }
 
         if (state_ == State::IDLE) {
             if (!gnss_valid_) {
@@ -334,11 +346,8 @@ private:
             RCLCPP_INFO(this->get_logger(), "Path following STARTED.");
             publishStatus(true);
 
-        } else if (state_ == State::FOLLOWING || state_ == State::STOPPING) {
-            RCLCPP_INFO(this->get_logger(), "Path following STOPPED by user.");
-            state_ = State::IDLE;
-            publishCmd(0.0, 0.0);
-            publishStatus(false);
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Path following already active; send false to stop.");
         }
     }
 
@@ -348,6 +357,16 @@ private:
     void controlLoop()
     {
         if (state_ == State::IDLE) return;
+
+        // --- GNSS staleness guard --------------------------------------------
+        if ((this->now() - last_gnss_time_).seconds() > GNSS_STALE_SEC) {
+            RCLCPP_WARN(this->get_logger(),
+                "GNSS data stale (>%.1f s). Stopping path following.", GNSS_STALE_SEC);
+            state_ = State::IDLE;
+            publishCmd(0.0, 0.0);
+            publishStatus(false);
+            return;
+        }
 
         // Snapshot latest vehicle state
         double car_x, car_y, car_heading, car_speed, car_steer;
@@ -635,6 +654,7 @@ private:
     double           car_steer_rad_ = 0.0;
     double           prev_steer_rad_= 0.0;
     bool             gnss_valid_        = false;
+    rclcpp::Time     last_gnss_time_;
 
     // Path
     Path             path_;

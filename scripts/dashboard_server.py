@@ -213,13 +213,9 @@ def _start_recording() -> dict:
     with _rec_lock:
         if _rec_active:
             return {"ok": False, "error": "already recording"}
-        try:
-            share_dir = pathlib.Path(_get_pkg_share('car_control')) if _get_pkg_share else None
-        except Exception:
-            share_dir = None
-        if share_dir is None:
-            share_dir = pathlib.Path(__file__).resolve().parent.parent.parent / 'share' / 'car_control'
-        paths_dir = share_dir / 'paths'
+        # Always save to the source tree so files are easy to find and version-control.
+        # __file__ = .../src/car_control/scripts/dashboard_server.py
+        paths_dir = pathlib.Path(__file__).resolve().parent.parent / 'paths'
         paths_dir.mkdir(parents=True, exist_ok=True)
         ts       = time.strftime('%Y%m%d_%H%M%S')
         filename = paths_dir / f'recording_{ts}.csv'
@@ -355,7 +351,7 @@ class DashboardNode(Node):
         self.create_subscription(Bool,    "/path_following_status",  self._cb_pf_status, latched_qos)
 
         # Publisher – allows dashboard to start/stop path following
-        self.enable_pub_ = self.create_publisher(Bool, "/path_follower_node/enable_path_following", 1)
+        self.enable_pub_ = self.create_publisher(Bool, "/enable_path_following", 1)
 
     # ── Existing callbacks ───────────────────────────────────────────────────
 
