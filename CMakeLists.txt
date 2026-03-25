@@ -123,4 +123,10 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install bundled paths
+install(DIRECTORY
+  paths
+  DESTINATION share/${PROJECT_NAME}
+)
+
 ament_package()

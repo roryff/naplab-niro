@@ -14,6 +14,7 @@
 
 #include <osqp.h>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include "car_control/msg/vehicle_state.hpp"
@@ -144,6 +145,21 @@ class SteeringMpcNode : public rclcpp::Node {
           // Speed comes from desired_speed_mps parameter, not from path_follower
         });
 
+    // Gate MPC output on path following status
+    sub_pf_status_ = create_subscription<std_msgs::msg::Bool>(
+        "/path_following_status", rclcpp::QoS(1).transient_local().reliable(),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          path_following_active_ = msg->data;
+          if (!msg->data) {
+            // Reset integrator state so we don't wind up while idle
+            u_prev_       = 0.0;
+            current_rate_ = 0.0;
+          }
+          RCLCPP_INFO(get_logger(), "Path following %s",
+              msg->data ? "ACTIVE — MPC running" : "INACTIVE — MPC output suppressed");
+        });
+
     // Subscribe to vehicle/state for steering wheel angle [deg] and speed [km/h]
     sub_vehicle_state_ = create_subscription<car_control::msg::VehicleState>(
         "vehicle/state", 10,
@@ -195,14 +211,25 @@ class SteeringMpcNode : public rclcpp::Node {
  private:
   void runMpcStep() {
     double angle_deg, rate_deg_s, desired, u_prev, desired_speed, vehicle_speed;
+    bool active;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      active        = path_following_active_;
       angle_deg     = current_angle_;
       rate_deg_s    = current_rate_;
       desired       = desired_angle_;
       u_prev        = u_prev_;
       desired_speed = std::clamp(desired_speed_mps_, -max_speed_mps_, max_speed_mps_);
       vehicle_speed = vehicle_speed_mps_;
+    }
+
+    // Do not run MPC when path following is inactive — hold brake
+    if (!active) {
+      geometry_msgs::msg::Twist brake;
+      brake.linear.x  = -1.0;  // full brake
+      brake.angular.z =  0.0;
+      pub_cmd_vel_->publish(brake);
+      return;
     }
 
     double u_cmd = solveMpc(angle_deg, rate_deg_s, desired, u_prev);
@@ -371,6 +398,7 @@ class SteeringMpcNode : public rclcpp::Node {
   int N_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr      sub_path_cmd_;
   rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr sub_vehicle_state_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr            sub_pf_status_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr         pub_cmd_vel_;
   // Debug publishers (rosbag / rqt_plot)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_dbg_desired_angle_;
@@ -393,6 +421,7 @@ class SteeringMpcNode : public rclcpp::Node {
   double u_prev_            = 0.0;
   double kp_speed_          = kDefaultKpSpeed;
   double max_speed_mps_     = kDefaultMaxSpeedMps;
+  bool   path_following_active_ = false;
   OSQPSolver* osqp_workspace_ = nullptr;
 };
 

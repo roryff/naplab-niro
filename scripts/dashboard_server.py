@@ -37,9 +37,27 @@ import json
 import time
 import math
 import pathlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import csv
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+try:
+    from ament_index_python.packages import get_package_share_directory as _get_pkg_share
+except ImportError:
+    _get_pkg_share = None
 
 _HTML_PATH = pathlib.Path(__file__).parent / "dashboard.html"
+
+# ---------------------------------------------------------------------------
+# WMTS tile proxy  (Norge i bilder satellite imagery)
+# ---------------------------------------------------------------------------
+_WMTS_BASE = (
+    "https://tilecache.norgeibilder.no/arcgis/rest/services"
+    "/Nibcache_UTM32_EUREF89_v2/MapServer/WMTS/tile/1.0.0"
+    "/Nibcache_UTM32_EUREF89_v2/default/default028mm"
+)
+_WMTS_REFERER = "https://naplab"
+_wmts_token   = "X2sctU5MKSsFC2rtPOI4U2gbNQRjZgLtPuoxgnQ_MbQGdh8h9ZjuMm9M_oDWQeun"
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -139,6 +157,134 @@ _path_data  = {"waypoints": [], "length_m": 0.0, "updated_at": 0.0}
 
 _start_time_mono = time.monotonic()
 _HZ_WINDOW_SEC   = 3.0
+_dashboard_node  = None   # set in main(), used by POST handler
+
+# ---------------------------------------------------------------------------
+# Path recording state
+# ---------------------------------------------------------------------------
+_RECORD_MIN_DIST_M = 0.5   # metres – skip if moved less than this
+_RECORD_HZ         = 5.0   # sampling rate for waypoints
+
+_rec_lock     = threading.Lock()
+_rec_active   = False
+_rec_file     = None
+_rec_writer   = None
+_rec_last_x   = None
+_rec_last_y   = None
+_rec_count    = 0
+_rec_filename = None
+_rec_thread   = None
+
+
+def _recording_loop():
+    """Background thread: samples gnss/odometry pos at ~_RECORD_HZ Hz, writes CSV."""
+    global _rec_active, _rec_count, _rec_last_x, _rec_last_y
+    interval = 1.0 / _RECORD_HZ
+    while True:
+        time.sleep(interval)
+        with _rec_lock:
+            if not _rec_active:
+                break
+        # read position from shared state (no topic lock needed for atomic float reads)
+        with _state_lock:
+            x   = _state["gnss"]["pos_x_m"]
+            y   = _state["gnss"]["pos_y_m"]
+            fix = _state["gnss"]["fix_label"]
+        if fix in ("NO FIX", "UNKNOWN"):
+            continue
+        with _rec_lock:
+            if not _rec_active:
+                break
+            if _rec_last_x is not None:
+                dx = x - _rec_last_x
+                dy = y - _rec_last_y
+                if (dx * dx + dy * dy) < (_RECORD_MIN_DIST_M ** 2):
+                    continue
+            _rec_writer.writerow([f'{x:.4f}', f'{y:.4f}'])
+            _rec_file.flush()
+            _rec_last_x = x
+            _rec_last_y = y
+            _rec_count += 1
+
+
+def _start_recording() -> dict:
+    global _rec_active, _rec_file, _rec_writer, _rec_last_x, _rec_last_y
+    global _rec_count, _rec_filename, _rec_thread
+    with _rec_lock:
+        if _rec_active:
+            return {"ok": False, "error": "already recording"}
+        try:
+            share_dir = pathlib.Path(_get_pkg_share('car_control')) if _get_pkg_share else None
+        except Exception:
+            share_dir = None
+        if share_dir is None:
+            share_dir = pathlib.Path(__file__).resolve().parent.parent.parent / 'share' / 'car_control'
+        paths_dir = share_dir / 'paths'
+        paths_dir.mkdir(parents=True, exist_ok=True)
+        ts       = time.strftime('%Y%m%d_%H%M%S')
+        filename = paths_dir / f'recording_{ts}.csv'
+        _rec_file   = open(filename, 'w', newline='')
+        _rec_writer = csv.writer(_rec_file)
+        _rec_writer.writerow(['x', 'y'])
+        _rec_last_x = None
+        _rec_last_y = None
+        _rec_count  = 0
+        _rec_filename = str(filename)
+        _rec_active = True
+        _rec_thread = threading.Thread(target=_recording_loop, daemon=True)
+    _rec_thread.start()
+    return {"ok": True, "filename": _rec_filename}
+
+
+def _stop_recording() -> dict:
+    global _rec_active, _rec_file, _rec_writer, _rec_filename, _rec_count
+    with _rec_lock:
+        if not _rec_active:
+            return {"ok": False, "error": "not recording"}
+        _rec_active = False
+        count    = _rec_count
+        filename = _rec_filename
+        stem     = pathlib.Path(filename).stem if filename else ""
+        if _rec_file:
+            _rec_file.flush()
+            _rec_file.close()
+            _rec_file = None
+    return {"ok": True, "filename": filename, "stem": stem, "waypoint_count": count}
+
+
+def _rename_recording(new_name: str) -> dict:
+    global _rec_filename
+    import re, os
+    with _rec_lock:
+        src = _rec_filename
+        if not src or not os.path.isfile(src):
+            return {"ok": False, "error": "no recording to rename"}
+        safe = re.sub(r'[^\w\-]', '_', new_name.strip()).strip('_')
+        if not safe:
+            return {"ok": False, "error": "invalid name"}
+        dst = str(pathlib.Path(src).parent / f'{safe}.csv')
+        try:
+            os.rename(src, dst)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        _rec_filename = None
+    return {"ok": True, "filename": pathlib.Path(dst).name}
+
+
+def _discard_recording() -> dict:
+    global _rec_filename
+    import os
+    with _rec_lock:
+        src = _rec_filename
+        if not src:
+            return {"ok": False, "error": "no recording to discard"}
+        _rec_filename = None
+        if os.path.isfile(src):
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +353,9 @@ class DashboardNode(Node):
         self.create_subscription(Float64, "/lateral_error",          self._cb_lat_err,   10)
         self.create_subscription(Float64, "/heading_error",          self._cb_hdg_err,   10)
         self.create_subscription(Bool,    "/path_following_status",  self._cb_pf_status, latched_qos)
+
+        # Publisher – allows dashboard to start/stop path following
+        self.enable_pub_ = self.create_publisher(Bool, "/path_follower_node/enable_path_following", 1)
 
     # ── Existing callbacks ───────────────────────────────────────────────────
 
@@ -349,11 +498,32 @@ class DashboardNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# HTTP server (threaded so parallel tile requests don't block each other)
+# ---------------------------------------------------------------------------
+class _QuietThreadedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that silently drops BrokenPipe from cancelled tile fetches."""
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def do_OPTIONS(self):
+        """Handle CORS pre-flight."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -382,6 +552,12 @@ class Handler(BaseHTTPRequestHandler):
                     "controller": ctrl,
                     "uptime_s":   round(time.monotonic() - _start_time_mono, 1),
                 }
+            with _rec_lock:
+                payload["recording"] = {
+                    "active":        _rec_active,
+                    "filename":      pathlib.Path(_rec_filename).name if _rec_filename else None,
+                    "waypoint_count": _rec_count,
+                }
             self._respond_json(payload)
 
         elif self.path == "/api/path":
@@ -390,6 +566,80 @@ class Handler(BaseHTTPRequestHandler):
                            "length_m":  _path_data["length_m"],
                            "updated_at": _path_data["updated_at"]}
             self._respond_json(payload)
+
+        elif self.path.startswith("/tiles/"):
+            if not _wmts_token:
+                body = b"WMTS token not configured (create mapview/WMTS_TOKEN.txt)"
+                self._respond(503, "text/plain", body)
+                return
+            rel = self.path[len("/tiles/"):].split("?")[0].strip("/")
+            if rel.endswith(".png"):
+                rel = rel[:-4]
+            parts = rel.split("/")
+            if len(parts) != 3:
+                self.send_response(400); self.end_headers(); return
+            z, y, x = parts
+            wmts_url = f"{_WMTS_BASE}/{z}/{y}/{x}?token={_wmts_token}"
+            req = Request(wmts_url, headers={
+                "Referer": _WMTS_REFERER,
+                "User-Agent": "car-dashboard/1.0",
+            })
+            try:
+                with urlopen(req, timeout=20) as resp:
+                    data = resp.read()
+                    ct = resp.headers.get("Content-Type", "image/png")
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", ct)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except HTTPError as exc:
+                self.send_error(exc.code, f"WMTS upstream: {exc.reason}")
+            except (URLError, Exception) as exc:
+                self.send_error(502, str(exc))
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/enable_path_following":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(body)
+                enable = bool(data.get("enable", True))
+            except (json.JSONDecodeError, KeyError):
+                self._respond(400, "application/json", b'{"error":"bad json"}')
+                return
+            msg = Bool()
+            msg.data = enable
+            _dashboard_node.enable_pub_.publish(msg)
+            self._respond_json({"ok": True, "enable": enable})
+
+        elif self.path == "/api/start_recording":
+            self._respond_json(_start_recording())
+
+        elif self.path == "/api/stop_recording":
+            self._respond_json(_stop_recording())
+
+        elif self.path == "/api/rename_recording":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(body)
+                name = str(data.get("name", ""))
+            except (json.JSONDecodeError, KeyError):
+                self._respond(400, "application/json", b'{"error":"bad json"}')
+                return
+            self._respond_json(_rename_recording(name))
+
+        elif self.path == "/api/discard_recording":
+            self._respond_json(_discard_recording())
 
         else:
             self.send_response(404)
@@ -411,14 +661,16 @@ class Handler(BaseHTTPRequestHandler):
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    PORT = 8080
+    global _dashboard_node
+    PORT = 8765
     rclpy.init()
     node = DashboardNode()
+    _dashboard_node = node
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = _QuietThreadedServer(("0.0.0.0", PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    print(f"[dashboard] Listening on http://localhost:{PORT}")
+    print(f"[dashboard] Listening on http://localhost:{PORT}  (VS Code: forward this port to open in browser)")
     print("[dashboard] Ctrl+C to stop")
     try:
         rclpy.spin(node)
@@ -427,7 +679,10 @@ def main():
     finally:
         server.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

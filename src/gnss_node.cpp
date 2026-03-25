@@ -54,7 +54,7 @@ public:
                  fusion_disabled_warned_(false)
     {
         // Declare parameters
-        this->declare_parameter("host", "ublox.lan");
+        this->declare_parameter("host", "tppg2.lan");
         this->declare_parameter("port", 7799);
         this->declare_parameter("reconnect_interval_sec", 5.0);
         this->declare_parameter("auto_set_origin", true);
@@ -106,10 +106,11 @@ public:
     {
         running_ = false;
         {
-            // Close socket under mutex so sender_loop sees socket_fd_ == -1
-            // when it next wakes, rather than getting EBADF on a closed fd.
+            // shutdown() immediately unblocks recv() in the reader thread.
+            // close() alone is not guaranteed to do so on Linux.
             std::lock_guard<std::mutex> lock(socket_write_mutex_);
             if (socket_fd_ >= 0) {
+                ::shutdown(socket_fd_, SHUT_RDWR);
                 close(socket_fd_);
                 socket_fd_ = -1;
             }
@@ -163,9 +164,10 @@ private:
             return;
         }
         
-        // Set recv timeout so we can check if node should shut down
+        // Set recv timeout – fallback so reader_loop can notice shutdown
+        // even if shutdown(SHUT_RDWR) somehow doesn't unblock recv immediately.
         struct timeval tv;
-        tv.tv_sec = 5;
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
         setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -427,24 +429,21 @@ private:
         
         navsat_publisher_->publish(navsat_msg);
         
-        // Convert to local ENU coordinates
+        // Convert lat/lon to UTM32 (EPSG:25832) absolute coordinates
         if (!origin_set_) {
-            origin_lat_ = navsat_msg.latitude;
-            origin_lon_ = navsat_msg.longitude;
             origin_alt_ = navsat_msg.altitude;
             origin_set_ = true;
-            RCLCPP_INFO(this->get_logger(), "Origin set to first fix: lat=%.7f, lon=%.7f, alt=%.2f",
-                origin_lat_, origin_lon_, origin_alt_);
+            RCLCPP_INFO(this->get_logger(), "Altitude origin set to first fix: alt=%.2f m",
+                origin_alt_);
         }
-        
-        // Convert lat/lon to local ENU (East-North-Up) coordinates
+
         double east, north;
-        latlon_to_enu(navsat_msg.latitude, navsat_msg.longitude, east, north);
+        geo::latlon_to_utm32(navsat_msg.latitude, navsat_msg.longitude, east, north);
         
         // Publish pose in local frame
         auto pose_msg = geometry_msgs::msg::PoseStamped();
         pose_msg.header = navsat_msg.header;
-        pose_msg.header.frame_id = "map"; // Local reference frame
+        pose_msg.header.frame_id = "utm32"; // UTM zone 32N (EPSG:25832)
         pose_msg.pose.position.x = east;
         pose_msg.pose.position.y = north;
         pose_msg.pose.position.z = navsat_msg.altitude - origin_alt_;
@@ -474,7 +473,7 @@ private:
         // Publish combined odometry
         auto odom_msg = nav_msgs::msg::Odometry();
         odom_msg.header = navsat_msg.header;
-        odom_msg.header.frame_id = "map";
+        odom_msg.header.frame_id = "utm32";
         odom_msg.child_frame_id = "base_link";
         odom_msg.pose.pose = pose_msg.pose;
         odom_msg.twist.twist = velocity_msg.twist;
@@ -502,17 +501,17 @@ private:
         }
         
         RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "GNSS: %s | sats=%d | ENU: x=%.2f y=%.2f z=%.2f | vN=%.2f vE=%.2f vD=%.2f m/s | calibrated=%s",
+            "GNSS: %s | sats=%d | UTM32: E=%.2f N=%.2f z=%.2f | vN=%.2f vE=%.2f vD=%.2f m/s | calibrated=%s",
             fix_status.c_str(), pvt.numSV,
             east, north, navsat_msg.altitude - origin_alt_,
             pvt.velN * 1e-3, pvt.velE * 1e-3, pvt.velD * 1e-3,
             calibration_complete_ ? "YES" : "NO");
     }
     
-    /** Convert lat/lon to local ENU. Delegates to geo_utils.hpp. */
+    /** Convert lat/lon to UTM32 (EPSG:25832). Delegates to geo_utils.hpp. */
     void latlon_to_enu(double lat, double lon, double& east, double& north)
     {
-        geo::latlon_to_enu(lat, lon, origin_lat_, origin_lon_, east, north);
+        geo::latlon_to_utm32(lat, lon, east, north);
     }
     
     /**

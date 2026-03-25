@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Car Control Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/proj4@2.9.0/dist/proj4.js"></script>
+<script src="https://unpkg.com/proj4leaflet@1.0.2/src/proj4leaflet.js"></script>
 <style>
 /* ── Reset / base ─────────────────────────────────────────────────────── */
 *{box-sizing:border-box;margin:0;padding:0}
@@ -42,10 +46,17 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
 /* ── Hz bar ──────────────────────────────────────────────────────────── */
 .hz-bar-bg{background:#21262d;border-radius:4px;height:5px;margin-top:3px;overflow:hidden}
 .hz-bar{height:5px;border-radius:4px;transition:width .4s}
-/* ── Map canvas ──────────────────────────────────────────────────────── */
+/* ── Map (Leaflet) ───────────────────────────────────────────────────────── */
 #map-wrap{position:relative;flex:1;min-width:320px}
-#map-canvas{display:block;width:100%;height:420px;background:#0a0f16;border-radius:4px;cursor:crosshair}
-#map-info{position:absolute;bottom:8px;left:8px;background:rgba(13,17,23,.85);padding:5px 9px;border-radius:6px;font-size:11px;color:#8b949e;pointer-events:none}
+#leaflet-map{width:100%;height:420px;border-radius:4px}
+/* Car arrow marker */
+.car-arrow-marker{width:14px;height:20px;background:#fff;clip-path:polygon(50% 0%,0% 100%,50% 72%,100% 100%);transform-origin:center center;filter:drop-shadow(0 0 3px #000)}
+/* Leaflet dark-theme tweaks */
+.leaflet-container{background:#0d1117}
+.leaflet-control-attribution{background:rgba(13,17,23,.85)!important;color:#6e7681!important}
+.leaflet-control-attribution a{color:#58d9f9!important}
+.leaflet-bar a{background:#161b22!important;color:#e6edf3!important;border-color:#30363d!important}
+.leaflet-bar a:hover{background:#21262d!important}
 /* ── Steering gauge ──────────────────────────────────────────────────── */
 #steer-canvas{display:block;margin:0 auto}
 /* ── Sparkline ───────────────────────────────────────────────────────── */
@@ -66,8 +77,35 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
 .prog-bg{background:#21262d;border-radius:4px;height:8px;overflow:hidden;margin-top:3px}
 .prog-fill{height:8px;border-radius:4px;transition:width .3s}
 /* ── Responsive ──────────────────────────────────────────────────────── */
-@media(max-width:900px){.row-flex{flex-direction:column}}
-</style>
+@media(max-width:900px){.row-flex{flex-direction:column}}/* ── Enable button ───────────────────────────────────────────────────────── */
+.enable-btn{display:block;width:100%;margin-top:10px;padding:8px 0;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;letter-spacing:.04em;transition:background .2s,color .2s}
+.enable-btn.start{background:#1a3d1f;color:#3fb950;border:1px solid #2a5c2f}
+.enable-btn.start:hover{background:#2a5c2f}
+.enable-btn.stop{background:#3d0f0a;color:#f85149;border:1px solid #6b1d17}
+.enable-btn.stop:hover{background:#6b1d17}
+.enable-btn:disabled{background:#21262d!important;color:#3b454f!important;border-color:#21262d!important;cursor:not-allowed!important}
+#enable-status{font-size:11px;text-align:center;margin-top:5px;color:#6e7681;min-height:14px}
+.record-btn{display:block;width:100%;margin-top:6px;padding:7px 0;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;letter-spacing:.04em;transition:background .2s,color .2s}
+.record-btn.idle{background:#2a1a1a;color:#f47174;border:1px solid #5a2020}
+.record-btn.idle:hover{background:#3a2020}
+.record-btn.active{background:#5a0a0a;color:#ff6060;border:1px solid #8b2020;animation:recpulse 1.2s ease-in-out infinite}
+@keyframes recpulse{0%,100%{border-color:#8b2020}50%{border-color:#f47174}}
+.record-btn:disabled{background:#21262d!important;color:#3b454f!important;border-color:#21262d!important;cursor:not-allowed!important;animation:none!important}
+#record-status{font-size:11px;text-align:center;margin-top:4px;color:#6e7681;min-height:14px}
+/* ── Save-recording modal ───────────────────────────────────────────────── */
+#rec-modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9000;align-items:center;justify-content:center}
+#rec-modal-overlay.open{display:flex}
+#rec-modal{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px 22px 16px;width:min(380px,90vw);box-shadow:0 8px 32px #000a}
+#rec-modal h3{margin:0 0 4px;font-size:14px;color:#e6edf3;font-weight:600}
+#rec-modal p{margin:0 0 12px;font-size:11px;color:#6e7681}
+#rec-modal input{width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:13px;padding:7px 10px;outline:none}
+#rec-modal input:focus{border-color:#388bfd}
+#rec-modal .modal-row{display:flex;gap:8px;margin-top:12px}
+#rec-modal .modal-row button{flex:1;padding:7px 0;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
+.modal-save{background:#1a3d1f;color:#3fb950;border:1px solid #2a5c2f!important}
+.modal-save:hover{background:#2a5c2f}
+.modal-discard{background:#3d0f0a;color:#f85149;border:1px solid #6b1d17!important}
+.modal-discard:hover{background:#6b1d17}</style>
 </head>
 <body>
 <header>
@@ -83,13 +121,15 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
     <!-- Map -->
     <div class="card" style="flex:3;min-width:320px">
       <div class="card-header">
-        <span>ENU Map</span>
-        <span id="map-status-badge" class="badge bg-grey">NO PATH</span>
+        <span>Satellite Map</span>
+        <span style="display:flex;gap:8px;align-items:center">
+          <button id="follow-car-btn" class="badge bg-grey" style="border:none;cursor:pointer;padding:2px 8px" title="Re-centre on car">⊛ Follow</button>
+          <span id="map-status-badge" class="badge bg-grey">NO PATH</span>
+        </span>
       </div>
       <div class="card-body" style="padding:8px;position:relative">
         <div id="map-wrap">
-          <canvas id="map-canvas"></canvas>
-          <div id="map-info">Waiting for path data…</div>
+          <div id="leaflet-map"></div>
         </div>
       </div>
     </div>
@@ -123,7 +163,9 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
             <span class="label">Heading Error</span>
             <span><span id="hdg-err-val" class="value">—</span> <span class="grey">deg</span></span>
           </div>
-        </div>
+          <button id="enable-btn" class="enable-btn start" onclick="togglePathFollowing()">▶ Start Path Following</button>
+          <div id="enable-status"></div>          <button id="record-btn" class="record-btn idle" onclick="toggleRecording()">&#9210; Record Path</button>
+          <div id="record-status"></div>        </div>
       </div>
 
       <!-- Steering gauge -->
@@ -134,27 +176,6 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
           <div style="display:flex;justify-content:space-around;font-size:11px;margin-top:2px">
             <span><span style="color:#f0a500">■</span> Target <span id="steer-tgt-num" class="value">—</span>°</span>
             <span><span style="color:#58d9f9">■</span> Measured <span id="steer-meas-num" class="value">—</span>°</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Error sparklines -->
-      <div class="card">
-        <div class="card-header">Error Histories</div>
-        <div class="card-body" style="padding:8px 10px">
-          <div class="spark-wrap">
-            <div class="spark-label">Lateral Error (m)  <span id="lat-range" style="color:#3b454f"></span></div>
-            <svg id="spark-lat" class="spark" viewBox="0 0 240 52" preserveAspectRatio="none"></svg>
-          </div>
-          <hr class="divider">
-          <div class="spark-wrap">
-            <div class="spark-label">Heading Error (deg)  <span id="hdg-range" style="color:#3b454f"></span></div>
-            <svg id="spark-hdg" class="spark" viewBox="0 0 240 52" preserveAspectRatio="none"></svg>
-          </div>
-          <hr class="divider">
-          <div class="spark-wrap">
-            <div class="spark-label">Speed (m/s)  <span id="spd-range" style="color:#3b454f"></span></div>
-            <svg id="spark-spd" class="spark" viewBox="0 0 240 52" preserveAspectRatio="none"></svg>
           </div>
         </div>
       </div>
@@ -182,7 +203,7 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
       </div>
     </div>
 
-    <!-- GNSS Velocity + ENU -->
+    <!-- GNSS Velocity + UTM32 -->
     <div class="card" style="flex:1;min-width:220px">
       <div class="card-header">GNSS Velocity</div>
       <div class="card-body">
@@ -192,8 +213,8 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
         <div class="row"><span class="label">Vel East</span><span id="vel-e" class="value">— m/s</span></div>
         <div class="row"><span class="label">Vel Down</span><span id="vel-d" class="value">— m/s</span></div>
         <hr class="divider">
-        <div class="row"><span class="label">ENU X (E)</span><span id="pos-x" class="value">— m</span></div>
-        <div class="row"><span class="label">ENU Y (N)</span><span id="pos-y" class="value">— m</span></div>
+        <div class="row"><span class="label">UTM32 E</span><span id="pos-x" class="value">— m</span></div>
+        <div class="row"><span class="label">UTM32 N</span><span id="pos-y" class="value">— m</span></div>
         <div class="row"><span class="label">Heading</span><span id="pos-h" class="value">—°</span></div>
       </div>
     </div>
@@ -287,13 +308,31 @@ const MAX_TRAIL       = 400;    // vehicle position history points
 const SW_TO_AXLE      = 30.0 / 460.0;     // steering-wheel → front-axle deg
 const MAX_AXLE_DEG    = 30.0;             // front-axle range ±
 
+// ENU frame fixed origin — used only as fallback map centre before first GNSS fix
+const ORIGIN_LAT    = 63.4391;
+const ORIGIN_LON    = 10.4128;
+
+// UTM32 (EPSG:25832) → WGS-84 projection (proj4 is loaded in <head>)
+const _PROJ_UTM32 = '+proj=utm +zone=32 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs';
+function utm32ToLL(e, n){
+  const [lon, lat] = proj4(_PROJ_UTM32, 'EPSG:4326', [e, n]);
+  return [lat, lon];
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════════════
 let gPath      = null;   // {waypoints:[{x,y}], length_m}
 let gPathTime  = 0;
-let gTrail     = [];     // [{x,y}] vehicle history
 let gLastS     = null;   // last API status
+
+// Leaflet map state
+let _lmap         = null;   // Leaflet map instance
+let _carMarker    = null;
+let _trailPts     = [];     // array of [lat, lon]
+let _trailLayer   = null;
+let _pathLayer    = null;
+let _followCar    = true;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Formatting helpers
@@ -337,6 +376,84 @@ function setHTML(id,v){ const el=document.getElementById(id); if(el) el.innerHTM
 function setClass(id,c){ const el=document.getElementById(id); if(el) el.className=c; }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Enable / disable path following
+// ═══════════════════════════════════════════════════════════════════════════
+let _pfActive = false;
+function togglePathFollowing(){
+  const enable = !_pfActive;
+  fetch('/api/enable_path_following',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enable})
+  }).catch(err=>console.warn('enable toggle failed:',err));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Path recording
+// ═══════════════════════════════════════════════════════════════════════════
+let _recActive = false;
+
+function toggleRecording(){
+  if(_recActive){
+    fetch('/api/stop_recording', {method:'POST'})
+      .then(r=>r.json())
+      .then(d=>{ if(d.ok) _showSaveModal(d.stem || d.filename, d.waypoint_count); })
+      .catch(err=>console.warn('stop_recording failed:', err));
+  } else {
+    fetch('/api/start_recording', {method:'POST'})
+      .then(r=>r.json())
+      .then(d=>{ if(!d.ok) console.warn('start_recording failed:', d.error); })
+      .catch(err=>console.warn('start_recording failed:', err));
+  }
+}
+
+function _showSaveModal(stem, count){
+  const overlay = document.getElementById('rec-modal-overlay');
+  const input   = document.getElementById('rec-modal-input');
+  const sub     = document.getElementById('rec-modal-sub');
+  if(!overlay) return;
+  input.value = stem || '';
+  sub.textContent = count + ' waypoints recorded. Edit name or discard.';
+  overlay.classList.add('open');
+  input.focus();
+  input.select();
+}
+
+function saveRecording(){
+  const input = document.getElementById('rec-modal-input');
+  const name  = input ? input.value.trim() : '';
+  if(!name) return;
+  fetch('/api/rename_recording', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name})
+  }).then(r=>r.json()).then(d=>{
+    document.getElementById('rec-modal-overlay').classList.remove('open');
+    const recStatus = document.getElementById('record-status');
+    if(recStatus) recStatus.innerHTML = d.ok
+      ? '<span style="color:#3fb950">&#10003; Saved: ' + d.filename + '</span>'
+      : '<span style="color:#f85149">&#9888; Rename failed: ' + (d.error||'') + '</span>';
+  }).catch(err=>console.warn('rename_recording failed:', err));
+}
+
+function discardRecording(){
+  fetch('/api/discard_recording', {method:'POST'})
+    .then(r=>r.json()).then(()=>{
+      document.getElementById('rec-modal-overlay').classList.remove('open');
+      const recStatus = document.getElementById('record-status');
+      if(recStatus) recStatus.innerHTML = '<span style="color:#6e7681">Recording discarded.</span>';
+    }).catch(err=>console.warn('discard_recording failed:', err));
+}
+
+// close modal on overlay click outside
+document.addEventListener('DOMContentLoaded', ()=>{
+  const ov = document.getElementById('rec-modal-overlay');
+  if(ov) ov.addEventListener('click', e=>{ if(e.target===ov) discardRecording(); });
+  const inp = document.getElementById('rec-modal-input');
+  if(inp) inp.addEventListener('keydown', e=>{ if(e.key==='Enter') saveRecording(); if(e.key==='Escape') discardRecording(); });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main render
 // ═══════════════════════════════════════════════════════════════════════════
 function render(s){
@@ -361,7 +478,49 @@ function render(s){
     const lbl = ctrlStale > 3 ? 'OFFLINE' : (c.state_label || 'IDLE');
     pfBadgeEl.textContent = lbl;
     pfBadgeEl.className   = 'badge ' +
-      (lbl==='FOLLOWING'?'bg-green': lbl==='STOPPING'?'bg-yellow': ctrlStale>3?'bg-red':'bg-grey');
+      (lbl==='FOLLOWING'?'bg-green': lbl==='STOPPING'?'bg-yellow': ctrlStale>3?'bg-red':'bg-grey');    _pfActive = (lbl === 'FOLLOWING');
+    const btn = document.getElementById('enable-btn');
+    const statusEl = document.getElementById('enable-status');
+    const hasGnss = gnssStale < STALE_SEC && g.fix_label !== 'NO FIX' && g.fix_label !== 'UNKNOWN';
+    if(btn){
+      if(_pfActive){ btn.textContent='⏹ Stop Path Following'; btn.className='enable-btn stop'; btn.disabled=false; }
+      else         { btn.textContent='▶ Start Path Following'; btn.className='enable-btn start'; btn.disabled=!hasGnss; }
+    }
+    if(statusEl){
+      if(_pfActive) statusEl.textContent='';
+      else if(!hasGnss && gnssStale >= STALE_SEC) statusEl.innerHTML='<span style="color:#f85149">⚠ No GNSS data</span>';
+      else if(!hasGnss) statusEl.innerHTML='<span style="color:#e3b341">⚠ Waiting for GNSS fix…</span>';
+      else statusEl.textContent='';
+    }  }
+
+  // ── Recording button ─────────────────────────────────────────────────────
+  const rec = s.recording || {};
+  _recActive = !!rec.active;
+  const recBtn = document.getElementById('record-btn');
+  const recStatus = document.getElementById('record-status');
+  const hasGnssRec = gnssStale < STALE_SEC && g.fix_label !== 'NO FIX' && g.fix_label !== 'UNKNOWN';
+  if(recBtn){
+    if(_recActive){
+      recBtn.textContent = '\u23F9 Stop Recording (' + (rec.waypoint_count||0) + ' pts)';
+      recBtn.className = 'record-btn active';
+      recBtn.disabled = false;
+    } else {
+      recBtn.textContent = '\u23FA Record Path';
+      recBtn.className = 'record-btn idle';
+      recBtn.disabled = !hasGnssRec;
+    }
+  }
+  // Only update recStatus if modal is not open
+  const recOverlay = document.getElementById('rec-modal-overlay');
+  const modalOpen = recOverlay && recOverlay.classList.contains('open');
+  if(recStatus && !modalOpen){
+    if(_recActive){
+      recStatus.innerHTML = '<span style="color:#f47174">&#9679; Recording\u2026</span>';
+    } else if(!hasGnssRec && !rec.filename){
+      recStatus.innerHTML = gnssStale >= STALE_SEC
+        ? '<span style="color:#f85149">\u26A0 No GNSS data</span>'
+        : '<span style="color:#e3b341">\u26A0 Waiting for GNSS fix\u2026</span>';
+    }
   }
 
   // ── Controller card ──────────────────────────────────────────────────────
@@ -388,11 +547,6 @@ function render(s){
   setText('steer-meas-num', fmt(measAxleDeg,1));
   drawSteeringGauge(tgtAxleDeg, measAxleDeg);
 
-  // ── Sparklines ────────────────────────────────────────────────────────────
-  drawSparkline('spark-lat', c.lat_err_history,   '#f0a500', 'lat-range');
-  drawSparkline('spark-hdg', c.hdg_err_history,   '#58d9f9', 'hdg-range');
-  drawSparkline('spark-spd', c.speed_history,     '#3fb950', 'spd-range');
-
   // ── GNSS Fix card ─────────────────────────────────────────────────────────
   setHTML ('gnss-stale-badge', stale_badge(gnssStale > STALE_SEC));
   setHTML ('fix-badge', `<span class="badge ${gnssStale>STALE_SEC?'bg-grey':fixClass(g.fix_label)}">${g.fix_label}</span>`);
@@ -411,8 +565,8 @@ function render(s){
   setText('vel-n', fmt(g.vel_n_mps,3)+' m/s');
   setText('vel-e', fmt(g.vel_e_mps,3)+' m/s');
   setText('vel-d', fmt(g.vel_d_mps,3)+' m/s');
-  setText('pos-x', fmt(g.pos_x_m,2)+' m');
-  setText('pos-y', fmt(g.pos_y_m,2)+' m');
+  setText('pos-x', fmt(g.pos_x_m,1)+' m');
+  setText('pos-y', fmt(g.pos_y_m,1)+' m');
   setText('pos-h', fmt(g.heading_deg,1)+'°');
 
   // ── Vehicle State card ────────────────────────────────────────────────────
@@ -495,180 +649,102 @@ function render(s){
     }).join('');
   }
 
-  // ── ENU Map ────────────────────────────────────────────────────────────────
-  // Push vehicle position to trail
-  if(g.pos_x_m!==0 || g.pos_y_m!==0){
-    gTrail.push({x:g.pos_x_m, y:g.pos_y_m});
-    if(gTrail.length > MAX_TRAIL) gTrail.shift();
-  }
-  drawMap(g, c);
+  // ── Leaflet satellite map ────────────────────────────────────────────────────
+  updateLeafletCar(g.latitude, g.longitude, g.heading_deg, c);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ENU Map canvas
+// Leaflet satellite map helpers
 // ═══════════════════════════════════════════════════════════════════════════
-function drawMap(g, c){
-  const canvas = document.getElementById('map-canvas');
-  const dpr    = window.devicePixelRatio || 1;
-  const W      = canvas.clientWidth;
-  const H      = canvas.clientHeight;
-  if(canvas.width !== W*dpr || canvas.height !== H*dpr){
-    canvas.width  = W*dpr;
-    canvas.height = H*dpr;
-  }
-  const ctx = canvas.getContext('2d');
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, W, H);
+function initLeafletMap(){
+  // EPSG:25832 UTM zone 32N — matches tilecache.norgeibilder.no CRS
+  const RES = [21664,10832,5416,2708,1354,677,338.5,169.25,84.625,42.3125,
+               21.15625,10.578125,5.2890625,2.64453125,1.322265625,
+               0.6611328125,0.33056640625,0.16528320312];
+  const crs25832 = new L.Proj.CRS(
+    'EPSG:25832',
+    '+proj=utm +zone=32 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs',
+    { resolutions: RES, origin: [-2000000, 9045984] }
+  );
 
-  // Collect all points to determine bounding box
-  const pts = [];
-  if(gPath && gPath.waypoints.length){
-    for(const p of gPath.waypoints) pts.push(p);
-  }
-  for(const p of gTrail) pts.push(p);
-  if(g.pos_x_m!==0||g.pos_y_m!==0) pts.push({x:g.pos_x_m, y:g.pos_y_m});
+  _lmap = L.map('leaflet-map', { crs: crs25832, zoomControl: true })
+           .setView([ORIGIN_LAT, ORIGIN_LON], 14);
 
-  if(pts.length < 2){ drawMapNoData(ctx,W,H); return; }
+  L.tileLayer('/tiles/{z}/{y}/{x}.png', {
+    minZoom: 0, maxZoom: 17, tileSize: 256,
+    attribution: '\u00a9 <a href="https://norgeibilder.no">Norge i bilder</a>',
+    crossOrigin: true,
+  }).addTo(_lmap);
 
-  let xmin=Infinity,xmax=-Infinity,ymin=Infinity,ymax=-Infinity;
-  for(const p of pts){
-    xmin=Math.min(xmin,p.x); xmax=Math.max(xmax,p.x);
-    ymin=Math.min(ymin,p.y); ymax=Math.max(ymax,p.y);
-  }
-  const PAD = 30;
-  const rx  = xmax-xmin || 1, ry = ymax-ymin || 1;
-  const scale = Math.min((W-2*PAD)/rx, (H-2*PAD)/ry);
-  const cx  = (x) => PAD + (x-xmin)*scale;
-  const cy  = (y) => H - PAD - (y-ymin)*scale;   // flip Y
+  // Car marker
+  const carIcon = L.divIcon({
+    className: '',
+    html: '<div class="car-arrow-marker"></div>',
+    iconSize: [14, 20], iconAnchor: [7, 10],
+  });
+  _carMarker = L.marker([ORIGIN_LAT, ORIGIN_LON], { icon: carIcon, zIndexOffset: 1000 }).addTo(_lmap);
 
-  // Grid lines
-  ctx.strokeStyle='#1c2330'; ctx.lineWidth=1;
-  const gridStep = niceStep(Math.max(rx,ry)/6);
-  const x0g=Math.ceil(xmin/gridStep)*gridStep;
-  for(let x=x0g; x<=xmax; x+=gridStep){
-    ctx.beginPath(); ctx.moveTo(cx(x),PAD); ctx.lineTo(cx(x),H-PAD); ctx.stroke();
-    ctx.fillStyle='#3b454f'; ctx.font='9px monospace'; ctx.fillText(x.toFixed(0)+'m',cx(x)+2,H-PAD-2);
-  }
-  const y0g=Math.ceil(ymin/gridStep)*gridStep;
-  for(let y=y0g; y<=ymax; y+=gridStep){
-    ctx.beginPath(); ctx.moveTo(PAD,cy(y)); ctx.lineTo(W-PAD,cy(y)); ctx.stroke();
-    ctx.fillStyle='#3b454f'; ctx.font='9px monospace'; ctx.fillText(y.toFixed(0)+'m',PAD+2,cy(y)-3);
-  }
+  // Unfollow on manual pan
+  _lmap.on('dragstart', () => {
+    _followCar = false;
+    const btn = document.getElementById('follow-car-btn');
+    if(btn) btn.className = 'badge bg-grey';
+  });
 
-  // Origin marker
-  ctx.beginPath(); ctx.arc(cx(0),cy(0),5,0,2*Math.PI);
-  ctx.fillStyle='#ffffff22'; ctx.fill();
-  ctx.strokeStyle='#ffffff44'; ctx.lineWidth=1; ctx.stroke();
+  // Re-follow button
+  const followBtn = document.getElementById('follow-car-btn');
+  if(followBtn) followBtn.addEventListener('click', () => {
+    _followCar = true;
+    followBtn.className = 'badge bg-green';
+    if(gLastS) _lmap.panTo([gLastS.gnss.latitude, gLastS.gnss.longitude]);
+  });
+}
 
-  // Path
-  if(gPath && gPath.waypoints.length >= 2){
-    ctx.beginPath();
-    ctx.moveTo(cx(gPath.waypoints[0].x), cy(gPath.waypoints[0].y));
-    for(let i=1;i<gPath.waypoints.length;i++)
-      ctx.lineTo(cx(gPath.waypoints[i].x), cy(gPath.waypoints[i].y));
-    ctx.strokeStyle='#1a5f7a'; ctx.lineWidth=3; ctx.stroke();
-
-    // Path highlight (thinner cyan on top)
-    ctx.beginPath();
-    ctx.moveTo(cx(gPath.waypoints[0].x), cy(gPath.waypoints[0].y));
-    for(let i=1;i<gPath.waypoints.length;i++)
-      ctx.lineTo(cx(gPath.waypoints[i].x), cy(gPath.waypoints[i].y));
-    ctx.strokeStyle='#58d9f9'; ctx.lineWidth=1.5; ctx.stroke();
-
-    // Start / end markers
-    const s=gPath.waypoints[0], e2=gPath.waypoints[gPath.waypoints.length-1];
-    ctx.beginPath(); ctx.arc(cx(s.x),cy(s.y),5,0,2*Math.PI);
-    ctx.fillStyle='#3fb950'; ctx.fill();
-    ctx.beginPath(); ctx.arc(cx(e2.x),cy(e2.y),5,0,2*Math.PI);
-    ctx.fillStyle='#f85149'; ctx.fill();
-  }
-
-  // Vehicle trail (fading dots)
-  if(gTrail.length >= 2){
-    for(let i=1;i<gTrail.length;i++){
-      const alpha = 0.05 + 0.6*(i/gTrail.length);
-      ctx.beginPath();
-      ctx.moveTo(cx(gTrail[i-1].x),cy(gTrail[i-1].y));
-      ctx.lineTo(cx(gTrail[i].x),  cy(gTrail[i].y));
-      ctx.strokeStyle=`rgba(63,185,80,${alpha})`;
-      ctx.lineWidth=1.5; ctx.stroke();
+function updateLeafletCar(lat, lon, headingDeg, c){
+  if(!_lmap) return;
+  // Update marker
+  const ll = [lat, lon];
+  if(lat !== 0 || lon !== 0){
+    _carMarker.setLatLng(ll);
+    // Rotate: heading_deg=90° is North (up on map), CSS 0° = arrow pointing up
+    const rot = 90 - headingDeg;
+    const el = _carMarker.getElement();
+    if(el){
+      const arrow = el.querySelector('.car-arrow-marker');
+      if(arrow) arrow.style.transform = `rotate(${rot}deg)`;
     }
+    // Trail
+    _trailPts.push(ll);
+    if(_trailPts.length > MAX_TRAIL) _trailPts.shift();
+    if(_trailLayer){ _lmap.removeLayer(_trailLayer); _trailLayer = null; }
+    if(_trailPts.length >= 2)
+      _trailLayer = L.polyline(_trailPts, {color:'#3fb950', weight:2, opacity:0.75, smoothFactor:1}).addTo(_lmap);
+    if(_followCar) _lmap.panTo(ll, {animate: true, duration: 0.3});
   }
-
-  // Cross-track error line (vehicle → nearest path point)
-  if(gPath && gPath.waypoints.length && gLastS){
-    const vx=g.pos_x_m, vy=g.pos_y_m;
-    let best=gPath.waypoints[0], bestD=Infinity;
-    for(const p of gPath.waypoints){
-      const d=(p.x-vx)**2+(p.y-vy)**2;
-      if(d<bestD){bestD=d;best=p;}
-    }
-    const errM = Math.sqrt(bestD);
-    if(errM < 20){
-      ctx.beginPath();
-      ctx.moveTo(cx(vx),cy(vy)); ctx.lineTo(cx(best.x),cy(best.y));
-      ctx.strokeStyle='rgba(248,81,73,0.7)'; ctx.lineWidth=1.5;
-      ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
-    }
-  }
-
-  // Vehicle arrow
-  const vx=g.pos_x_m, vy=g.pos_y_m;
-  const headRad = (g.heading_deg - 90) * Math.PI/180;  // ENU: 0°=E,90°=N → rotate
-  drawArrow(ctx, cx(vx), cy(vy), headRad, 12, '#ffffff');
-
-  // Map info overlay
-  const infoEl=document.getElementById('map-info');
-  if(infoEl){
-    const pathLen = gPath ? gPath.length_m.toFixed(0)+'m' : '—';
-    const trailLen = gTrail.length ? (gTrail.length*0.2).toFixed(0)+'s' : '—';
-    infoEl.textContent = `Path ${pathLen}  |  Trail ${trailLen}  |  Scale ${(1/scale).toFixed(1)} m/px`;
-  }
-
   // Map status badge
-  const mapBadge=document.getElementById('map-status-badge');
+  const mapBadge = document.getElementById('map-status-badge');
   if(mapBadge){
-    if(!gPath) { mapBadge.textContent='NO PATH'; mapBadge.className='badge bg-grey'; }
-    else if(gLastS?.controller?.active){ mapBadge.textContent='FOLLOWING'; mapBadge.className='badge bg-green'; }
-    else { mapBadge.textContent='PATH LOADED'; mapBadge.className='badge bg-cyan'; }
+    if(!gPath){ mapBadge.textContent='NO PATH'; mapBadge.className='badge bg-grey'; }
+    else if(c?.active){ mapBadge.textContent='FOLLOWING'; mapBadge.className='badge bg-green'; }
+    else{ mapBadge.textContent='PATH LOADED'; mapBadge.className='badge bg-cyan'; }
   }
 }
 
-function drawMapNoData(ctx, W, H){
-  ctx.fillStyle='#3b454f'; ctx.font='13px sans-serif'; ctx.textAlign='center';
-  ctx.fillText('Waiting for GNSS + path data…', W/2, H/2);
-  ctx.textAlign='left';
-  const infoEl=document.getElementById('map-info');
-  if(infoEl) infoEl.textContent='No data';
+function updateLeafletPath(path){
+  if(!_lmap || !path || path.waypoints.length < 2) return;
+  const lls = path.waypoints.map(p => utm32ToLL(p.x, p.y));
+  if(_pathLayer){ _lmap.removeLayer(_pathLayer); _pathLayer = null; }
+  _pathLayer = L.layerGroup([
+    L.polyline(lls, {color:'#1a5f7a', weight:5, opacity:0.7}),
+    L.polyline(lls, {color:'#58d9f9', weight:2, opacity:0.95}),
+    L.circleMarker(lls[0],             {radius:6, color:'#3fb950', fillColor:'#3fb950', fillOpacity:0.9, weight:2}),
+    L.circleMarker(lls[lls.length-1],  {radius:6, color:'#f85149', fillColor:'#f85149', fillOpacity:0.9, weight:2}),
+  ]).addTo(_lmap);
 }
-
-function drawArrow(ctx, x, y, headingRad, size, color){
-  ctx.save();
-  ctx.translate(x, y);
-  // headingRad from ENU: East=0, CCW positiv. Canvas: right=0, CW positive.
-  // ENU to canvas: angle = -headingRad + π/2  → already done via (heading_deg-90)
-  ctx.rotate(headingRad);
-  ctx.beginPath();
-  ctx.moveTo(0, -size);          // tip (forward)
-  ctx.lineTo(-size*0.5, size*0.6);
-  ctx.lineTo(0, size*0.2);
-  ctx.lineTo(size*0.5,  size*0.6);
-  ctx.closePath();
-  ctx.fillStyle=color;
-  ctx.fill();
-  // Outline
-  ctx.strokeStyle='#00000088'; ctx.lineWidth=1; ctx.stroke();
-  ctx.restore();
-}
-
-function niceStep(raw){
-  const mag=Math.pow(10, Math.floor(Math.log10(raw)));
-  const f=raw/mag;
-  return (f<1.5?1:f<3.5?2:f<7.5?5:10)*mag;
-}
+  const dpr    = window.devicePixelRatio || 1;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Steering gauge
+// Steering gauge — needle style
 // ═══════════════════════════════════════════════════════════════════════════
 function drawSteeringGauge(tgtDeg, measDeg){
   const canvas=document.getElementById('steer-canvas');
@@ -676,66 +752,91 @@ function drawSteeringGauge(tgtDeg, measDeg){
   const ctx=canvas.getContext('2d');
   ctx.clearRect(0,0,W,H);
 
-  const cx2=W/2, cy2=H-18, R=Math.min(W/2,H)-22;
+  const px=W/2, py=H-10, R=Math.min(W/2,H)-16;
   const MAX=MAX_AXLE_DEG;
-  const startA = Math.PI;          // 180° (left)
-  const endA   = 2*Math.PI;        // 360° (right) → top=270°=straight
+  // Maps steering angle → canvas arc angle. 0°=straight up (−π/2), ±MAX = ±(π/2)
+  function degToAngle(deg){ return -Math.PI/2 + (deg/MAX)*(Math.PI/2); }
 
-  function degToAngle(deg){ return 1.5*Math.PI + (deg/MAX)*(Math.PI/2); }
-  // Clamp to ±MAX
-  const t=Math.max(-MAX,Math.min(MAX,tgtDeg));
-  const m=Math.max(-MAX,Math.min(MAX,measDeg));
+  const t=Math.max(-MAX,Math.min(MAX,isFinite(tgtDeg)  ? tgtDeg  : 0));
+  const m=Math.max(-MAX,Math.min(MAX,isFinite(measDeg) ? measDeg : 0));
 
-  // Background arc
-  ctx.beginPath(); ctx.arc(cx2,cy2,R,startA,endA);
-  ctx.strokeStyle='#21262d'; ctx.lineWidth=14; ctx.lineCap='butt'; ctx.stroke();
+  // ── Background arc (thin, dark) ──────────────────────────────────────────
+  ctx.beginPath();
+  ctx.arc(px, py, R, -Math.PI, 0);
+  ctx.strokeStyle='#21262d'; ctx.lineWidth=2; ctx.stroke();
 
-  // Tick marks every 5°
-  for(let d=-MAX;d<=MAX;d+=5){
-    const a=degToAngle(d);
-    const inner=d%10===0?R-20:R-12;
+  // ── Tick marks ────────────────────────────────────────────────────────────
+  for(let d=-MAX; d<=MAX; d+=5){
+    const a    = degToAngle(d);
+    const big  = d % 10 === 0;
+    const r0   = big ? R-11 : R-6;
     ctx.beginPath();
-    ctx.moveTo(cx2+Math.cos(a)*inner, cy2+Math.sin(a)*inner);
-    ctx.lineTo(cx2+Math.cos(a)*(R+2),  cy2+Math.sin(a)*(R+2));
-    ctx.strokeStyle=d%10===0?'#8b949e':'#3b454f'; ctx.lineWidth=d%10===0?1.5:0.8; ctx.stroke();
-    if(d%10===0){
+    ctx.moveTo(px+Math.cos(a)*r0,    py+Math.sin(a)*r0);
+    ctx.lineTo(px+Math.cos(a)*(R+1), py+Math.sin(a)*(R+1));
+    ctx.strokeStyle = big ? '#8b949e' : '#3b454f';
+    ctx.lineWidth   = big ? 1.2 : 0.7;
+    ctx.stroke();
+    if(big && d !== 0){
+      const tr = r0-10;
       ctx.fillStyle='#6e7681'; ctx.font='9px monospace'; ctx.textAlign='center';
-      const tr=inner-9;
-      ctx.fillText(d, cx2+Math.cos(a)*tr, cy2+Math.sin(a)*tr+3);
+      ctx.fillText(d, px+Math.cos(a)*tr, py+Math.sin(a)*tr+3);
     }
   }
 
-  // Measured arc  (cyan)
-  const mA=degToAngle(m);
-  ctx.beginPath(); ctx.arc(cx2,cy2,R,startA,mA, m<0);
-  ctx.strokeStyle='#58d9f9'; ctx.lineWidth=10; ctx.lineCap='round'; ctx.stroke();
-
-  // Target needle (orange)
-  const tA=degToAngle(t);
-  ctx.beginPath();
-  ctx.moveTo(cx2+Math.cos(tA)*(R-22), cy2+Math.sin(tA)*(R-22));
-  ctx.lineTo(cx2+Math.cos(tA)*(R+6),  cy2+Math.sin(tA)*(R+6));
-  ctx.strokeStyle='#f0a500'; ctx.lineWidth=3; ctx.lineCap='round'; ctx.stroke();
-
-  // Center dot
-  ctx.beginPath(); ctx.arc(cx2,cy2,5,0,2*Math.PI);
-  ctx.fillStyle='#e6edf3'; ctx.fill();
-
-  // Straight-ahead line
+  // ── Straight-ahead reference mark ─────────────────────────────────────────
   const sa=degToAngle(0);
   ctx.beginPath();
-  ctx.moveTo(cx2+Math.cos(sa)*(R-16), cy2+Math.sin(sa)*(R-16));
-  ctx.lineTo(cx2+Math.cos(sa)*(R+5),  cy2+Math.sin(sa)*(R+5));
-  ctx.strokeStyle='#ffffff44'; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.moveTo(px+Math.cos(sa)*(R-16), py+Math.sin(sa)*(R-16));
+  ctx.lineTo(px+Math.cos(sa)*(R+2),  py+Math.sin(sa)*(R+2));
+  ctx.strokeStyle='#ffffff33'; ctx.lineWidth=2; ctx.stroke();
 
-  // Labels
-  ctx.fillStyle='#6e7681'; ctx.font='10px sans-serif'; ctx.textAlign='left';
-  ctx.fillText('L', 6, cy2+4);
-  ctx.textAlign='right';
-  ctx.fillText('R', W-6, cy2+4);
-  ctx.textAlign='center';
-  ctx.fillStyle='#8b949e'; ctx.font='11px sans-serif';
-  ctx.fillText('Front Axle', cx2, cy2+16);
+  // ── Helper: draw a needle from pivot ─────────────────────────────────────
+  function needle(angleDeg, color, length, width, tailFrac){
+    const a   = degToAngle(angleDeg);
+    const tip = length;
+    const tail= length * (tailFrac || 0.18);
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(a + Math.PI/2);   // rotate so 0 = pointing up
+    // Shadow for depth
+    ctx.shadowColor='rgba(0,0,0,0.5)'; ctx.shadowBlur=4;
+    ctx.beginPath();
+    ctx.moveTo(0,  tail);        // tail (behind pivot)
+    ctx.lineTo(0, -tip);         // tip  (forward)
+    ctx.strokeStyle=color; ctx.lineWidth=width; ctx.lineCap='round';
+    ctx.stroke();
+    ctx.shadowBlur=0;
+    ctx.restore();
+  }
+
+  // ── Target needle (orange, thin) ─────────────────────────────────────────
+  needle(t, '#f0a500', R-4, 1.5, 0.1);
+
+  // ── Measured needle (cyan, heavier) ──────────────────────────────────────
+  needle(m, '#58d9f9', R-4, 2.5, 0.22);
+
+  // ── Needle tip dot (measured) ─────────────────────────────────────────────
+  const ma=degToAngle(m);
+  ctx.beginPath();
+  ctx.arc(px+Math.cos(ma)*(R-5), py+Math.sin(ma)*(R-5), 3, 0, 2*Math.PI);
+  ctx.fillStyle='#58d9f9'; ctx.fill();
+
+  // ── Target tip dot ─────────────────────────────────────────────────────────
+  const ta=degToAngle(t);
+  ctx.beginPath();
+  ctx.arc(px+Math.cos(ta)*(R-5), py+Math.sin(ta)*(R-5), 2.5, 0, 2*Math.PI);
+  ctx.fillStyle='#f0a500'; ctx.fill();
+
+  // ── Center hub ────────────────────────────────────────────────────────────
+  ctx.beginPath(); ctx.arc(px, py, 6, 0, 2*Math.PI);
+  ctx.fillStyle='#30363d'; ctx.fill();
+  ctx.beginPath(); ctx.arc(px, py, 3.5, 0, 2*Math.PI);
+  ctx.fillStyle='#e6edf3'; ctx.fill();
+
+  // ── L / R labels ──────────────────────────────────────────────────────────
+  ctx.fillStyle='#6e7681'; ctx.font='10px sans-serif';
+  ctx.textAlign='left';  ctx.fillText('L', 4,   py+1);
+  ctx.textAlign='right'; ctx.fillText('R', W-4, py+1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -789,6 +890,7 @@ async function fetchPath(){
     if(d.waypoints && d.waypoints.length >= 2 && d.updated_at !== gPathTime){
       gPath    = d;
       gPathTime = d.updated_at;
+      updateLeafletPath(gPath);
     }
   } catch(e){}
   setTimeout(fetchPath, PATH_POLL_MS);
@@ -807,12 +909,23 @@ async function poll(){
   setTimeout(poll, POLL_MS);
 }
 
-// ── Resize map canvas on window resize ─────────────────────────────────────
-window.addEventListener('resize', ()=>{ if(gLastS) drawMap(gLastS.gnss, gLastS.controller); });
-
-// ── Boot ────────────────────────────────────────────────────────────────────
+// ── Boot ─────────────────────────────────────────────────────────────────────────
+initLeafletMap();
 fetchPath();
 poll();
 </script>
+
+<!-- Save-recording modal -->
+<div id="rec-modal-overlay">
+  <div id="rec-modal">
+    <h3>&#128190; Save recording</h3>
+    <p id="rec-modal-sub">Edit the name below, then save or discard.</p>
+    <input id="rec-modal-input" type="text" spellcheck="false" placeholder="recording name" />
+    <div class="modal-row">
+      <button class="modal-save" onclick="saveRecording()">&#10003; Save</button>
+      <button class="modal-discard" onclick="discardRecording()">&#128465; Discard</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>

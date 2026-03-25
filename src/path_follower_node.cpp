@@ -213,7 +213,6 @@ public:
         this->declare_parameter("k_soft",            DEFAULT_K_SOFT);
         this->declare_parameter("k_d_steer",         DEFAULT_K_D_STEER);
         this->declare_parameter<std::string>("path_csv_file", "");  // empty = sinusoidal
-        this->declare_parameter<bool>("auto_enable", false);
 
         // ---- Subscriptions -----------------------------------------------------
         gnss_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -275,12 +274,6 @@ public:
             "PathFollowerNode ready.  Path length: %.1f m.  "
             "Publish 'true' on ~/enable_path_following to start.",
             path_.totalLength());
-
-        auto_enable_ = this->get_parameter("auto_enable").as_bool();
-        if (auto_enable_) {
-            RCLCPP_INFO(this->get_logger(),
-                "auto_enable=true: path following will start automatically after first GNSS fix.");
-        }
     }
 
 private:
@@ -300,21 +293,7 @@ private:
             2.0*(q.w*q.z + q.x*q.y),
             1.0 - 2.0*(q.y*q.y + q.z*q.z));
 
-        bool was_valid = gnss_valid_;
         gnss_valid_ = true;
-
-        // Auto-enable: fire once, 1 second after the first GNSS fix
-        if (auto_enable_ && !was_valid && !auto_enable_fired_) {
-            auto_enable_fired_ = true;
-            auto_enable_timer_ = this->create_wall_timer(
-                std::chrono::seconds(1),
-                [this]() {
-                    auto_enable_timer_.reset();  // one-shot
-                    auto msg = std::make_shared<std_msgs::msg::Bool>();
-                    msg->data = true;
-                    enableCallback(msg);
-                });
-        }
     }
 
     void vehicleStateCallback(const car_control::msg::VehicleState::SharedPtr msg)
@@ -656,8 +635,6 @@ private:
     double           car_steer_rad_ = 0.0;
     double           prev_steer_rad_= 0.0;
     bool             gnss_valid_        = false;
-    bool             auto_enable_       = false;
-    bool             auto_enable_fired_ = false;
 
     // Path
     Path             path_;
@@ -681,7 +658,6 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              ramp_pub_;
 
     rclcpp::TimerBase::SharedPtr                                      control_timer_;
-    rclcpp::TimerBase::SharedPtr                                      auto_enable_timer_;
 };
 
 int main(int argc, char** argv)

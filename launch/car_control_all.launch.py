@@ -15,7 +15,8 @@ def generate_launch_description():
     adb_port        = LaunchConfiguration('adb_port',        default='5555')
 
     # ---- Path follower / replay ------------------------------------------------
-    path_csv_file    = LaunchConfiguration('path_csv_file',    default='')
+    path_csv_file    = LaunchConfiguration('path_csv_file',
+                           default=PathJoinSubstitution([pkg_share, 'paths', 'path.csv']))
     desired_speed    = LaunchConfiguration('desired_speed_mps', default='4.0')
 
     # ---- Steering MPC ----------------------------------------------------------
@@ -39,8 +40,9 @@ def generate_launch_description():
         DeclareLaunchArgument('adb_port',        default_value='5555',
             description='ADB device port (use_tcp_tunnel=false only)'),
 
-        DeclareLaunchArgument('path_csv_file', default_value='',
-            description='Path to recorded drive CSV for replay (empty = sinusoidal test path)'),
+        DeclareLaunchArgument('path_csv_file',
+            default_value=PathJoinSubstitution([pkg_share, 'paths', 'path.csv']),
+            description='Path to recorded drive CSV for replay (default = bundled paths/path.csv)'),
         DeclareLaunchArgument('desired_speed_mps', default_value='4.0',
             description='Desired replay speed [m/s]'),
         DeclareLaunchArgument('model_config_path', default_value='',
@@ -90,7 +92,6 @@ def generate_launch_description():
             parameters=[{
                 'path_csv_file':    path_csv_file,
                 'desired_speed_mps': desired_speed,
-                'auto_enable':      True,
             }],
             remappings=[
                 ('cmd_vel', 'path_follower/cmd_vel'),
