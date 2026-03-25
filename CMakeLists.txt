@@ -89,12 +89,18 @@ ament_target_dependencies(steering_mpc_node rclcpp std_msgs geometry_msgs)
 target_include_directories(steering_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
 target_link_libraries(steering_mpc_node osqpstatic ${cpp_typesupport_target})
 
+add_executable(lateral_mpc_node src/lateral_mpc_node.cpp)
+ament_target_dependencies(lateral_mpc_node rclcpp std_msgs geometry_msgs nav_msgs)
+target_include_directories(lateral_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
+target_link_libraries(lateral_mpc_node osqpstatic ${cpp_typesupport_target})
+
 # Install executables
 install(TARGETS
   gnss_node
   comma_node
   path_follower_node
   steering_mpc_node
+  lateral_mpc_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
