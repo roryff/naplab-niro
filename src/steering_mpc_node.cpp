@@ -64,6 +64,12 @@ struct IntegratorParams {
   double rate_clip = kDefaultRateClip;
   double max_angle_deg = kDefaultMaxAngleDeg;
   double delay_s = kDefaultDelayS;
+  // Speed-dependent gain (A8 quadratic-speed model).
+  // If G0 > 0: gain_r_eff(v) = G0 / (va*v^2 + vb*v + 1).
+  // If G0 == 0 (default): constant gain_r above is used instead.
+  double G0 = 0.0;
+  double va = 0.0;
+  double vb = 0.0;
 };
 
 struct ControllerParams {
@@ -102,6 +108,9 @@ bool loadConfig(const std::string& path, IntegratorParams& ip, ControllerParams&
     else if (key == "rate_clip") ip.rate_clip = std::stod(val);
     else if (key == "max_angle_deg") ip.max_angle_deg = std::stod(val);
     else if (key == "delay_s") ip.delay_s = std::stod(val);
+    else if (key == "G0") ip.G0 = std::stod(val);
+    else if (key == "va") ip.va = std::stod(val);
+    else if (key == "vb") ip.vb = std::stod(val);
     else if (key == "dt") cp.dt = std::stod(val);
     else if (key == "horizon") cp.horizon = std::stoi(val);
     else if (key == "rate_up") cp.rate_up = std::stod(val);
@@ -137,7 +146,14 @@ class SteeringMpcNode : public rclcpp::Node {
       if (!loadConfig(config_path, integrator_, ctrl_)) {
         RCLCPP_ERROR(get_logger(), "Failed to load model config: %s", config_path.c_str());
       } else {
-        RCLCPP_INFO(get_logger(), "Loaded model from %s", config_path.c_str());
+        if (integrator_.G0 > 0.0) {
+          RCLCPP_INFO(get_logger(),
+            "Loaded model from %s  [speed-dependent gain: G0=%.0f va=%.4f vb=%.4f]",
+            config_path.c_str(), integrator_.G0, integrator_.va, integrator_.vb);
+        } else {
+          RCLCPP_INFO(get_logger(), "Loaded model from %s  [constant gain_r=%.1f]",
+            config_path.c_str(), integrator_.gain_r);
+        }
       }
     }
     ctrl_.dt = get_parameter("dt").as_double();
@@ -277,7 +293,7 @@ class SteeringMpcNode : public rclcpp::Node {
       return;
     }
 
-    double u_cmd = solveMpc(angle_deg, rate_deg_s, lookahead_ref, u_prev, ref_traj_snap);
+    double u_cmd = solveMpc(angle_deg, rate_deg_s, lookahead_ref, u_prev, vehicle_speed, ref_traj_snap);
     u_cmd = std::max(-ctrl_.torque_limit, std::min(ctrl_.torque_limit, u_cmd));
     u_prev_ = u_cmd;
 
@@ -309,13 +325,17 @@ class SteeringMpcNode : public rclcpp::Node {
   }
 
   double solveMpc(double angle_deg, double rate_deg_s, double desired_angle, double u_prev,
-                  const std::vector<double>& ref_traj) {
+                  double vehicle_speed_mps, const std::vector<double>& ref_traj) {
     const int n = N_;
     if (n < 1) return u_prev;
 
     const double dt = ctrl_.dt;
     const double tau_r = integrator_.tau_r;
-    const double gain_r = integrator_.gain_r;
+    // Speed-dependent gain: use G0/(va*v^2+vb*v+1) if G0>0, else constant gain_r.
+    const double v = vehicle_speed_mps;
+    const double gain_r = (integrator_.G0 > 0.0)
+        ? integrator_.G0 / (integrator_.va * v * v + integrator_.vb * v + 1.0)
+        : integrator_.gain_r;
     const double leak = integrator_.leak;
     const double alpha = dt / (tau_r + dt);
     const double a_rate = 1.0 - alpha;
