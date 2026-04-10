@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include "car_control/ubx_protocol.hpp"
 #include "car_control/geo_utils.hpp"
 
@@ -145,35 +146,74 @@ private:
             
             // Block on socket read - will return immediately when data arrives
             read_gnss_data();
+
+            // If read_gnss_data() closed the socket (error / remote close),
+            // wait before reconnecting.  Rapid SYN storms can exhaust the
+            // u-blox's tiny TCP connection table and crash its NIC driver,
+            // making the device completely unreachable until the cable is
+            // replugged.
+            if (socket_fd_ < 0 && running_) {
+                for (int i = 0; i < 20 && running_; i++) {  // ~2 s back-off
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
         }
     }
     
     /**
      * @brief Attempt to connect to u-blox receiver
+     *
+     * Uses a local fd throughout so that socket_fd_ (visible to the sender
+     * thread) is only set once the socket is fully connected, configured, and
+     * back in blocking mode.  This prevents the sender from calling send() on
+     * a non-blocking or not-yet-connected fd (which would return EAGAIN).
      */
     void try_connect()
     {
         std::string host = this->get_parameter("host").as_string();
         int port = this->get_parameter("port").as_int();
-        
-        // Create socket
-        socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (socket_fd_ < 0) {
+
+        // Work with a local fd until the connection is fully established.
+        // socket_fd_ is only written at the very end, under socket_write_mutex_,
+        // so the sender thread never sees a half-ready descriptor.
+        int new_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (new_fd < 0) {
             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "Failed to create socket: %s", strerror(errno));
             return;
         }
-        
+
         // Set recv timeout – fallback so reader_loop can notice shutdown
         // even if shutdown(SHUT_RDWR) somehow doesn't unblock recv immediately.
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
-        setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // TCP keepalive: keeps the connection entry alive in the switch/router
+        // ARP and MAC tables, and detects a dead peer without waiting for a
+        // send to fail.  Without this some switches age out the entry after
+        // ~30 s of inactivity and then isolate the port, making the u-blox
+        // completely unreachable until the cable is replugged.
+        int keepalive = 1;
+        setsockopt(new_fd, SOL_SOCKET,  SO_KEEPALIVE,  &keepalive, sizeof(keepalive));
+        int keepidle  = 10;  // start probing after 10 s idle
+        int keepintvl =  5;  // probe every 5 s
+        int keepcnt   =  3;  // drop after 3 consecutive failures (~25 s total)
+        setsockopt(new_fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keepidle,  sizeof(keepidle));
+        setsockopt(new_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+        setsockopt(new_fd, IPPROTO_TCP, TCP_KEEPCNT,   &keepcnt,   sizeof(keepcnt));
+
+        // Disable Nagle: we send many small 50 Hz ESF-MEAS frames that must
+        // not be held back by the coalescing algorithm.
+        int nodelay = 1;
+        setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         // Use non-blocking connect with a short timeout so SIGINT isn't blocked
-        // by the OS TCP timeout (which can be ~2 minutes)
-        fcntl(socket_fd_, F_SETFL, O_NONBLOCK);
+        // by the OS TCP timeout (which can be ~2 minutes).
+        // NOTE: new_fd is NOT published to socket_fd_ yet, so the sender thread
+        // cannot touch it while it is in O_NONBLOCK mode.
+        fcntl(new_fd, F_SETFL, O_NONBLOCK);
 
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
@@ -191,11 +231,8 @@ private:
             int gai = getaddrinfo(host.c_str(), nullptr, &hints, &result);
             if (gai != 0 || result == nullptr) {
                 RCLCPP_ERROR(this->get_logger(), "Invalid address: %s", host.c_str());
-                if (result) {
-                    freeaddrinfo(result);
-                }
-                close(socket_fd_);
-                socket_fd_ = -1;
+                if (result) freeaddrinfo(result);
+                close(new_fd);
                 return;
             }
 
@@ -204,13 +241,12 @@ private:
             freeaddrinfo(result);
         }
 
-        int ret = connect(socket_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr));
+        int ret = connect(new_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
         if (ret < 0 && errno != EINPROGRESS) {
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "Connection to %s:%d failed: %s - retrying...",
                 host.c_str(), port, strerror(errno));
-            close(socket_fd_);
-            socket_fd_ = -1;
+            close(new_fd);
             return;
         }
 
@@ -218,42 +254,46 @@ private:
             // Wait up to 5 seconds for connect, but bail immediately if shutting down
             fd_set write_fds;
             FD_ZERO(&write_fds);
-            FD_SET(socket_fd_, &write_fds);
+            FD_SET(new_fd, &write_fds);
             struct timeval connect_tv = {5, 0};
-            int sel = select(socket_fd_ + 1, nullptr, &write_fds, nullptr, &connect_tv);
+            int sel = select(new_fd + 1, nullptr, &write_fds, nullptr, &connect_tv);
 
             if (!running_) {
-                close(socket_fd_);
-                socket_fd_ = -1;
+                close(new_fd);
                 return;
             }
 
             if (sel <= 0) {
                 RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Connection to %s:%d timed out - retrying...", host.c_str(), port);
-                close(socket_fd_);
-                socket_fd_ = -1;
+                close(new_fd);
                 return;
             }
 
             // Check if connect actually succeeded
             int sock_err = 0;
             socklen_t sock_err_len = sizeof(sock_err);
-            getsockopt(socket_fd_, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len);
+            getsockopt(new_fd, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len);
             if (sock_err != 0) {
                 RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Connection to %s:%d failed: %s - retrying...",
                     host.c_str(), port, strerror(sock_err));
-                close(socket_fd_);
-                socket_fd_ = -1;
+                close(new_fd);
                 return;
             }
         }
 
-        // Restore blocking mode for recv
-        fcntl(socket_fd_, F_SETFL, fcntl(socket_fd_, F_GETFL) & ~O_NONBLOCK);
-        
-        RCLCPP_INFO(this->get_logger(), "Connected to u-blox receiver at %s:%d", 
+        // Restore blocking mode BEFORE handing the fd to the sender thread.
+        fcntl(new_fd, F_SETFL, fcntl(new_fd, F_GETFL) & ~O_NONBLOCK);
+
+        // Publish the ready fd atomically so the sender thread sees a fully
+        // connected, blocking socket or nothing at all.
+        {
+            std::lock_guard<std::mutex> lock(socket_write_mutex_);
+            socket_fd_ = new_fd;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Connected to u-blox receiver at %s:%d",
             host.c_str(), port);
     }
     
@@ -263,30 +303,50 @@ private:
      */
     void read_gnss_data()
     {
+        // Take a snapshot of the fd so we recv() without holding the mutex
+        // (recv blocks; holding the mutex would deadlock the sender thread).
+        int fd;
+        {
+            std::lock_guard<std::mutex> lock(socket_write_mutex_);
+            fd = socket_fd_;
+        }
+        if (fd < 0) return;
+
         uint8_t buffer[2048];
-        // Blocking recv - returns when data arrives or on timeout
-        int bytes_read = recv(socket_fd_, buffer, sizeof(buffer), 0);
-        
+        int bytes_read = recv(fd, buffer, sizeof(buffer), 0);
+
         if (bytes_read < 0) {
             // Timeout is OK - just means no data yet, loop will continue
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;  // Timeout, no data available
+                return;
             }
-            
-            RCLCPP_ERROR(this->get_logger(), "Socket read error: %s - reconnecting...", 
+            RCLCPP_ERROR(this->get_logger(), "Socket read error: %s - reconnecting...",
                 strerror(errno));
-            close(socket_fd_);
-            socket_fd_ = -1;
+            // Close under the mutex so the sender never uses a dead fd.
+            {
+                std::lock_guard<std::mutex> lock(socket_write_mutex_);
+                if (socket_fd_ == fd) {   // guard against concurrent reconnect
+                    close(socket_fd_);
+                    socket_fd_ = -1;
+                }
+            }
+            rx_buffer_.clear();
             return;
         }
-        
+
         if (bytes_read == 0) {
             RCLCPP_WARN(this->get_logger(), "Connection closed - reconnecting...");
-            close(socket_fd_);
-            socket_fd_ = -1;
+            {
+                std::lock_guard<std::mutex> lock(socket_write_mutex_);
+                if (socket_fd_ == fd) {
+                    close(socket_fd_);
+                    socket_fd_ = -1;
+                }
+            }
+            rx_buffer_.clear();
             return;
         }
-        
+
         // Add to buffer and parse UBX messages
         rx_buffer_.insert(rx_buffer_.end(), buffer, buffer + bytes_read);
         parse_ubx_messages();

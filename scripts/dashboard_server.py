@@ -78,6 +78,7 @@ _state = {
         "/cmd_vel":                 {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_visualization":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/lateral_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/heading_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_following_status":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
     },
 
@@ -213,9 +214,18 @@ def _start_recording() -> dict:
     with _rec_lock:
         if _rec_active:
             return {"ok": False, "error": "already recording"}
-        # Always save to the source tree so files are easy to find and version-control.
-        # __file__ = .../src/car_control/scripts/dashboard_server.py
-        paths_dir = pathlib.Path(__file__).resolve().parent.parent / 'paths'
+        # Walk up from __file__ to find the package root (contains package.xml),
+        # so recordings always land in the source tree regardless of whether the
+        # script is running from the install tree or directly.
+        _here = pathlib.Path(__file__).resolve()
+        _pkg_root = _here.parent
+        while _pkg_root != _pkg_root.parent:
+            if (_pkg_root / 'package.xml').exists():
+                break
+            _pkg_root = _pkg_root.parent
+        else:
+            _pkg_root = _here.parent.parent  # fallback
+        paths_dir = _pkg_root / 'paths'
         paths_dir.mkdir(parents=True, exist_ok=True)
         ts       = time.strftime('%Y%m%d_%H%M%S')
         filename = paths_dir / f'recording_{ts}.csv'
@@ -458,6 +468,7 @@ class DashboardNode(Node):
 
     def _cb_hdg_err(self, msg: Float64):
         with _state_lock:
+            _touch_topic("/heading_error")
             c = _state["controller"]
             c["heading_error_deg"] = round(math.degrees(float(msg.data)), 3)
             _push_history(c["hdg_err_history"], math.degrees(float(msg.data)))

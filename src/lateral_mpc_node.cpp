@@ -36,7 +36,7 @@
 #include <std_msgs/msg/float64.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 #include <nav_msgs/msg/path.hpp>
-#include <osqp/osqp.h>
+#include <osqp.h>
 
 #include <algorithm>
 #include <cmath>
@@ -230,7 +230,7 @@ public:
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
 
-        N_ = std::max(1, std::min(get_parameter("horizon").as_int(), 64));
+        N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
 
         // ---- Subscriptions -----------------------------------------------------
         gnss_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -260,6 +260,9 @@ public:
         pub_actual_delta_  = create_publisher<std_msgs::msg::Float64>("lateral_mpc/actual_delta_deg",  10);
         pub_torque_cmd_    = create_publisher<std_msgs::msg::Float64>("lateral_mpc/torque_cmd",        10);
         pub_progress_      = create_publisher<std_msgs::msg::Float64>("lateral_mpc/progress_m",        10);
+        pub_lateral_error_ = create_publisher<std_msgs::msg::Float64>("lateral_error",                 10);
+        pub_heading_error_ = create_publisher<std_msgs::msg::Float64>("heading_error",                 10);
+        pub_pf_cmd_vel_    = create_publisher<geometry_msgs::msg::Twist>("path_follower/cmd_vel",       10);
 
         // ---- Build path --------------------------------------------------------
         std::string csv_file = get_parameter("path_csv_file").as_string();
@@ -351,8 +354,18 @@ private:
 
     void enableCallback(const std_msgs::msg::Bool::SharedPtr msg)
     {
-        if (!msg->data) return;  // react only to 'true' (rising edge / stop intent)
+        if (!msg->data) {
+            // false → stop if currently active (matches cascade behaviour)
+            if (state_ == State::FOLLOWING || state_ == State::STOPPING) {
+                RCLCPP_INFO(get_logger(), "Path following STOPPED by user.");
+                state_ = State::IDLE;
+                publishCmd(0.0, 0.0);
+                publishStatus(false);
+            }
+            return;
+        }
 
+        // true → toggle: start if IDLE, stop if already active
         if (state_ == State::IDLE) {
             if (!gnss_valid_) {
                 RCLCPP_WARN(get_logger(), "Cannot start: no GNSS fix received yet.");
@@ -460,6 +473,16 @@ private:
         pub_torque_cmd_   ->publish(f64(torque_cmd));
         pub_progress_     ->publish(f64(s_rear));
 
+        // Dashboard-compatible topics (mirror cascade node interface)
+        pub_lateral_error_->publish(f64(cte));
+        pub_heading_error_->publish(f64(dpsi));   // [rad] – dashboard calls math.degrees()
+        {
+            geometry_msgs::msg::Twist pf_cmd;
+            pf_cmd.linear.x  = desired_speed;
+            pf_cmd.angular.z = desired_delta_rad;  // front-axle [rad]
+            pub_pf_cmd_vel_->publish(pf_cmd);
+        }
+
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | dPsi=%.2f° | "
             "delta=%.2f° | torque=%.3f | v=%.2f m/s",
@@ -553,12 +576,12 @@ private:
             for (int j = 0; j < n; j++)
                 G_delta_new[j] = G_delta[j] + dt * G_rate_new[j];
 
-            // dPsi_{k+1} = dPsi_k + (v * delta_k / L - kappa_k * v) * dt
-            // Note: uses delta_k (before update) and kappa feedforward
-            double c_psi_new = c_psi + (v_eff * c_delta / WHEELBASE - kappa * v_eff) * dt;
+            // dPsi_{k+1} = dPsi_k - (v * delta_k / L - kappa_k * v) * dt
+            // Positive steer left increases car heading, decreasing dPsi = path_heading - car_heading
+            double c_psi_new = c_psi - (v_eff * c_delta / WHEELBASE - kappa * v_eff) * dt;
             std::vector<double> G_psi_new(n, 0.0);
             for (int j = 0; j < n; j++)
-                G_psi_new[j] = G_psi[j] + v_eff * dt / WHEELBASE * G_delta[j];
+                G_psi_new[j] = G_psi[j] - v_eff * dt / WHEELBASE * G_delta[j];
 
             // CTE_{k+1} = CTE_k + v * dPsi_k * dt
             // Note: uses dPsi_k (before update)
@@ -860,6 +883,9 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_actual_delta_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_torque_cmd_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_progress_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_lateral_error_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_heading_error_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr    pub_pf_cmd_vel_;
 
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp::TimerBase::SharedPtr auto_enable_timer_;

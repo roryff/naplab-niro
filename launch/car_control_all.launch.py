@@ -95,7 +95,7 @@ def launch_setup(context, *args, **kwargs):
         ))
 
     elif control_mode == 'unified':
-        # ---- Option B: lateral_mpc_node (replaces both above) ------------------
+        # ---- Option B: lateral_mpc_node (replaces both above) -----------------
         #
         # 4-state MPC [CTE, dPsi, delta, dRate] directly minimises cross-track
         # and heading error using path curvature as feed-forward.
@@ -104,11 +104,12 @@ def launch_setup(context, *args, **kwargs):
             package='car_control',
             executable='lateral_mpc_node',
             name='lateral_mpc_node',
+
             output='screen',
             parameters=[{
                 'path_csv_file':     path_csv_file,
                 'desired_speed_mps': float(desired_speed),
-                'auto_enable':       True,
+                'auto_enable':       False,
                 'horizon':           40,
                 'tau_r':             0.78,
                 'gain_r':            36.0,
