@@ -514,7 +514,7 @@ private:
         double torque_cmd = 0.0;
         if (state_ == State::FOLLOWING) {
             torque_cmd = ramp * solveMpc(cte_biased, dpsi, car_delta, car_delta_rate,
-                                         car_speed, s_rear, yaw_rate_);
+                                         car_speed, s_rear);
         }
         torque_cmd = std::clamp(torque_cmd, -1.0, 1.0);
         u_prev_    = torque_cmd;
@@ -575,7 +575,7 @@ private:
     // =========================================================================
 
     double solveMpc(double cte0, double dpsi0, double delta0, double drate0,
-                    double v,    double s_ref,  double r_measured = 0.0)
+                    double v,    double s_ref)
     {
         const int n = N_;
         if (n < 1) return u_prev_;
@@ -640,12 +640,8 @@ private:
             for (int j = 0; j < n; j++)
                 G_delta_new[j] = G_delta[j] + dt * G_rate_new[j];
 
-            // dPsi_{k+1} = dPsi_k - (yaw_rate - kappa*v) * dt
-            // For k=0: use measured yaw rate (from IMU) when available for accuracy.
-            // For k>0: use kinematic model v*delta/L (no measured future yaw rate).
-            double yaw_rate_k = (k == 0 && std::abs(r_measured) > 1e-6)
-                                ? r_measured
-                                : v_eff * c_delta / WHEELBASE;
+            // dPsi_{k+1} = dPsi_k - (v*delta/L - kappa*v) * dt  (bicycle model)
+            double yaw_rate_k = v_eff * c_delta / WHEELBASE;
             double c_psi_new = c_psi - (yaw_rate_k - kappa * v_eff) * dt;
             std::vector<double> G_psi_new(n, 0.0);
             for (int j = 0; j < n; j++)

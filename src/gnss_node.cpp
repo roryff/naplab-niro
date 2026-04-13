@@ -146,7 +146,7 @@ private:
                     }
                     continue;
                 }
-            }
+            
             // On fresh connection, enable ESF-RAW output from the receiver
             enable_esf_raw_output();
         }
