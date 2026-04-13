@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    sensor_hostname: '192.168.2.228'
+    udp_dest: ''
+    lidar_mode: ''
+    timestamp_mode: ''
+    point_type: 'xyzir'

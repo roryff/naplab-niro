@@ -483,6 +483,16 @@ private:
             pub_pf_cmd_vel_->publish(pf_cmd);
         }
 
+        // Dashboard-compatible topics (mirror cascade node interface)
+        pub_lateral_error_->publish(f64(cte));
+        pub_heading_error_->publish(f64(dpsi));   // [rad] – dashboard calls math.degrees()
+        {
+            geometry_msgs::msg::Twist pf_cmd;
+            pf_cmd.linear.x  = desired_speed;
+            pf_cmd.angular.z = desired_delta_rad;  // front-axle [rad]
+            pub_pf_cmd_vel_->publish(pf_cmd);
+        }
+
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | dPsi=%.2f° | "
             "delta=%.2f° | torque=%.3f | v=%.2f m/s",
