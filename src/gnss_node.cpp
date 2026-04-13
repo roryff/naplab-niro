@@ -2,8 +2,8 @@
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <std_msgs/msg/float32.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 #include "car_control/msg/esf_status.hpp"
 #include "car_control/msg/esf_sensor.hpp"
@@ -47,6 +47,7 @@
  *     - gnss/fix (sensor_msgs/NavSatFix): GPS fix data
  *     - gnss/velocity (geometry_msgs/TwistStamped): Vehicle velocity
  *     - gnss/odometry (nav_msgs/Odometry): Combined pose and velocity
+ *     - gnss/gyro (geometry_msgs/Vector3Stamped): IMU gyro rates x/y/z [rad/s] (ESF-RAW)
  */
 class GNSSNode : public rclcpp::Node
 {
@@ -75,8 +76,8 @@ public:
             "gnss/odometry", 10);
         esf_status_pub_ = this->create_publisher<car_control::msg::EsfStatus>(
             "gnss/esf_status", 10);
-        yaw_rate_pub_ = this->create_publisher<std_msgs::msg::Float32>(
-            "gnss/yaw_rate", 10);
+        gyro_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            "gnss/gyro", 10);
         
         // Check if origin should be manually set
         if (!this->get_parameter("auto_set_origin").as_bool()) {
@@ -764,13 +765,13 @@ private:
 
 
     /**
-     * @brief Process ESF-RAW message — extract compensated gyro-z (yaw rate)
+     * @brief Process ESF-RAW message — extract compensated gyro axes and publish gnss/gyro
      *
      * ESF-RAW payload: 4 bytes reserved, then N × 8-byte {data, sTag} blocks.
      * data word: bits[31:24]=dataType, bits[23:0]=signed 24-bit dataField.
-     * dataType 14 = z-axis compensated gyro, scale: 0.001 deg/s per LSB.
+     * dataType 12/13/14 = compensated gyro x/y/z, scale: 0.001 deg/s per LSB.
      *
-     * Publishes the most recent gyro_z sample as gnss/yaw_rate [rad/s].
+     * Publishes geometry_msgs/Vector3Stamped on gnss/gyro [rad/s].
      */
     void process_esf_raw(const uint8_t* payload, uint16_t length)
     {
@@ -782,8 +783,8 @@ private:
         const uint8_t* ptr = payload + header_size;
         const uint8_t* end = payload + length;
 
-        bool found = false;
-        float yaw_rate_rad_s = 0.0f;
+        bool found_x = false, found_y = false, found_z = false;
+        float gyro_x = 0.0f, gyro_y = 0.0f, gyro_z = 0.0f;
 
         while (ptr + sample_size <= end) {
             UBXESFRAWSample sample;
@@ -791,22 +792,25 @@ private:
             ptr += sample_size;
 
             uint8_t dtype = ubx_esf_raw_data_type(sample.data);
-            if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_Z) {
-                int32_t raw = ubx_esf_raw_data_field(sample.data);
-                // 0.001 deg/s per LSB → rad/s
-                yaw_rate_rad_s = static_cast<float>(raw) * 0.001f * (M_PI / 180.0f);
-                found = true;
-            }
+            float val = static_cast<float>(ubx_esf_raw_data_field(sample.data))
+                        * 0.001f * (M_PI / 180.0f);  // 0.001 deg/s per LSB → rad/s
+
+            if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_X) { gyro_x = val; found_x = true; }
+            else if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_Y) { gyro_y = val; found_y = true; }
+            else if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_Z) { gyro_z = val; found_z = true; }
         }
 
-        if (found) {
-            std_msgs::msg::Float32 msg;
-            msg.data = yaw_rate_rad_s;
-            yaw_rate_pub_->publish(msg);
+        if (found_x || found_y || found_z) {
+            geometry_msgs::msg::Vector3Stamped msg;
+            msg.header.stamp = this->get_clock()->now();
+            msg.header.frame_id = "imu";
+            msg.vector.x = gyro_x;
+            msg.vector.y = gyro_y;
+            msg.vector.z = gyro_z;
+            gyro_pub_->publish(msg);
 
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "ESF-RAW gyro_z: %.4f rad/s (%.2f deg/s)",
-                yaw_rate_rad_s, yaw_rate_rad_s * (180.0f / M_PI));
+                "ESF-RAW gyro [rad/s]: x=%.4f y=%.4f z=%.4f", gyro_x, gyro_y, gyro_z);
         }
     }
 
@@ -944,7 +948,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocity_publisher_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_publisher_;
     rclcpp::Publisher<car_control::msg::EsfStatus>::SharedPtr esf_status_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr yaw_rate_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gyro_pub_;
     
     // Reader / sender threads
     std::thread reader_thread_;

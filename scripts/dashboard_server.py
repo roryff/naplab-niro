@@ -27,7 +27,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import NavSatFix
-from geometry_msgs.msg import TwistStamped, PoseStamped, Twist
+from geometry_msgs.msg import TwistStamped, PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float64
 from car_control.msg import VehicleState, EsfStatus
@@ -74,6 +74,7 @@ _state = {
         "/gnss/velocity":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/odometry":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/esf_status":         {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/gyro":               {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_follower/cmd_vel":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/cmd_vel":                 {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_visualization":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
@@ -115,6 +116,11 @@ _state = {
         "pos_y_m":          0.0,
         "pos_z_m":          0.0,
         "heading_deg":      0.0,
+        "roll_deg":         0.0,
+        "pitch_deg":        0.0,
+        "gyro_x_rads":      0.0,
+        "gyro_y_rads":      0.0,
+        "gyro_z_rads":      0.0,
     },
 
     # ── ESF calibration ──────────────────────────────────────────────────────
@@ -348,7 +354,8 @@ class DashboardNode(Node):
         self.create_subscription(NavSatFix,    "/gnss/fix",        self._cb_gnss_fix, 10)
         self.create_subscription(TwistStamped, "/gnss/velocity",   self._cb_velocity, 10)
         self.create_subscription(Odometry,     "/gnss/odometry",   self._cb_odom,     10)
-        self.create_subscription(EsfStatus,    "/gnss/esf_status", self._cb_esf,      10)
+        self.create_subscription(EsfStatus,       "/gnss/esf_status", self._cb_esf,      10)
+        self.create_subscription(Vector3Stamped,  "/gnss/gyro",       self._cb_gyro,     10)
 
         # Path-follower topics
         # path_follower/cmd_vel: desired steer angle [rad] + desired speed [m/s]
@@ -416,8 +423,21 @@ class DashboardNode(Node):
             g["pos_y_m"] = round(msg.pose.pose.position.y, 2)
             g["pos_z_m"] = round(msg.pose.pose.position.z, 2)
             q = msg.pose.pose.orientation
-            yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))
+            w, x, y, z = q.w, q.x, q.y, q.z
+            roll  = math.atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+            pitch = math.asin(max(-1.0, min(1.0, 2*(w*y - z*x))))
+            yaw   = math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+            g["roll_deg"]    = round(math.degrees(roll),  2)
+            g["pitch_deg"]   = round(math.degrees(pitch), 2)
             g["heading_deg"] = round(math.degrees(yaw) % 360, 1)
+
+    def _cb_gyro(self, msg: Vector3Stamped):
+        with _state_lock:
+            _touch_topic("/gnss/gyro")
+            g = _state["gnss"]
+            g["gyro_x_rads"] = round(msg.vector.x, 5)
+            g["gyro_y_rads"] = round(msg.vector.y, 5)
+            g["gyro_z_rads"] = round(msg.vector.z, 5)
 
     def _cb_esf(self, msg: EsfStatus):
         with _state_lock:

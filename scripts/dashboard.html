@@ -203,7 +203,7 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
       </div>
     </div>
 
-    <!-- GNSS Velocity + UTM32 -->
+    <!-- GNSS Velocity + IMU Gyro -->
     <div class="card" style="flex:1;min-width:220px">
       <div class="card-header">GNSS Velocity</div>
       <div class="card-body">
@@ -213,8 +213,12 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
         <div class="row"><span class="label">Vel East</span><span id="vel-e" class="value">— m/s</span></div>
         <div class="row"><span class="label">Vel Down</span><span id="vel-d" class="value">— m/s</span></div>
         <hr class="divider">
-        <div class="row"><span class="label">UTM32 E</span><span id="pos-x" class="value">— m</span></div>
-        <div class="row"><span class="label">UTM32 N</span><span id="pos-y" class="value">— m</span></div>
+        <div class="row"><span class="label">Gyro X</span><span id="gyro-x" class="value">— °/s</span></div>
+        <div class="row"><span class="label">Gyro Y</span><span id="gyro-y" class="value">— °/s</span></div>
+        <div class="row"><span class="label">Gyro Z</span><span id="gyro-z" class="value">— °/s</span></div>
+        <hr class="divider">
+        <div class="row"><span class="label">Roll</span><span id="imu-roll" class="value">—°</span></div>
+        <div class="row"><span class="label">Pitch</span><span id="imu-pitch" class="value">—°</span></div>
         <div class="row"><span class="label">Heading</span><span id="pos-h" class="value">—°</span></div>
       </div>
     </div>
@@ -560,15 +564,19 @@ function render(s){
   if(haccEl){ haccEl.textContent=fmt(g.h_acc_m,3)+' m'; haccEl.className='value '+errColor(g.h_acc_m,0.05,0.3); }
   if(vaccEl){ vaccEl.textContent=fmt(g.v_acc_m,3)+' m'; vaccEl.className='value '+errColor(g.v_acc_m,0.1,0.5); }
 
-  // ── GNSS Velocity ─────────────────────────────────────────────────────────
+  // ── GNSS Velocity + IMU Gyro ─────────────────────────────────────────────
   const gspdEl=document.getElementById('gspd-big');
   if(gspdEl){ gspdEl.textContent=fmt(g.ground_speed_mps,2); gspdEl.className='big '+(staleSec(t['/gnss/velocity']?.last_recv)>STALE_SEC?'grey':'green'); }
   setText('gspd-kmh', fmt(g.ground_speed_mps*3.6,1));
   setText('vel-n', fmt(g.vel_n_mps,3)+' m/s');
   setText('vel-e', fmt(g.vel_e_mps,3)+' m/s');
   setText('vel-d', fmt(g.vel_d_mps,3)+' m/s');
-  setText('pos-x', fmt(g.pos_x_m,1)+' m');
-  setText('pos-y', fmt(g.pos_y_m,1)+' m');
+  const R2D = 180/Math.PI;
+  setText('gyro-x', fmt(g.gyro_x_rads*R2D,2)+' °/s');
+  setText('gyro-y', fmt(g.gyro_y_rads*R2D,2)+' °/s');
+  setText('gyro-z', fmt(g.gyro_z_rads*R2D,2)+' °/s');
+  setText('imu-roll',  fmt(g.roll_deg,1)+'°');
+  setText('imu-pitch', fmt(g.pitch_deg,1)+'°');
   setText('pos-h', fmt(g.heading_deg,1)+'°');
 
   // ── Vehicle State card ────────────────────────────────────────────────────
@@ -628,6 +636,7 @@ function render(s){
     ['/path_following_status',  1, 'Path Status'],
     ['/path_visualization',     1, 'Path Viz'],
     ['/gnss/esf_status',        1, 'ESF Status'],
+    ['/gnss/gyro',             50, 'Gyro'],
   ];
   const healthEl = document.getElementById('topic-health');
   if(healthEl){

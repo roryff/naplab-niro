@@ -16,7 +16,7 @@
  *   gnss/pose             (geometry_msgs/PoseStamped)  — ENU position + yaw
  *   vehicle/state         (car_control/VehicleState)   — v_ego [km/h], steering_angle_deg [sw-deg]
  *   enable_path_following (std_msgs/Bool)              — rising edge starts, any msg stops
- *   gnss/yaw_rate         (std_msgs/Float32)           — IMU yaw rate [rad/s] (optional)
+ *   gnss/gyro             (geometry_msgs/Vector3Stamped) — IMU gyro rates [rad/s] (optional)
  *
  * Publications:
  *   cmd_vel                       (geometry_msgs/Twist)   — linear.x=accel, angular.z=torque
@@ -33,8 +33,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 #include <nav_msgs/msg/path.hpp>
@@ -274,7 +274,7 @@ public:
         declare_parameter("torque_limit",      1.0);
         declare_parameter("kp_speed",          0.3);
         declare_parameter("tau_i_cte",         8.0);   // leaky integrator time constant [s]
-        declare_parameter("ki_cte",            0.15);  // integrator gain
+        declare_parameter("ki_cte",             0.0);   // integrator gain (0 = disabled; set to ~0.15 to enable)
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
 
@@ -293,11 +293,11 @@ public:
             "enable_path_following", 10,
             std::bind(&LateralMpcNode::enableCallback, this, std::placeholders::_1));
 
-        yaw_rate_sub_ = create_subscription<std_msgs::msg::Float32>(
-            "gnss/yaw_rate", 10,
-            [this](const std_msgs::msg::Float32::SharedPtr msg) {
+        yaw_rate_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
+            "gnss/gyro", 10,
+            [this](const geometry_msgs::msg::Vector3Stamped::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(data_mutex_);
-                yaw_rate_ = static_cast<double>(msg->data);
+                yaw_rate_ = msg->vector.z;
             });
 
         // ---- Publishers --------------------------------------------------------
@@ -949,7 +949,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  gnss_pose_sub_;
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr   vehicle_state_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              enable_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr           yaw_rate_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr           yaw_rate_sub_;
 
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr   cmd_vel_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr          path_vis_pub_;
