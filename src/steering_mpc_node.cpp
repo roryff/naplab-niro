@@ -414,18 +414,18 @@ class SteeringMpcNode : public rclcpp::Node {
     int nz = 0;
     for (int j = 0; j < n; j++) {
       A_p[j] = nz;
-      if (j == 0) {
-        A_x.insert(A_x.end(), {1.0, -1.0, 1.0, -1.0});
-        A_i.insert(A_i.end(), {0, 1, 2, 3});
-        nz += 4;
-      } else {
-        A_x.push_back(-1.0); A_i.push_back(4 * (j - 1));
-        A_x.push_back(1.0);  A_i.push_back(4 * (j - 1) + 1);
-        A_x.push_back(1.0);  A_i.push_back(4 * j);
-        A_x.push_back(-1.0); A_i.push_back(4 * j + 1);
-        A_x.push_back(1.0);  A_i.push_back(4 * j + 2);
-        A_x.push_back(-1.0); A_i.push_back(4 * j + 3);
-        nz += 6;
+      // Own-step: row 4j (rate-up), 4j+1 (rate-down), 4j+2 (tlim upper), 4j+3 (tlim lower)
+      A_x.push_back( 1.0); A_i.push_back(4 * j);
+      A_x.push_back(-1.0); A_i.push_back(4 * j + 1);
+      A_x.push_back( 1.0); A_i.push_back(4 * j + 2);
+      A_x.push_back(-1.0); A_i.push_back(4 * j + 3);
+      nz += 4;
+      if (j < n - 1) {
+        // Forward coupling: -U_j in (U_{j+1} - U_j ≤ rate_up*dt)  → row 4(j+1)
+        A_x.push_back(-1.0); A_i.push_back(4 * (j + 1));
+        // Forward coupling: +U_j in (U_j - U_{j+1} ≤ rate_down*dt) → row 4(j+1)+1
+        A_x.push_back( 1.0); A_i.push_back(4 * (j + 1) + 1);
+        nz += 2;
       }
     }
     A_p[n] = nz;

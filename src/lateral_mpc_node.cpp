@@ -92,6 +92,50 @@ public:
         return s_.empty() ? 0.0 : s_.back();
     }
 
+    /**
+     * Savitzky-Golay smoothing (window=9, order=3) applied to x/y coordinates.
+     * Reduces GPS position noise in recorded paths without distorting large-scale
+     * geometry. Arc-lengths are recomputed from the smoothed coordinates.
+     * Edge handling: clamp — boundary points use the nearest valid index.
+     */
+    void smooth(int passes = 2)
+    {
+        // SG(9,3) symmetric coefficients: [-21,14,39,54,59,54,39,14,-21] / 231
+        constexpr int    W    = 9;
+        constexpr int    H    = W / 2;   // 4
+        constexpr double c[W] = { -21.0, 14.0, 39.0, 54.0, 59.0,
+                                    54.0, 39.0, 14.0, -21.0 };
+        constexpr double norm = 231.0;
+
+        const size_t n = wpts_.size();
+        if (n < static_cast<size_t>(W)) return;
+
+        std::vector<double> xs(n), ys(n);
+        for (int pass = 0; pass < passes; ++pass) {
+            for (size_t i = 0; i < n; ++i) {
+                double sx = 0.0, sy = 0.0;
+                for (int k = -H; k <= H; ++k) {
+                    size_t j = static_cast<size_t>(
+                        std::clamp(static_cast<int>(i) + k, 0, static_cast<int>(n) - 1));
+                    sx += c[k + H] * wpts_[j].first;
+                    sy += c[k + H] * wpts_[j].second;
+                }
+                xs[i] = sx / norm;
+                ys[i] = sy / norm;
+            }
+            for (size_t i = 0; i < n; ++i) wpts_[i] = { xs[i], ys[i] };
+        }
+
+        // Recompute arc-lengths from smoothed positions
+        s_.resize(n);
+        s_[0] = 0.0;
+        for (size_t i = 1; i < n; ++i) {
+            double dx = wpts_[i].first  - wpts_[i-1].first;
+            double dy = wpts_[i].second - wpts_[i-1].second;
+            s_[i] = s_[i-1] + std::hypot(dx, dy);
+        }
+    }
+
     /** Find arc-length of closest point to (qx, qy). Updates hint in place. */
     double findClosest(double qx, double qy, size_t & hint) const
     {
@@ -643,18 +687,18 @@ private:
         int nz = 0;
         for (int j = 0; j < n; j++) {
             A_p[j] = nz;
-            if (j == 0) {
-                A_x.insert(A_x.end(), {1.0f, -1.0f, 1.0f, -1.0f});
-                A_i.insert(A_i.end(), {0, 1, 2, 3});
-                nz += 4;
-            } else {
-                A_x.push_back(-1.0f); A_i.push_back(4*(j-1));
-                A_x.push_back( 1.0f); A_i.push_back(4*(j-1)+1);
-                A_x.push_back( 1.0f); A_i.push_back(4*j);
-                A_x.push_back(-1.0f); A_i.push_back(4*j+1);
-                A_x.push_back( 1.0f); A_i.push_back(4*j+2);
-                A_x.push_back(-1.0f); A_i.push_back(4*j+3);
-                nz += 6;
+            // Own-step: row 4j (rate-up), 4j+1 (rate-down), 4j+2 (tlim upper), 4j+3 (tlim lower)
+            A_x.push_back( 1.0f); A_i.push_back(4 * j);
+            A_x.push_back(-1.0f); A_i.push_back(4 * j + 1);
+            A_x.push_back( 1.0f); A_i.push_back(4 * j + 2);
+            A_x.push_back(-1.0f); A_i.push_back(4 * j + 3);
+            nz += 4;
+            if (j < n - 1) {
+                // Forward coupling: -U_j in (U_{j+1} - U_j ≤ rate_up*dt)  → row 4(j+1)
+                A_x.push_back(-1.0f); A_i.push_back(4 * (j + 1));
+                // Forward coupling: +U_j in (U_j - U_{j+1} ≤ rate_down*dt) → row 4(j+1)+1
+                A_x.push_back( 1.0f); A_i.push_back(4 * (j + 1) + 1);
+                nz += 2;
             }
         }
         A_p[n] = nz;
@@ -781,6 +825,10 @@ private:
         RCLCPP_INFO(get_logger(),
             "Loaded path from '%s': %d waypoints, %.1f m total.",
             filename.c_str(), count, path_.totalLength());
+
+        path_.smooth();
+        RCLCPP_INFO(get_logger(), "Path smoothed (SG 9-pt order-3, 2 passes). New length: %.1f m.",
+            path_.totalLength());
     }
 
     // =========================================================================

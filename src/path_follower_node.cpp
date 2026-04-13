@@ -93,6 +93,50 @@ public:
     }
 
     /**
+     * Savitzky-Golay smoothing (window=9, order=3) applied to x/y coordinates.
+     * Reduces GPS position noise in recorded paths without distorting large-scale
+     * geometry. Arc-lengths are recomputed from the smoothed coordinates.
+     * Edge handling: clamp — boundary points use the nearest valid index.
+     */
+    void smooth(int passes = 2)
+    {
+        // SG(9,3) symmetric coefficients: [-21,14,39,54,59,54,39,14,-21] / 231
+        constexpr int    W    = 9;
+        constexpr int    H    = W / 2;   // 4
+        constexpr double c[W] = { -21.0, 14.0, 39.0, 54.0, 59.0,
+                                    54.0, 39.0, 14.0, -21.0 };
+        constexpr double norm = 231.0;
+
+        const size_t n = wpts_.size();
+        if (n < static_cast<size_t>(W)) return;
+
+        std::vector<double> xs(n), ys(n);
+        for (int pass = 0; pass < passes; ++pass) {
+            for (size_t i = 0; i < n; ++i) {
+                double sx = 0.0, sy = 0.0;
+                for (int k = -H; k <= H; ++k) {
+                    size_t j = static_cast<size_t>(
+                        std::clamp(static_cast<int>(i) + k, 0, static_cast<int>(n) - 1));
+                    sx += c[k + H] * wpts_[j].first;
+                    sy += c[k + H] * wpts_[j].second;
+                }
+                xs[i] = sx / norm;
+                ys[i] = sy / norm;
+            }
+            for (size_t i = 0; i < n; ++i) wpts_[i] = { xs[i], ys[i] };
+        }
+
+        // Recompute arc-lengths from smoothed positions
+        s_.resize(n);
+        s_[0] = 0.0;
+        for (size_t i = 1; i < n; ++i) {
+            double dx = wpts_[i].first  - wpts_[i-1].first;
+            double dy = wpts_[i].second - wpts_[i-1].second;
+            s_[i] = s_[i-1] + std::hypot(dx, dy);
+        }
+    }
+
+    /**
      * Find arc-length of the point on the path closest to (qx, qy).
      * @param hint  Start index for search (updated in place; prevents backward jumps).
      */
@@ -600,6 +644,11 @@ private:
         RCLCPP_INFO(this->get_logger(),
             "Loaded path from '%s': %d waypoints, %.1f m total.",
             filename.c_str(), count, path_.totalLength());
+
+        path_.smooth();
+        RCLCPP_INFO(this->get_logger(),
+            "Path smoothed (SG 9-pt order-3, 2 passes). New length: %.1f m.",
+            path_.totalLength());
     }
 
     // =========================================================================
