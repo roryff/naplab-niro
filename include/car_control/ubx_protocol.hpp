@@ -91,6 +91,52 @@ struct UBXESFSensor {
 } __attribute__((packed));
 
 /**
+ * UBX ESF-RAW  –  Raw / Compensated IMU Sensor Measurements
+ * Class 0x10, ID 0x03
+ *
+ * Payload layout:
+ *   Bytes 0–3: reserved
+ *   Bytes 4+:  N × 8-byte blocks  { data (4 bytes), sTag (4 bytes) }
+ *
+ * data word encoding:
+ *   bits[31:24] = dataType   (sensor type enum)
+ *   bits[23:0]  = dataField  (24-bit signed value, scale depends on type)
+ *
+ * Relevant dataType values (ZED-F9R):
+ *   14  =  z-axis gyro compensated  [0.001 deg/s per LSB]  ← yaw rate
+ *   13  =  y-axis gyro compensated  [0.001 deg/s per LSB]
+ *   12  =  x-axis gyro compensated  [0.001 deg/s per LSB]
+ */
+#define UBX_ESF_RAW_DATATYPE_GYRO_X  12
+#define UBX_ESF_RAW_DATATYPE_GYRO_Y  13
+#define UBX_ESF_RAW_DATATYPE_GYRO_Z  14
+
+/** Fixed-size header at the start of ESF-RAW payload (4 reserved bytes). */
+struct UBXESFRAWHEADER {
+    uint8_t reserved[4];
+} __attribute__((packed));
+
+/** One sensor measurement block inside ESF-RAW. */
+struct UBXESFRAWSample {
+    uint32_t data;   // bits[31:24]=dataType, bits[23:0]=dataField (24-bit signed)
+    uint32_t sTag;   // sensor time tag [ms]
+} __attribute__((packed));
+
+/** Extract the signed 24-bit dataField from an ESF-RAW data word. */
+inline int32_t ubx_esf_raw_data_field(uint32_t data_word)
+{
+    int32_t val = static_cast<int32_t>(data_word & 0x00FFFFFF);
+    if (val & 0x00800000) val |= static_cast<int32_t>(0xFF000000);
+    return val;
+}
+
+/** Extract the dataType byte (bits[31:24]) from an ESF-RAW data word. */
+inline uint8_t ubx_esf_raw_data_type(uint32_t data_word)
+{
+    return static_cast<uint8_t>((data_word >> 24) & 0xFF);
+}
+
+/**
  * UBX ESF-ALG  –  IMU-mount Auto-alignment Status
  * Class 0x10, ID 0x14
  */

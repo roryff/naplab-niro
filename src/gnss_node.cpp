@@ -3,6 +3,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 #include "car_control/msg/esf_status.hpp"
 #include "car_control/msg/esf_sensor.hpp"
@@ -74,6 +75,8 @@ public:
             "gnss/odometry", 10);
         esf_status_pub_ = this->create_publisher<car_control::msg::EsfStatus>(
             "gnss/esf_status", 10);
+        yaw_rate_pub_ = this->create_publisher<std_msgs::msg::Float32>(
+            "gnss/yaw_rate", 10);
         
         // Check if origin should be manually set
         if (!this->get_parameter("auto_set_origin").as_bool()) {
@@ -143,8 +146,11 @@ private:
                     continue;
                 }
             }
+            // On fresh connection, enable ESF-RAW output from the receiver
+            enable_esf_raw_output();
+        }
             
-            // Block on socket read - will return immediately when data arrives
+        // Block on socket read - will return immediately when data arrives
             read_gnss_data();
 
             // If read_gnss_data() closed the socket (error / remote close),
@@ -417,6 +423,12 @@ private:
             else if (header.msg_class == 0x10 && header.msg_id == 0x14) {
                 if (header.length >= sizeof(UBXESFALG)) {
                     process_esf_alg(rx_buffer_.data() + sizeof(UBXHeader));
+                }
+            }
+            // Process ESF-RAW message (Class 0x10, ID 0x03)
+            else if (header.msg_class == 0x10 && header.msg_id == 0x03) {
+                if (header.length >= sizeof(UBXESFRAWHEADER)) {
+                    process_esf_raw(rx_buffer_.data() + sizeof(UBXHeader), header.length);
                 }
             }
             else {
@@ -752,6 +764,73 @@ private:
 
 
     /**
+     * @brief Process ESF-RAW message — extract compensated gyro-z (yaw rate)
+     *
+     * ESF-RAW payload: 4 bytes reserved, then N × 8-byte {data, sTag} blocks.
+     * data word: bits[31:24]=dataType, bits[23:0]=signed 24-bit dataField.
+     * dataType 14 = z-axis compensated gyro, scale: 0.001 deg/s per LSB.
+     *
+     * Publishes the most recent gyro_z sample as gnss/yaw_rate [rad/s].
+     */
+    void process_esf_raw(const uint8_t* payload, uint16_t length)
+    {
+        constexpr uint16_t header_size = sizeof(UBXESFRAWHEADER);
+        constexpr uint16_t sample_size = sizeof(UBXESFRAWSample);
+
+        if (length < header_size) return;
+
+        const uint8_t* ptr = payload + header_size;
+        const uint8_t* end = payload + length;
+
+        bool found = false;
+        float yaw_rate_rad_s = 0.0f;
+
+        while (ptr + sample_size <= end) {
+            UBXESFRAWSample sample;
+            std::memcpy(&sample, ptr, sample_size);
+            ptr += sample_size;
+
+            uint8_t dtype = ubx_esf_raw_data_type(sample.data);
+            if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_Z) {
+                int32_t raw = ubx_esf_raw_data_field(sample.data);
+                // 0.001 deg/s per LSB → rad/s
+                yaw_rate_rad_s = static_cast<float>(raw) * 0.001f * (M_PI / 180.0f);
+                found = true;
+            }
+        }
+
+        if (found) {
+            std_msgs::msg::Float32 msg;
+            msg.data = yaw_rate_rad_s;
+            yaw_rate_pub_->publish(msg);
+
+            RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "ESF-RAW gyro_z: %.4f rad/s (%.2f deg/s)",
+                yaw_rate_rad_s, yaw_rate_rad_s * (180.0f / M_PI));
+        }
+    }
+
+    /**
+     * @brief Send CFG-MSG to enable UBX-ESF-RAW output on all interfaces.
+     * Rate=1 enables the message at the receiver's navigation rate.
+     */
+    void enable_esf_raw_output()
+    {
+        std::lock_guard<std::mutex> lock(socket_write_mutex_);
+        if (socket_fd_ < 0) return;
+
+        uint8_t cfg_msg_payload[8] = {
+            0x10,  // msgClass = ESF
+            0x03,  // msgId    = RAW
+            1, 1, 1, 1, 1, 0  // rate: DDC, UART1, UART2, USB, SPI, reserved
+        };
+        send_ubx_message(0x06, 0x01, cfg_msg_payload, sizeof(cfg_msg_payload));
+
+        RCLCPP_INFO(this->get_logger(),
+            "Sent CFG-MSG to enable ESF-RAW (gyro yaw rate) output");
+    }
+
+    /**
      * @brief Dedicated 50 Hz sender thread for UBX-ESF-MEAS
      *
      * Sends at a fixed isochronous 20 ms interval so the u-blox receiver can
@@ -865,6 +944,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocity_publisher_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_publisher_;
     rclcpp::Publisher<car_control::msg::EsfStatus>::SharedPtr esf_status_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr yaw_rate_pub_;
     
     // Reader / sender threads
     std::thread reader_thread_;

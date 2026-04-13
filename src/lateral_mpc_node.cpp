@@ -16,6 +16,7 @@
  *   gnss/pose             (geometry_msgs/PoseStamped)  — ENU position + yaw
  *   vehicle/state         (car_control/VehicleState)   — v_ego [km/h], steering_angle_deg [sw-deg]
  *   enable_path_following (std_msgs/Bool)              — rising edge starts, any msg stops
+ *   gnss/yaw_rate         (std_msgs/Float32)           — IMU yaw rate [rad/s] (optional)
  *
  * Publications:
  *   cmd_vel                       (geometry_msgs/Twist)   — linear.x=accel, angular.z=torque
@@ -33,6 +34,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 #include <nav_msgs/msg/path.hpp>
@@ -263,7 +265,7 @@ public:
         declare_parameter("stop_distance",     3.0);
         declare_parameter("horizon",           40);
         declare_parameter("weight_cte",        2.0);   // [1/m²]
-        declare_parameter("weight_psi",        1.0);   // [1/rad²]
+        declare_parameter("weight_psi",        2.0);   // [1/rad²]  — was 1.0; increased for better heading tracking
         declare_parameter("weight_torque",     0.1);
         declare_parameter("tau_r",             0.78);  // actuator time constant [s]
         declare_parameter("gain_r",            36.0);  // sw-deg/s per unit torque
@@ -271,6 +273,8 @@ public:
         declare_parameter("rate_down",         5.5/3.0);
         declare_parameter("torque_limit",      1.0);
         declare_parameter("kp_speed",          0.3);
+        declare_parameter("tau_i_cte",         8.0);   // leaky integrator time constant [s]
+        declare_parameter("ki_cte",            0.15);  // integrator gain
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
 
@@ -289,6 +293,13 @@ public:
             "enable_path_following", 10,
             std::bind(&LateralMpcNode::enableCallback, this, std::placeholders::_1));
 
+        yaw_rate_sub_ = create_subscription<std_msgs::msg::Float32>(
+            "gnss/yaw_rate", 10,
+            [this](const std_msgs::msg::Float32::SharedPtr msg) {
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                yaw_rate_ = static_cast<double>(msg->data);
+            });
+
         // ---- Publishers --------------------------------------------------------
         cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
 
@@ -304,6 +315,7 @@ public:
         pub_actual_delta_  = create_publisher<std_msgs::msg::Float64>("lateral_mpc/actual_delta_deg",  10);
         pub_torque_cmd_    = create_publisher<std_msgs::msg::Float64>("lateral_mpc/torque_cmd",        10);
         pub_progress_      = create_publisher<std_msgs::msg::Float64>("lateral_mpc/progress_m",        10);
+        pub_integral_cte_  = create_publisher<std_msgs::msg::Float64>("lateral_mpc/integral_cte",      10);
         pub_lateral_error_ = create_publisher<std_msgs::msg::Float64>("lateral_error",                 10);
         pub_heading_error_ = create_publisher<std_msgs::msg::Float64>("heading_error",                 10);
         pub_pf_cmd_vel_    = create_publisher<geometry_msgs::msg::Twist>("path_follower/cmd_vel",       10);
@@ -421,6 +433,7 @@ private:
             }
             hint_front_      = 0;
             u_prev_          = 0.0;
+            integral_cte_    = 0.0;
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
             RCLCPP_INFO(get_logger(), "Path following STARTED.");
@@ -462,13 +475,10 @@ private:
             return;
         }
 
-        // --- Project front axle onto path ------------------------------------
-        double front_x = car_x + WHEELBASE * std::cos(car_heading);
-        double front_y = car_y + WHEELBASE * std::sin(car_heading);
-        double s_front = path_.findClosest(front_x, front_y, hint_front_);
-
-        size_t hint_rear = (hint_front_ > 0) ? hint_front_ - 1 : 0;
-        double s_rear    = path_.findClosest(car_x, car_y, hint_rear);
+        // --- Project rear axle (GNSS antenna) onto path ----------------------
+        // CTE and heading are referenced at the rear axle (GNSS position) to avoid
+        // the geometric inside-corner bias caused by a front-axle reference point.
+        double s_rear = path_.findClosest(car_x, car_y, hint_front_);
 
         // --- Check if approaching end of path --------------------------------
         double remaining = path_.totalLength() - s_rear;
@@ -484,18 +494,27 @@ private:
         double elapsed = (this->now() - path_start_time_).seconds();
         double ramp    = std::min(1.0, elapsed / SOFT_START_DURATION);
 
-        // --- Initial state for MPC -------------------------------------------
-        double cte  = path_.crossTrackError(front_x, front_y, s_front);
-        double dpsi = path_.headingError(s_front, car_heading);
+        // --- Initial state for MPC (rear-axle reference) ----------------------
+        double cte  = path_.crossTrackError(car_x, car_y, s_rear);
+        double dpsi = path_.headingError(s_rear, car_heading);
 
         // Curvature-based desired steer angle (feedforward reference for debug only)
-        double desired_delta_rad = path_.curvature(s_front) * WHEELBASE;
+        double desired_delta_rad = path_.curvature(s_rear) * WHEELBASE;
+
+        // --- Leaky CTE integrator (slow integral action for steady-state offset) ---
+        // Accumulates persistent CTE bias over τ_i seconds; corrects road camber /
+        // EPS deadband offsets without affecting the fast lateral dynamics.
+        {
+            const double tau_i = get_parameter("tau_i_cte").as_double();
+            integral_cte_ = integral_cte_ * (1.0 - DT / tau_i) + DT * cte;
+        }
+        double cte_biased = cte + get_parameter("ki_cte").as_double() * integral_cte_;
 
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
         if (state_ == State::FOLLOWING) {
-            torque_cmd = ramp * solveMpc(cte, dpsi, car_delta, car_delta_rate,
-                                         car_speed, s_front);
+            torque_cmd = ramp * solveMpc(cte_biased, dpsi, car_delta, car_delta_rate,
+                                         car_speed, s_rear, yaw_rate_);
         }
         torque_cmd = std::clamp(torque_cmd, -1.0, 1.0);
         u_prev_    = torque_cmd;
@@ -516,6 +535,7 @@ private:
         pub_actual_delta_ ->publish(f64(car_delta * 180.0 / M_PI));
         pub_torque_cmd_   ->publish(f64(torque_cmd));
         pub_progress_     ->publish(f64(s_rear));
+        pub_integral_cte_ ->publish(f64(integral_cte_));
 
         // Dashboard-compatible topics (mirror cascade node interface)
         pub_lateral_error_->publish(f64(cte));
@@ -555,7 +575,7 @@ private:
     // =========================================================================
 
     double solveMpc(double cte0, double dpsi0, double delta0, double drate0,
-                    double v,    double s_front)
+                    double v,    double s_ref,  double r_measured = 0.0)
     {
         const int n = N_;
         if (n < 1) return u_prev_;
@@ -605,7 +625,7 @@ private:
 
         for (int k = 0; k < n; k++) {
             // Path curvature feedforward at predicted vehicle position for step k
-            double s_k   = std::min(s_front + k * dt * v_eff, path_.totalLength());
+            double s_k   = std::min(s_ref + k * dt * v_eff, path_.totalLength());
             double kappa = path_.curvature(s_k);
 
             // dRate_{k+1} = a_rate * dRate_k + b_rate * u_k
@@ -620,9 +640,13 @@ private:
             for (int j = 0; j < n; j++)
                 G_delta_new[j] = G_delta[j] + dt * G_rate_new[j];
 
-            // dPsi_{k+1} = dPsi_k - (v * delta_k / L - kappa_k * v) * dt
-            // Positive steer left increases car heading, decreasing dPsi = path_heading - car_heading
-            double c_psi_new = c_psi - (v_eff * c_delta / WHEELBASE - kappa * v_eff) * dt;
+            // dPsi_{k+1} = dPsi_k - (yaw_rate - kappa*v) * dt
+            // For k=0: use measured yaw rate (from IMU) when available for accuracy.
+            // For k>0: use kinematic model v*delta/L (no measured future yaw rate).
+            double yaw_rate_k = (k == 0 && std::abs(r_measured) > 1e-6)
+                                ? r_measured
+                                : v_eff * c_delta / WHEELBASE;
+            double c_psi_new = c_psi - (yaw_rate_k - kappa * v_eff) * dt;
             std::vector<double> G_psi_new(n, 0.0);
             for (int j = 0; j < n; j++)
                 G_psi_new[j] = G_psi[j] - v_eff * dt / WHEELBASE * G_delta[j];
@@ -754,7 +778,8 @@ private:
                                double spacing)
     {
         path_.clear();
-        hint_front_ = 0;
+        hint_front_    = 0;
+        integral_cte_  = 0.0;
 
         const double sinusoid_len = total_length - 60.0;
         const int    n_sin        = static_cast<int>(sinusoid_len / spacing);
@@ -792,7 +817,8 @@ private:
     void loadPathFromCSV(const std::string& filename)
     {
         path_.clear();
-        hint_front_ = 0;
+        hint_front_   = 0;
+        integral_cte_ = 0.0;
 
         std::ifstream f(filename);
         if (!f.is_open()) {
@@ -907,8 +933,10 @@ private:
     bool   auto_enable_fired_  = false;
 
     // MPC state
-    double u_prev_ = 0.0;
-    int    N_      = 40;
+    double u_prev_        = 0.0;
+    double integral_cte_  = 0.0;  // leaky integrator for steady-state CTE bias correction
+    double yaw_rate_      = 0.0;  // measured yaw rate from IMU [rad/s], 0 if not available
+    int    N_             = 40;
 
     // Path
     Path   path_;
@@ -921,6 +949,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  gnss_pose_sub_;
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr   vehicle_state_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              enable_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr           yaw_rate_sub_;
 
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr   cmd_vel_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr          path_vis_pub_;
@@ -931,6 +960,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_actual_delta_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_torque_cmd_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_progress_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_integral_cte_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_lateral_error_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_heading_error_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr    pub_pf_cmd_vel_;
