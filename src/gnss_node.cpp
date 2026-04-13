@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include "car_control/ubx_protocol.hpp"
 #include "car_control/geo_utils.hpp"
 
@@ -252,11 +253,33 @@ private:
 
         // Restore blocking mode for recv
         fcntl(socket_fd_, F_SETFL, fcntl(socket_fd_, F_GETFL) & ~O_NONBLOCK);
+
+        // Apply low-latency socket options
+        optimize_socket(socket_fd_);
         
         RCLCPP_INFO(this->get_logger(), "Connected to u-blox receiver at %s:%d", 
             host.c_str(), port);
     }
     
+    /**
+     * @brief Apply low-latency socket options (mirrors comma_node::optimize_socket)
+     */
+    void optimize_socket(int fd)
+    {
+        // 1. Disable Nagle's algorithm - send small packets immediately
+        int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        // 2. Reduce socket buffer sizes to minimize buffering delay
+        int small_buffer = 8192;  // 8KB instead of default ~200KB
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small_buffer, sizeof(small_buffer));
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer));
+
+        // 3. Set socket priority for real-time traffic
+        int priority = 6;
+        setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
+    }
+
     /**
      * @brief Read data from u-blox receiver (blocking)
      * This runs in a dedicated thread and publishes immediately when data arrives
