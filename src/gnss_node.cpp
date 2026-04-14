@@ -47,7 +47,8 @@
  *     - gnss/fix (sensor_msgs/NavSatFix): GPS fix data
  *     - gnss/velocity (geometry_msgs/TwistStamped): Vehicle velocity
  *     - gnss/odometry (nav_msgs/Odometry): Combined pose and velocity
- *     - gnss/gyro (geometry_msgs/Vector3Stamped): IMU gyro rates x/y/z [rad/s] (ESF-RAW)
+ *     - gnss/gyro (geometry_msgs/Vector3Stamped): Compensated angular rates x/y/z [rad/s] (ESF-INS)
+ *     - gnss/accel (geometry_msgs/Vector3Stamped): Compensated accelerations x/y/z [m/s²] (ESF-INS)
  */
 class GNSSNode : public rclcpp::Node
 {
@@ -78,6 +79,8 @@ public:
             "gnss/esf_status", 10);
         gyro_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>(
             "gnss/gyro", 10);
+        accel_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            "gnss/accel", 10);
         
         // Check if origin should be manually set
         if (!this->get_parameter("auto_set_origin").as_bool()) {
@@ -147,8 +150,8 @@ private:
                     continue;
                 }
             
-            // On fresh connection, enable ESF-RAW output from the receiver
-            enable_esf_raw_output();
+            // On fresh connection, enable ESF-INS output and disable ESF-RAW
+            enable_esf_ins_output();
         }
             
         // Block on socket read - will return immediately when data arrives
@@ -426,10 +429,10 @@ private:
                     process_esf_alg(rx_buffer_.data() + sizeof(UBXHeader));
                 }
             }
-            // Process ESF-RAW message (Class 0x10, ID 0x03)
-            else if (header.msg_class == 0x10 && header.msg_id == 0x03) {
-                if (header.length >= sizeof(UBXESFRAWHEADER)) {
-                    process_esf_raw(rx_buffer_.data() + sizeof(UBXHeader), header.length);
+            // Process ESF-INS message (Class 0x10, ID 0x15) — compensated vehicle-frame dynamics
+            else if (header.msg_class == 0x10 && header.msg_id == 0x15) {
+                if (header.length >= sizeof(UBXESFINS)) {
+                    process_esf_ins(rx_buffer_.data() + sizeof(UBXHeader));
                 }
             }
             else {
@@ -765,73 +768,82 @@ private:
 
 
     /**
-     * @brief Process ESF-RAW message — extract compensated gyro axes and publish gnss/gyro
+     * @brief Process ESF-INS message — publish compensated vehicle-frame dynamics
      *
-     * ESF-RAW payload: 4 bytes reserved, then N × 8-byte {data, sTag} blocks.
-     * data word: bits[31:24]=dataType, bits[23:0]=signed 24-bit dataField.
-     * dataType 12/13/14 = compensated gyro x/y/z, scale: 0.001 deg/s per LSB.
+     * Angular rates: int32 [deg/s * 1e-3] → rad/s (per-axis validity checked)
+     * Accelerations: int32 [mg]           → m/s² (gravity-free, per-axis validity checked)
      *
-     * Publishes geometry_msgs/Vector3Stamped on gnss/gyro [rad/s].
+     * NOTE: Fields are only meaningful when fusionMode == 1 (FUSION).
+     * Publishes gnss/gyro [rad/s] and gnss/accel [m/s²].
      */
-    void process_esf_raw(const uint8_t* payload, uint16_t length)
+    void process_esf_ins(const uint8_t* payload)
     {
-        constexpr uint16_t header_size = sizeof(UBXESFRAWHEADER);
-        constexpr uint16_t sample_size = sizeof(UBXESFRAWSample);
+        UBXESFINS ins;
+        std::memcpy(&ins, payload, sizeof(UBXESFINS));
 
-        if (length < header_size) return;
+        auto stamp = this->get_clock()->now();
+        constexpr double DEG_S_SCALE = 1e-3 * M_PI / 180.0;  // 0.001 deg/s per LSB → rad/s
+        constexpr double MG_SCALE    = 1e-3 * 9.80665;        // mg → m/s²
 
-        const uint8_t* ptr = payload + header_size;
-        const uint8_t* end = payload + length;
-
-        bool found_x = false, found_y = false, found_z = false;
-        float gyro_x = 0.0f, gyro_y = 0.0f, gyro_z = 0.0f;
-
-        while (ptr + sample_size <= end) {
-            UBXESFRAWSample sample;
-            std::memcpy(&sample, ptr, sample_size);
-            ptr += sample_size;
-
-            uint8_t dtype = ubx_esf_raw_data_type(sample.data);
-            float val = static_cast<float>(ubx_esf_raw_data_field(sample.data))
-                        * 0.001f * (M_PI / 180.0f);  // 0.001 deg/s per LSB → rad/s
-
-            if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_X) { gyro_x = val; found_x = true; }
-            else if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_Y) { gyro_y = val; found_y = true; }
-            else if (dtype == UBX_ESF_RAW_DATATYPE_GYRO_Z) { gyro_z = val; found_z = true; }
-        }
-
-        if (found_x || found_y || found_z) {
-            geometry_msgs::msg::Vector3Stamped msg;
-            msg.header.stamp = this->get_clock()->now();
-            msg.header.frame_id = "imu";
-            msg.vector.x = gyro_x;
-            msg.vector.y = gyro_y;
-            msg.vector.z = gyro_z;
-            gyro_pub_->publish(msg);
+        // Angular rates
+        if (ins.bitfield0 & (UBX_ESF_INS_X_ANG_RATE_VALID |
+                             UBX_ESF_INS_Y_ANG_RATE_VALID |
+                             UBX_ESF_INS_Z_ANG_RATE_VALID)) {
+            geometry_msgs::msg::Vector3Stamped gyro_msg;
+            gyro_msg.header.stamp    = stamp;
+            gyro_msg.header.frame_id = "imu";
+            gyro_msg.vector.x = (ins.bitfield0 & UBX_ESF_INS_X_ANG_RATE_VALID)
+                                 ? ins.xAngRate * DEG_S_SCALE : 0.0;
+            gyro_msg.vector.y = (ins.bitfield0 & UBX_ESF_INS_Y_ANG_RATE_VALID)
+                                 ? ins.yAngRate * DEG_S_SCALE : 0.0;
+            gyro_msg.vector.z = (ins.bitfield0 & UBX_ESF_INS_Z_ANG_RATE_VALID)
+                                 ? ins.zAngRate * DEG_S_SCALE : 0.0;
+            gyro_pub_->publish(gyro_msg);
 
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "ESF-RAW gyro [rad/s]: x=%.4f y=%.4f z=%.4f", gyro_x, gyro_y, gyro_z);
+                "ESF-INS gyro [deg/s]: x=%.3f y=%.3f z=%.3f",
+                ins.xAngRate * 1e-3, ins.yAngRate * 1e-3, ins.zAngRate * 1e-3);
+        }
+
+        // Accelerations
+        if (ins.bitfield0 & (UBX_ESF_INS_X_ACCEL_VALID |
+                             UBX_ESF_INS_Y_ACCEL_VALID |
+                             UBX_ESF_INS_Z_ACCEL_VALID)) {
+            geometry_msgs::msg::Vector3Stamped accel_msg;
+            accel_msg.header.stamp    = stamp;
+            accel_msg.header.frame_id = "imu";
+            accel_msg.vector.x = (ins.bitfield0 & UBX_ESF_INS_X_ACCEL_VALID)
+                                  ? ins.xAccel * MG_SCALE : 0.0;
+            accel_msg.vector.y = (ins.bitfield0 & UBX_ESF_INS_Y_ACCEL_VALID)
+                                  ? ins.yAccel * MG_SCALE : 0.0;
+            accel_msg.vector.z = (ins.bitfield0 & UBX_ESF_INS_Z_ACCEL_VALID)
+                                  ? ins.zAccel * MG_SCALE : 0.0;
+            accel_pub_->publish(accel_msg);
         }
     }
 
     /**
-     * @brief Send CFG-MSG to enable UBX-ESF-RAW output on all interfaces.
-     * Rate=1 enables the message at the receiver's navigation rate.
+     * @brief Send CFG-MSG to enable UBX-ESF-INS and disable UBX-ESF-RAW.
+     *
+     * ESF-INS provides bias-compensated angular rates and accelerations from
+     * the INS fusion engine.  ESF-RAW carries uncompensated sensor data and
+     * is disabled to reduce bandwidth and avoid confusion.
      */
-    void enable_esf_raw_output()
+    void enable_esf_ins_output()
     {
         std::lock_guard<std::mutex> lock(socket_write_mutex_);
         if (socket_fd_ < 0) return;
 
-        uint8_t cfg_msg_payload[8] = {
-            0x10,  // msgClass = ESF
-            0x03,  // msgId    = RAW
-            1, 1, 1, 1, 1, 0  // rate: DDC, UART1, UART2, USB, SPI, reserved
-        };
-        send_ubx_message(0x06, 0x01, cfg_msg_payload, sizeof(cfg_msg_payload));
+        // Enable ESF-INS (0x10 0x15) at nav rate on all interfaces
+        uint8_t cfg_ins[8] = { 0x10, 0x15, 1, 1, 1, 1, 1, 0 };
+        send_ubx_message(0x06, 0x01, cfg_ins, sizeof(cfg_ins));
+
+        // Disable ESF-RAW (0x10 0x03) — noisy, uncompensated, not needed
+        uint8_t cfg_raw[8] = { 0x10, 0x03, 0, 0, 0, 0, 0, 0 };
+        send_ubx_message(0x06, 0x01, cfg_raw, sizeof(cfg_raw));
 
         RCLCPP_INFO(this->get_logger(),
-            "Sent CFG-MSG to enable ESF-RAW (gyro yaw rate) output");
+            "Sent CFG-MSG: enabled ESF-INS (compensated dynamics), disabled ESF-RAW");
     }
 
     /**
@@ -949,6 +961,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_publisher_;
     rclcpp::Publisher<car_control::msg::EsfStatus>::SharedPtr esf_status_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gyro_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr accel_pub_;
     
     // Reader / sender threads
     std::thread reader_thread_;

@@ -137,6 +137,45 @@ inline uint8_t ubx_esf_raw_data_type(uint32_t data_word)
 }
 
 /**
+ * UBX ESF-INS  –  Vehicle Dynamics (INS)
+ * Class 0x10, ID 0x15
+ *
+ * Outputs bias-compensated angular rates and accelerations from the INS
+ * fusion engine (vehicle-frame for ADR products).
+ *
+ * Angular rates : int32 [deg/s * 1e-3]  →  multiply by 1e-3 * π/180 for rad/s
+ * Accelerations : int32 [mg]            →  multiply by 1e-3 * 9.80665 for m/s²
+ *
+ * Validity flags in bitfield0:
+ *   bit  8 = xAngRateValid
+ *   bit  9 = yAngRateValid
+ *   bit 10 = zAngRateValid
+ *   bit 11 = xAccelValid
+ *   bit 12 = yAccelValid
+ *   bit 13 = zAccelValid
+ *
+ * NOTE: Fields are only valid when fusionMode == 1 (FUSION).
+ */
+struct UBXESFINS {
+    uint32_t bitfield0;     // Version (bits[7:0]) + validity flags (bits[13:8])
+    uint8_t  reserved1[4];
+    uint32_t iTOW;          // GPS time of week [ms]
+    int32_t  xAngRate;      // Compensated x-axis angular rate [deg/s * 1e-3]
+    int32_t  yAngRate;      // Compensated y-axis angular rate [deg/s * 1e-3]
+    int32_t  zAngRate;      // Compensated z-axis angular rate [deg/s * 1e-3]
+    int32_t  xAccel;        // Compensated x-axis acceleration (gravity-free) [mg]
+    int32_t  yAccel;        // Compensated y-axis acceleration (gravity-free) [mg]
+    int32_t  zAccel;        // Compensated z-axis acceleration (gravity-free) [mg]
+} __attribute__((packed));
+
+#define UBX_ESF_INS_X_ANG_RATE_VALID  (1u << 8)
+#define UBX_ESF_INS_Y_ANG_RATE_VALID  (1u << 9)
+#define UBX_ESF_INS_Z_ANG_RATE_VALID  (1u << 10)
+#define UBX_ESF_INS_X_ACCEL_VALID     (1u << 11)
+#define UBX_ESF_INS_Y_ACCEL_VALID     (1u << 12)
+#define UBX_ESF_INS_Z_ACCEL_VALID     (1u << 13)
+
+/**
  * UBX ESF-ALG  –  IMU-mount Auto-alignment Status
  * Class 0x10, ID 0x14
  */
