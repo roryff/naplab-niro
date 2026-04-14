@@ -205,7 +205,7 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
 
     <!-- GNSS Velocity + UTM32 -->
     <div class="card" style="flex:1;min-width:220px">
-      <div class="card-header">GNSS Velocity</div>
+      <div class="card-header">GNSS Velocity / ESF-INS</div>
       <div class="card-body">
         <div class="big green" id="gspd-big">—</div>
         <div class="sub">Ground Speed — <span id="gspd-kmh">—</span> km/h</div>
@@ -213,8 +213,14 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
         <div class="row"><span class="label">Vel East</span><span id="vel-e" class="value">— m/s</span></div>
         <div class="row"><span class="label">Vel Down</span><span id="vel-d" class="value">— m/s</span></div>
         <hr class="divider">
-        <div class="row"><span class="label">UTM32 E</span><span id="pos-x" class="value">— m</span></div>
-        <div class="row"><span class="label">UTM32 N</span><span id="pos-y" class="value">— m</span></div>
+        <div class="row"><span class="label">Gyro X</span><span id="gyro-x" class="value">— °/s</span></div>
+        <div class="row"><span class="label">Gyro Y</span><span id="gyro-y" class="value">— °/s</span></div>
+        <div class="row"><span class="label">Gyro Z</span><span id="gyro-z" class="value">— °/s</span></div>
+        <hr class="divider">
+        <div class="row"><span class="label">Accel X</span><span id="accel-x" class="value">— m/s²</span></div>
+        <div class="row"><span class="label">Accel Y</span><span id="accel-y" class="value">— m/s²</span></div>
+        <div class="row"><span class="label">Accel Z</span><span id="accel-z" class="value">— m/s²</span></div>
+        <hr class="divider">
         <div class="row"><span class="label">Heading</span><span id="pos-h" class="value">—°</span></div>
       </div>
     </div>
@@ -567,8 +573,13 @@ function render(s){
   setText('vel-n', fmt(g.vel_n_mps,3)+' m/s');
   setText('vel-e', fmt(g.vel_e_mps,3)+' m/s');
   setText('vel-d', fmt(g.vel_d_mps,3)+' m/s');
-  setText('pos-x', fmt(g.pos_x_m,1)+' m');
-  setText('pos-y', fmt(g.pos_y_m,1)+' m');
+  const R2D = 180/Math.PI;
+  setText('gyro-x', fmt(g.gyro_x_rads*R2D,2)+' °/s');
+  setText('gyro-y', fmt(g.gyro_y_rads*R2D,2)+' °/s');
+  setText('gyro-z', fmt(g.gyro_z_rads*R2D,2)+' °/s');
+  setText('accel-x', fmt(g.accel_x_ms2,3)+' m/s²');
+  setText('accel-y', fmt(g.accel_y_ms2,3)+' m/s²');
+  setText('accel-z', fmt(g.accel_z_ms2,3)+' m/s²');
   setText('pos-h', fmt(g.heading_deg,1)+'°');
 
   // ── Vehicle State card ────────────────────────────────────────────────────
@@ -628,6 +639,8 @@ function render(s){
     ['/path_following_status',  1, 'Path Status'],
     ['/path_visualization',     1, 'Path Viz'],
     ['/gnss/esf_status',        1, 'ESF Status'],
+    ['/gnss/gyro',             50, 'Gyro (ESF-INS)'],
+    ['/gnss/accel',            50, 'Accel (ESF-INS)'],
   ];
   const healthEl = document.getElementById('topic-health');
   if(healthEl){

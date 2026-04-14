@@ -74,6 +74,8 @@ _state = {
         "/gnss/velocity":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/odometry":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/esf_status":         {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/gyro":               {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/accel":              {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_follower/cmd_vel":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/cmd_vel":                 {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_visualization":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
@@ -115,6 +117,14 @@ _state = {
         "pos_y_m":          0.0,
         "pos_z_m":          0.0,
         "heading_deg":      0.0,
+        "roll_deg":         0.0,
+        "pitch_deg":        0.0,
+        "gyro_x_rads":      0.0,
+        "gyro_y_rads":      0.0,
+        "gyro_z_rads":      0.0,
+        "accel_x_ms2":      0.0,
+        "accel_y_ms2":      0.0,
+        "accel_z_ms2":      0.0,
     },
 
     # ── ESF calibration ──────────────────────────────────────────────────────
@@ -348,7 +358,9 @@ class DashboardNode(Node):
         self.create_subscription(NavSatFix,    "/gnss/fix",        self._cb_gnss_fix, 10)
         self.create_subscription(TwistStamped, "/gnss/velocity",   self._cb_velocity, 10)
         self.create_subscription(Odometry,     "/gnss/odometry",   self._cb_odom,     10)
-        self.create_subscription(EsfStatus,    "/gnss/esf_status", self._cb_esf,      10)
+        self.create_subscription(EsfStatus,       "/gnss/esf_status", self._cb_esf,      10)
+        self.create_subscription(Vector3Stamped,  "/gnss/gyro",       self._cb_gyro,     10)
+        self.create_subscription(Vector3Stamped,  "/gnss/accel",      self._cb_accel,    10)
 
         # Path-follower topics
         # path_follower/cmd_vel: desired steer angle [rad] + desired speed [m/s]
@@ -418,6 +430,22 @@ class DashboardNode(Node):
             q = msg.pose.pose.orientation
             yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))
             g["heading_deg"] = round(math.degrees(yaw) % 360, 1)
+
+    def _cb_gyro(self, msg: Vector3Stamped):
+        with _state_lock:
+            _touch_topic("/gnss/gyro")
+            g = _state["gnss"]
+            g["gyro_x_rads"] = round(msg.vector.x, 5)
+            g["gyro_y_rads"] = round(msg.vector.y, 5)
+            g["gyro_z_rads"] = round(msg.vector.z, 5)
+
+    def _cb_accel(self, msg: Vector3Stamped):
+        with _state_lock:
+            _touch_topic("/gnss/accel")
+            g = _state["gnss"]
+            g["accel_x_ms2"] = round(msg.vector.x, 4)
+            g["accel_y_ms2"] = round(msg.vector.y, 4)
+            g["accel_z_ms2"] = round(msg.vector.z, 4)
 
     def _cb_esf(self, msg: EsfStatus):
         with _state_lock:
