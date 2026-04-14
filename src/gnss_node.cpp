@@ -46,6 +46,8 @@
  *     - gnss/fix (sensor_msgs/NavSatFix): GPS fix data
  *     - gnss/velocity (geometry_msgs/TwistStamped): Vehicle velocity
  *     - gnss/odometry (nav_msgs/Odometry): Combined pose and velocity
+ *     - gnss/gyro (geometry_msgs/Vector3Stamped): Compensated angular rates x/y/z [rad/s] (ESF-INS)
+ *     - gnss/accel (geometry_msgs/Vector3Stamped): Compensated accelerations x/y/z [m/s²] (ESF-INS)
  */
 class GNSSNode : public rclcpp::Node
 {
@@ -74,6 +76,10 @@ public:
             "gnss/odometry", 10);
         esf_status_pub_ = this->create_publisher<car_control::msg::EsfStatus>(
             "gnss/esf_status", 10);
+        gyro_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            "gnss/gyro", 10);
+        accel_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            "gnss/accel", 10);
         
         // Check if origin should be manually set
         if (!this->get_parameter("auto_set_origin").as_bool()) {
@@ -142,7 +148,10 @@ private:
                     }
                     continue;
                 }
-            }
+            
+            // On fresh connection, enable ESF-INS output and disable ESF-RAW
+            enable_esf_ins_output();
+        }
             
             // Block on socket read - will return immediately when data arrives
             read_gnss_data();
@@ -417,6 +426,12 @@ private:
             else if (header.msg_class == 0x10 && header.msg_id == 0x14) {
                 if (header.length >= sizeof(UBXESFALG)) {
                     process_esf_alg(rx_buffer_.data() + sizeof(UBXHeader));
+                }
+            }
+            // Process ESF-INS message (Class 0x10, ID 0x15) — compensated vehicle-frame dynamics
+            else if (header.msg_class == 0x10 && header.msg_id == 0x15) {
+                if (header.length >= sizeof(UBXESFINS)) {
+                    process_esf_ins(rx_buffer_.data() + sizeof(UBXHeader));
                 }
             }
             else {
@@ -752,6 +767,85 @@ private:
 
 
     /**
+     * @brief Process ESF-INS message — publish compensated vehicle-frame dynamics
+     *
+     * Angular rates: int32 [deg/s * 1e-3] → rad/s (per-axis validity checked)
+     * Accelerations: int32 [mg]           → m/s² (gravity-free, per-axis validity checked)
+     *
+     * NOTE: Fields are only meaningful when fusionMode == 1 (FUSION).
+     * Publishes gnss/gyro [rad/s] and gnss/accel [m/s²].
+     */
+    void process_esf_ins(const uint8_t* payload)
+    {
+        UBXESFINS ins;
+        std::memcpy(&ins, payload, sizeof(UBXESFINS));
+
+        auto stamp = this->get_clock()->now();
+        constexpr double DEG_S_SCALE = 1e-3 * M_PI / 180.0;  // 0.001 deg/s per LSB → rad/s
+        constexpr double MG_SCALE    = 1e-3 * 9.80665;        // mg → m/s²
+
+        // Angular rates
+        if (ins.bitfield0 & (UBX_ESF_INS_X_ANG_RATE_VALID |
+                             UBX_ESF_INS_Y_ANG_RATE_VALID |
+                             UBX_ESF_INS_Z_ANG_RATE_VALID)) {
+            geometry_msgs::msg::Vector3Stamped gyro_msg;
+            gyro_msg.header.stamp    = stamp;
+            gyro_msg.header.frame_id = "imu";
+            gyro_msg.vector.x = (ins.bitfield0 & UBX_ESF_INS_X_ANG_RATE_VALID)
+                                 ? ins.xAngRate * DEG_S_SCALE : 0.0;
+            gyro_msg.vector.y = (ins.bitfield0 & UBX_ESF_INS_Y_ANG_RATE_VALID)
+                                 ? ins.yAngRate * DEG_S_SCALE : 0.0;
+            gyro_msg.vector.z = (ins.bitfield0 & UBX_ESF_INS_Z_ANG_RATE_VALID)
+                                 ? ins.zAngRate * DEG_S_SCALE : 0.0;
+            gyro_pub_->publish(gyro_msg);
+
+            RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "ESF-INS gyro [deg/s]: x=%.3f y=%.3f z=%.3f",
+                ins.xAngRate * 1e-3, ins.yAngRate * 1e-3, ins.zAngRate * 1e-3);
+        }
+
+        // Accelerations
+        if (ins.bitfield0 & (UBX_ESF_INS_X_ACCEL_VALID |
+                             UBX_ESF_INS_Y_ACCEL_VALID |
+                             UBX_ESF_INS_Z_ACCEL_VALID)) {
+            geometry_msgs::msg::Vector3Stamped accel_msg;
+            accel_msg.header.stamp    = stamp;
+            accel_msg.header.frame_id = "imu";
+            accel_msg.vector.x = (ins.bitfield0 & UBX_ESF_INS_X_ACCEL_VALID)
+                                  ? ins.xAccel * MG_SCALE : 0.0;
+            accel_msg.vector.y = (ins.bitfield0 & UBX_ESF_INS_Y_ACCEL_VALID)
+                                  ? ins.yAccel * MG_SCALE : 0.0;
+            accel_msg.vector.z = (ins.bitfield0 & UBX_ESF_INS_Z_ACCEL_VALID)
+                                  ? ins.zAccel * MG_SCALE : 0.0;
+            accel_pub_->publish(accel_msg);
+        }
+    }
+
+    /**
+     * @brief Send CFG-MSG to enable UBX-ESF-INS and disable UBX-ESF-RAW.
+     *
+     * ESF-INS provides bias-compensated angular rates and accelerations from
+     * the INS fusion engine.  ESF-RAW carries uncompensated sensor data and
+     * is disabled to reduce bandwidth and avoid confusion.
+     */
+    void enable_esf_ins_output()
+    {
+        std::lock_guard<std::mutex> lock(socket_write_mutex_);
+        if (socket_fd_ < 0) return;
+
+        // Enable ESF-INS (0x10 0x15) at nav rate on all interfaces
+        uint8_t cfg_ins[8] = { 0x10, 0x15, 1, 1, 1, 1, 1, 0 };
+        send_ubx_message(0x06, 0x01, cfg_ins, sizeof(cfg_ins));
+
+        // Disable ESF-RAW (0x10 0x03) — noisy, uncompensated, not needed
+        uint8_t cfg_raw[8] = { 0x10, 0x03, 0, 0, 0, 0, 0, 0 };
+        send_ubx_message(0x06, 0x01, cfg_raw, sizeof(cfg_raw));
+
+        RCLCPP_INFO(this->get_logger(),
+            "Sent CFG-MSG: enabled ESF-INS (compensated dynamics), disabled ESF-RAW");
+    }
+
+    /**
      * @brief Dedicated 50 Hz sender thread for UBX-ESF-MEAS
      *
      * Sends at a fixed isochronous 20 ms interval so the u-blox receiver can
@@ -865,6 +959,8 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocity_publisher_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_publisher_;
     rclcpp::Publisher<car_control::msg::EsfStatus>::SharedPtr esf_status_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gyro_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr accel_pub_;
     
     // Reader / sender threads
     std::thread reader_thread_;

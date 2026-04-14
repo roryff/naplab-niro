@@ -91,6 +91,91 @@ struct UBXESFSensor {
 } __attribute__((packed));
 
 /**
+ * UBX ESF-RAW  –  Raw / Compensated IMU Sensor Measurements
+ * Class 0x10, ID 0x03
+ *
+ * Payload layout:
+ *   Bytes 0–3: reserved
+ *   Bytes 4+:  N × 8-byte blocks  { data (4 bytes), sTag (4 bytes) }
+ *
+ * data word encoding:
+ *   bits[31:24] = dataType   (sensor type enum)
+ *   bits[23:0]  = dataField  (24-bit signed value, scale depends on type)
+ *
+ * Relevant dataType values (ZED-F9R):
+ *   14  =  z-axis gyro compensated  [0.001 deg/s per LSB]  ← yaw rate
+ *   13  =  y-axis gyro compensated  [0.001 deg/s per LSB]
+ *   12  =  x-axis gyro compensated  [0.001 deg/s per LSB]
+ */
+#define UBX_ESF_RAW_DATATYPE_GYRO_X  12
+#define UBX_ESF_RAW_DATATYPE_GYRO_Y  13
+#define UBX_ESF_RAW_DATATYPE_GYRO_Z  14
+
+/** Fixed-size header at the start of ESF-RAW payload (4 reserved bytes). */
+struct UBXESFRAWHEADER {
+    uint8_t reserved[4];
+} __attribute__((packed));
+
+/** One sensor measurement block inside ESF-RAW. */
+struct UBXESFRAWSample {
+    uint32_t data;   // bits[31:24]=dataType, bits[23:0]=dataField (24-bit signed)
+    uint32_t sTag;   // sensor time tag [ms]
+} __attribute__((packed));
+
+/** Extract the signed 24-bit dataField from an ESF-RAW data word. */
+inline int32_t ubx_esf_raw_data_field(uint32_t data_word)
+{
+    int32_t val = static_cast<int32_t>(data_word & 0x00FFFFFF);
+    if (val & 0x00800000) val |= static_cast<int32_t>(0xFF000000);
+    return val;
+}
+
+/** Extract the dataType byte (bits[31:24]) from an ESF-RAW data word. */
+inline uint8_t ubx_esf_raw_data_type(uint32_t data_word)
+{
+    return static_cast<uint8_t>((data_word >> 24) & 0xFF);
+}
+
+/**
+ * UBX ESF-INS  –  Vehicle Dynamics (INS)
+ * Class 0x10, ID 0x15
+ *
+ * Outputs bias-compensated angular rates and accelerations from the INS
+ * fusion engine (vehicle-frame for ADR products).
+ *
+ * Angular rates : int32 [deg/s * 1e-3]  →  multiply by 1e-3 * π/180 for rad/s
+ * Accelerations : int32 [mg]            →  multiply by 1e-3 * 9.80665 for m/s²
+ *
+ * Validity flags in bitfield0:
+ *   bit  8 = xAngRateValid
+ *   bit  9 = yAngRateValid
+ *   bit 10 = zAngRateValid
+ *   bit 11 = xAccelValid
+ *   bit 12 = yAccelValid
+ *   bit 13 = zAccelValid
+ *
+ * NOTE: Fields are only valid when fusionMode == 1 (FUSION).
+ */
+struct UBXESFINS {
+    uint32_t bitfield0;     // Version (bits[7:0]) + validity flags (bits[13:8])
+    uint8_t  reserved1[4];
+    uint32_t iTOW;          // GPS time of week [ms]
+    int32_t  xAngRate;      // Compensated x-axis angular rate [deg/s * 1e-3]
+    int32_t  yAngRate;      // Compensated y-axis angular rate [deg/s * 1e-3]
+    int32_t  zAngRate;      // Compensated z-axis angular rate [deg/s * 1e-3]
+    int32_t  xAccel;        // Compensated x-axis acceleration (gravity-free) [mg]
+    int32_t  yAccel;        // Compensated y-axis acceleration (gravity-free) [mg]
+    int32_t  zAccel;        // Compensated z-axis acceleration (gravity-free) [mg]
+} __attribute__((packed));
+
+#define UBX_ESF_INS_X_ANG_RATE_VALID  (1u << 8)
+#define UBX_ESF_INS_Y_ANG_RATE_VALID  (1u << 9)
+#define UBX_ESF_INS_Z_ANG_RATE_VALID  (1u << 10)
+#define UBX_ESF_INS_X_ACCEL_VALID     (1u << 11)
+#define UBX_ESF_INS_Y_ACCEL_VALID     (1u << 12)
+#define UBX_ESF_INS_Z_ACCEL_VALID     (1u << 13)
+
+/**
  * UBX ESF-ALG  –  IMU-mount Auto-alignment Status
  * Class 0x10, ID 0x14
  */
