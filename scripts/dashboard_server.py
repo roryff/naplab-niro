@@ -75,6 +75,7 @@ _state = {
         "/gnss/odometry":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/esf_status":         {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/gyro":               {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/gnss/accel":              {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_follower/cmd_vel":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/cmd_vel":                 {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_visualization":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
@@ -121,6 +122,9 @@ _state = {
         "gyro_x_rads":      0.0,
         "gyro_y_rads":      0.0,
         "gyro_z_rads":      0.0,
+        "accel_x_ms2":      0.0,
+        "accel_y_ms2":      0.0,
+        "accel_z_ms2":      0.0,
     },
 
     # ── ESF calibration ──────────────────────────────────────────────────────
@@ -356,6 +360,7 @@ class DashboardNode(Node):
         self.create_subscription(Odometry,     "/gnss/odometry",   self._cb_odom,     10)
         self.create_subscription(EsfStatus,       "/gnss/esf_status", self._cb_esf,      10)
         self.create_subscription(Vector3Stamped,  "/gnss/gyro",       self._cb_gyro,     10)
+        self.create_subscription(Vector3Stamped,  "/gnss/accel",      self._cb_accel,    10)
 
         # Path-follower topics
         # path_follower/cmd_vel: desired steer angle [rad] + desired speed [m/s]
@@ -438,6 +443,14 @@ class DashboardNode(Node):
             g["gyro_x_rads"] = round(msg.vector.x, 5)
             g["gyro_y_rads"] = round(msg.vector.y, 5)
             g["gyro_z_rads"] = round(msg.vector.z, 5)
+
+    def _cb_accel(self, msg: Vector3Stamped):
+        with _state_lock:
+            _touch_topic("/gnss/accel")
+            g = _state["gnss"]
+            g["accel_x_ms2"] = round(msg.vector.x, 4)
+            g["accel_y_ms2"] = round(msg.vector.y, 4)
+            g["accel_z_ms2"] = round(msg.vector.z, 4)
 
     def _cb_esf(self, msg: EsfStatus):
         with _state_lock:
