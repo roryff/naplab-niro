@@ -653,18 +653,17 @@ private:
         int nz = 0;
         for (int j = 0; j < n; j++) {
             A_p[j] = nz;
-            if (j == 0) {
-                A_x.insert(A_x.end(), {1.0f, -1.0f, 1.0f, -1.0f});
-                A_i.insert(A_i.end(), {0, 1, 2, 3});
-                nz += 4;
-            } else {
-                A_x.push_back(-1.0f); A_i.push_back(4*(j-1));
-                A_x.push_back( 1.0f); A_i.push_back(4*(j-1)+1);
+            // Own rate constraints (rows 4j, 4j+1) and magnitude (rows 4j+2, 4j+3)
                 A_x.push_back( 1.0f); A_i.push_back(4*j);
                 A_x.push_back(-1.0f); A_i.push_back(4*j+1);
                 A_x.push_back( 1.0f); A_i.push_back(4*j+2);
                 A_x.push_back(-1.0f); A_i.push_back(4*j+3);
-                nz += 6;
+            nz += 4;
+            // Couple into next step's rate rows (u_j acts as u_{k-1} for k=j+1)
+            if (j + 1 < n) {
+                A_x.push_back(-1.0f); A_i.push_back(4*(j+1));
+                A_x.push_back( 1.0f); A_i.push_back(4*(j+1)+1);
+                nz += 2;
             }
         }
         A_p[n] = nz;
