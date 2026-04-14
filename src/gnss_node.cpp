@@ -2,6 +2,7 @@
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 #include "car_control/msg/esf_status.hpp"
@@ -105,6 +106,11 @@ public:
 
         // Start reader thread (blocks on socket, publishes immediately on data arrival)
         reader_thread_ = std::thread(&GNSSNode::reader_loop, this);
+
+        // Staleness monitor: warn loudly if NAV-PVT stops arriving (u-blox dropout)
+        stale_check_timer_ = this->create_wall_timer(
+            std::chrono::seconds(2),
+            std::bind(&GNSSNode::stale_check_callback, this));
         
         RCLCPP_INFO(this->get_logger(), "GNSS Node initialized - ADR mode only");
     }
@@ -575,6 +581,10 @@ private:
             fix_status = "UNKNOWN";
         }
         
+        // Update staleness timestamp for the dropout monitor
+        last_navpvt_mono_ns_.store(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+
         RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
             "GNSS: %s | sats=%d | UTM32: E=%.2f N=%.2f z=%.2f | vN=%.2f vE=%.2f vD=%.2f m/s | calibrated=%s",
             fix_status.c_str(), pvt.numSV,
@@ -583,6 +593,37 @@ private:
             calibration_complete_ ? "YES" : "NO");
     }
     
+    /**
+     * @brief Timer callback — logs when NAV-PVT goes stale or recovers.
+     * Runs in the ROS executor thread at 0.5 Hz.
+     */
+    void stale_check_callback()
+    {
+        int64_t last = last_navpvt_mono_ns_.load();
+        if (last == 0) return;  // no data ever received, nothing to warn about yet
+
+        int64_t age_ms = (std::chrono::steady_clock::now().time_since_epoch().count()
+                          - last) / 1'000'000LL;
+        bool is_stale = age_ms > 3000;  // 3 s threshold
+
+        if (is_stale && !navpvt_was_stale_) {
+            navpvt_was_stale_ = true;
+            RCLCPP_ERROR(this->get_logger(),
+                "GNSS DROPOUT — no NAV-PVT for %.1f s. "
+                "u-blox may have left the network (check cable / switch / IP).",
+                age_ms * 1e-3);
+        } else if (is_stale) {
+            // Repeat at WARN level every ~10 s while stale
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                "GNSS still stale — %.1f s since last fix.", age_ms * 1e-3);
+        } else if (!is_stale && navpvt_was_stale_) {
+            navpvt_was_stale_ = false;
+            RCLCPP_INFO(this->get_logger(),
+                "GNSS recovered — NAV-PVT resuming after %.1f s dropout.",
+                age_ms * 1e-3);
+        }
+    }
+
     /** Convert lat/lon to UTM32 (EPSG:25832). Delegates to geo_utils.hpp. */
     void latlon_to_enu(double lat, double lon, double& east, double& north)
     {
@@ -992,6 +1033,11 @@ private:
     bool fusion_disabled_warned_;
     // Heading state
     double last_valid_enu_yaw_  = 0.0;  // ENU yaw [rad], held when headVehValid drops
+
+    // Staleness / dropout monitor
+    rclcpp::TimerBase::SharedPtr stale_check_timer_;
+    std::atomic<int64_t> last_navpvt_mono_ns_{0};  // steady_clock ns of last NAV-PVT
+    bool navpvt_was_stale_ = false;
 };
 
 int main(int argc, char** argv)

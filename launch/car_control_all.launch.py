@@ -140,7 +140,7 @@ def generate_launch_description():
     return LaunchDescription([
         # ---- Control mode ------------------------------------------------------
         DeclareLaunchArgument(
-            'control_mode', default_value='cascade',
+            'control_mode', default_value='unified',
             description=(
                 'Steering control architecture: '
                 '"cascade" = path_follower_node + steering_mpc_node (Option A), '

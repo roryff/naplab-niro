@@ -27,7 +27,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import NavSatFix
-from geometry_msgs.msg import TwistStamped, PoseStamped, Twist
+from geometry_msgs.msg import TwistStamped, PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float64
 from car_control.msg import VehicleState, EsfStatus
