@@ -60,10 +60,10 @@ public:
         latest_state_.lat_active = false;         // bool
         latest_state_.long_active = false;        // bool
         
-        // Timer-based publisher at exactly 100 Hz for smooth, jitter-free output
+        // Timer-based publisher at 50 Hz for smooth, jitter-free output
         // Decouples receiving (minimal latency) from publishing (smooth rate)
         publish_timer_ = this->create_wall_timer(
-            std::chrono::microseconds(10000),  // 100 Hz = 10ms = 10000us
+            std::chrono::microseconds(20000),  // 50 Hz = 20ms = 20000us
             std::bind(&CommaNode::timer_publish_callback, this));
         
         // Start separate send and receive threads
@@ -72,9 +72,9 @@ public:
         
         bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
         if (use_tcp_tunnel) {
-            RCLCPP_INFO(this->get_logger(), "Comma TCP Tunnel Node initialized (listening mode) with 100 Hz timer-based publishing");
+            RCLCPP_INFO(this->get_logger(), "Comma TCP Tunnel Node initialized (listening mode) with 50 Hz timer-based publishing");
         } else {
-            RCLCPP_INFO(this->get_logger(), "Comma ADB Node initialized with 100 Hz timer-based publishing");
+            RCLCPP_INFO(this->get_logger(), "Comma ADB Node initialized with 50 Hz timer-based publishing");
         }
     }
     
@@ -103,8 +103,8 @@ public:
 private:
     void adb_sender_loop()
     {
-        // Send control commands at exactly 100 Hz
-        const auto send_interval = std::chrono::milliseconds(10);
+        // Send control commands at 50 Hz
+        const auto send_interval = std::chrono::milliseconds(20);
         
         while (running_) {
             auto start_time = std::chrono::steady_clock::now();
@@ -116,7 +116,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
             
-            // Maintain precise 100 Hz timing
+            // Maintain precise 50 Hz timing
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             auto sleep_time = send_interval - elapsed;
             if (sleep_time > std::chrono::milliseconds(0) && running_) {
@@ -527,7 +527,7 @@ private:
         }
     }
     
-    // Timer callback - publishes at exactly 100 Hz for smooth, jitter-free output
+    // Timer callback - publishes at 50 Hz for smooth, jitter-free output
     void timer_publish_callback()
     {
         std::lock_guard<std::mutex> lock(sensor_mutex_);
