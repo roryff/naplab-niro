@@ -174,9 +174,91 @@ public:
 
     const std::vector<std::pair<double,double>>& waypoints() const { return wpts_; }
 
+    /**
+     * Savitzky-Golay path smoother.
+     * For each waypoint fits a degree-2 polynomial over all neighbours within
+     * ±(window_m/2) arc-length, then replaces it with p(0) (the constant term).
+     * Arc-lengths are rebuilt afterwards.
+     */
+    void smooth(double window_m)
+    {
+        const int n = static_cast<int>(wpts_.size());
+        if (n < 3) return;
+        const double half = window_m / 2.0;
+
+        std::vector<double> sx(n), sy(n);
+        for (int i = 0; i < n; i++) {
+            const double s0 = s_[i];
+            double ATA[3][3] = {};
+            double ATbx[3]   = {};
+            double ATby[3]   = {};
+
+            for (int j = 0; j < n; j++) {
+                double dt = s_[j] - s0;
+                if (dt < -half || dt > half) continue;
+                double basis[3] = {1.0, dt, dt * dt};
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++)
+                        ATA[r][c] += basis[r] * basis[c];
+                    ATbx[r] += basis[r] * wpts_[j].first;
+                    ATby[r] += basis[r] * wpts_[j].second;
+                }
+            }
+
+            double cx[3] = {}, cy[3] = {};
+            if (!solveNE3(ATA, ATbx, cx) || !solveNE3(ATA, ATby, cy)) {
+                sx[i] = wpts_[i].first;
+                sy[i] = wpts_[i].second;
+            } else {
+                sx[i] = cx[0];
+                sy[i] = cy[0];
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            wpts_[i].first  = sx[i];
+            wpts_[i].second = sy[i];
+        }
+        s_[0] = 0.0;
+        for (int i = 1; i < n; i++) {
+            double dx = wpts_[i].first  - wpts_[i-1].first;
+            double dy = wpts_[i].second - wpts_[i-1].second;
+            s_[i] = s_[i-1] + std::hypot(dx, dy);
+        }
+    }
+
 private:
     std::vector<std::pair<double,double>> wpts_;
     std::vector<double>                   s_;
+
+    /** Solve 3×3 system via Gaussian elimination with partial pivoting. */
+    static bool solveNE3(double A[3][3], const double b[3], double x[3])
+    {
+        double M[3][3], rhs[3];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) M[i][j] = A[i][j];
+            rhs[i] = b[i];
+        }
+        for (int p = 0; p < 3; p++) {
+            int maxR = p;
+            for (int r = p+1; r < 3; r++)
+                if (std::abs(M[r][p]) > std::abs(M[maxR][p])) maxR = r;
+            for (int c = 0; c < 3; c++) std::swap(M[p][c], M[maxR][c]);
+            std::swap(rhs[p], rhs[maxR]);
+            if (std::abs(M[p][p]) < 1e-12) return false;
+            for (int r = p+1; r < 3; r++) {
+                double f = M[r][p] / M[p][p];
+                for (int c = p; c < 3; c++) M[r][c] -= f * M[p][c];
+                rhs[r] -= f * rhs[p];
+            }
+        }
+        for (int i = 2; i >= 0; i--) {
+            x[i] = rhs[i];
+            for (int j = i+1; j < 3; j++) x[i] -= M[i][j] * x[j];
+            x[i] /= M[i][i];
+        }
+        return true;
+    }
 
     std::pair<double,double> interp(double s) const
     {
@@ -654,10 +736,10 @@ private:
         for (int j = 0; j < n; j++) {
             A_p[j] = nz;
             // Own rate constraints (rows 4j, 4j+1) and magnitude (rows 4j+2, 4j+3)
-                A_x.push_back( 1.0f); A_i.push_back(4*j);
-                A_x.push_back(-1.0f); A_i.push_back(4*j+1);
-                A_x.push_back( 1.0f); A_i.push_back(4*j+2);
-                A_x.push_back(-1.0f); A_i.push_back(4*j+3);
+            A_x.push_back( 1.0f); A_i.push_back(4*j);
+            A_x.push_back(-1.0f); A_i.push_back(4*j+1);
+            A_x.push_back( 1.0f); A_i.push_back(4*j+2);
+            A_x.push_back(-1.0f); A_i.push_back(4*j+3);
             nz += 4;
             // Couple into next step's rate rows (u_j acts as u_{k-1} for k=j+1)
             if (j + 1 < n) {
@@ -749,8 +831,9 @@ private:
             path_.addWaypoint(x, last_y * taper);
         }
 
+        path_.smooth(5.0);
         RCLCPP_INFO(get_logger(),
-            "Sinusoidal path created: %.1f m total, %d waypoints.",
+            "Sinusoidal path created: %.1f m total, %d waypoints (SG-smoothed 5 m).",
             path_.totalLength(), n_tot + 1);
     }
 
@@ -787,8 +870,9 @@ private:
             return;
         }
 
+        path_.smooth(5.0);
         RCLCPP_INFO(get_logger(),
-            "Loaded path from '%s': %d waypoints, %.1f m total.",
+            "Loaded path from '%s': %d waypoints, %.1f m total (SG-smoothed 5 m).",
             filename.c_str(), count, path_.totalLength());
     }
 
