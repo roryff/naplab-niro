@@ -1,0 +1,11 @@
+lateral_mpc_node:
+  ros__parameters:
+    # path_csv_file and desired_speed_mps are supplied at launch time
+    auto_enable: false
+    horizon: 40
+    tau_r:   0.78
+    gain_r:  36.0
+    # Cost weights
+    weight_cte:    20.0
+    weight_psi:    3.0
+    weight_torque: 0.01

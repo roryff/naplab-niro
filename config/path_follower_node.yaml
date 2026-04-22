@@ -1,0 +1,4 @@
+path_follower_node:
+  ros__parameters:
+    # path_csv_file and desired_speed_mps are supplied at launch time
+    auto_enable: true

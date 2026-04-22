@@ -46,7 +46,7 @@ public:
         send_sequence_ = 0;
         
         // Initialize sensor state
-        has_new_data_ = false;
+        ever_received_ = false;
         latest_state_.timestamp = 0;           // int64 nanoseconds
         latest_state_.v_ego = 0.0f;           // float32
         latest_state_.steering_angle_deg = 0.0f;  // float32
@@ -475,7 +475,7 @@ private:
             }
             
             if (updated) {
-                has_new_data_ = true;
+                ever_received_ = true;
             }
             
         } else if (msg_type == "pong") {
@@ -532,15 +532,14 @@ private:
     {
         std::lock_guard<std::mutex> lock(sensor_mutex_);
         
-        if (!has_new_data_) {
-            // No new data since last publish - skip
+        if (!ever_received_) {
+            // Haven't received any data from comma yet - don't publish zeros
             return;
         }
         
-        // Publish unified vehicle state
+        // Always publish latest state at steady 50 Hz (even if data unchanged since last tick)
+        // This keeps the dashboard Hz counter accurate and matches behaviour of all other nodes
         speed_publisher_->publish(latest_state_);
-        
-        has_new_data_ = false;  // Mark as published
         
         RCLCPP_DEBUG(this->get_logger(),
             "Published state: speed=%.2f km/h, steering=%.2f deg, ts=%ld ns",
@@ -565,7 +564,7 @@ private:
     
     // Latest sensor state (received data, published by timer)
     std::mutex sensor_mutex_;
-    bool has_new_data_;
+    bool ever_received_;  // true once first sensor message parsed; prevents publishing zero-state
     car_control::msg::VehicleState latest_state_;
     
     // Receive buffer for incomplete messages

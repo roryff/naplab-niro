@@ -163,14 +163,16 @@ private:
             read_gnss_data();
 
             // If read_gnss_data() closed the socket (error / remote close),
-            // wait before reconnecting.  Rapid SYN storms can exhaust the
-            // u-blox's tiny TCP connection table and crash its NIC driver,
-            // making the device completely unreachable until the cable is
-            // replugged.
+            // wait before reconnecting.  The C103's sp_l2sw ethernet driver can
+            // lock up under sustained SYN load; exponential backoff keeps the
+            // retry rate low during an extended outage while still recovering
+            // quickly after a brief glitch.
             if (socket_fd_ < 0 && running_) {
-                for (int i = 0; i < 20 && running_; i++) {  // ~2 s back-off
+                int steps = reconnect_backoff_s_ * 10;  // 100 ms granularity
+                for (int i = 0; i < steps && running_; i++) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
+                reconnect_backoff_s_ = std::min(reconnect_backoff_s_ * 2, 30);
             }
         }
     }
@@ -308,6 +310,7 @@ private:
             socket_fd_ = new_fd;
         }
 
+        reconnect_backoff_s_ = 2;  // reset exponential backoff on success
         RCLCPP_INFO(this->get_logger(), "Connected to u-blox receiver at %s:%d",
             host.c_str(), port);
     }
@@ -338,9 +341,15 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Socket read error: %s - reconnecting...",
                 strerror(errno));
             // Close under the mutex so the sender never uses a dead fd.
+            // Use SO_LINGER with l_linger=0 to send RST instead of FIN: this
+            // immediately clears the TCP entry on the u-blox side so a fresh
+            // connection is accepted right away instead of waiting for its
+            // TIME_WAIT to expire.
             {
                 std::lock_guard<std::mutex> lock(socket_write_mutex_);
                 if (socket_fd_ == fd) {   // guard against concurrent reconnect
+                    struct linger rst = {1, 0};
+                    setsockopt(socket_fd_, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
                     close(socket_fd_);
                     socket_fd_ = -1;
                 }
@@ -354,6 +363,8 @@ private:
             {
                 std::lock_guard<std::mutex> lock(socket_write_mutex_);
                 if (socket_fd_ == fd) {
+                    struct linger rst = {1, 0};
+                    setsockopt(socket_fd_, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
                     close(socket_fd_);
                     socket_fd_ = -1;
                 }
@@ -899,7 +910,7 @@ private:
         auto next = steady_clock::now();
 
         while (running_) {
-            next += milliseconds(20);  // 50 Hz
+            next += milliseconds(100);  // 10 Hz — u-blox recommended wheel-speed input rate
             std::this_thread::sleep_until(next);
 
             if (!running_) break;  // check after waking so we don't send on a closing socket
@@ -1010,6 +1021,7 @@ private:
     
     // TCP connection
     int socket_fd_;
+    int reconnect_backoff_s_{2};  // exponential backoff: 2→4→8→16→30s, reset on connect
     std::vector<uint8_t> rx_buffer_;
     
     // Origin for local coordinate conversion

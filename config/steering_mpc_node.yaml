@@ -1,0 +1,9 @@
+steering_mpc_node:
+  ros__parameters:
+    # desired_speed_mps is supplied at launch time
+    # Leave model_config_path empty to use the bundled integrator_model.yaml
+    model_config_path: ""
+    dt:     0.05
+    horizon: 40
+    tau_r:   0.78
+    gain_r:  36.0

@@ -1,0 +1,7 @@
+comma_node:
+  ros__parameters:
+    # Set true to accept the comma device over TCP; false to use ADB
+    use_tcp_tunnel:  true
+    tcp_listen_port: 3000
+    adb_host:        "127.0.0.1"
+    adb_port:        5555
