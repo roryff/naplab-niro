@@ -70,6 +70,13 @@ struct IntegratorParams {
   double G0 = 0.0;
   double va = 0.0;
   double vb = 0.0;
+  // SchedFO2 mode: 1-state first-order model θ[k+1] = ad*θ[k] + K_ss*(1-ad)*u[k]
+  // with τ_r(v) and K_ss(v) looked up from piecewise-linear schedule.
+  // Active when use_sched_fo2=true and sched_v_kmh is non-empty.
+  bool use_sched_fo2 = false;
+  std::vector<double> sched_v_kmh;
+  std::vector<double> sched_tau_r;
+  std::vector<double> sched_kss;
 };
 
 struct ControllerParams {
@@ -82,6 +89,31 @@ struct ControllerParams {
   double weight_torque = kDefaultWeightTorque;
   double lookahead_s = kDefaultLookaheadS;
 };
+
+// Parse a space-separated list of doubles from a string.
+static std::vector<double> parseDoubleArray(const std::string& s) {
+  std::vector<double> out;
+  std::istringstream iss(s);
+  double d;
+  while (iss >> d) out.push_back(d);
+  return out;
+}
+
+// Piecewise-linear interpolation with clamping. floor_val clips the lower bound.
+static double schedInterp(const std::vector<double>& xs,
+                          const std::vector<double>& ys,
+                          double x, double floor_val = 0.0) {
+  if (xs.empty()) return floor_val;
+  if (x <= xs.front()) return std::max(floor_val, ys.front());
+  if (x >= xs.back())  return std::max(floor_val, ys.back());
+  for (size_t i = 1; i < xs.size(); ++i) {
+    if (x < xs[i]) {
+      double t = (x - xs[i-1]) / (xs[i] - xs[i-1]);
+      return std::max(floor_val, ys[i-1] + t * (ys[i] - ys[i-1]));
+    }
+  }
+  return std::max(floor_val, ys.back());
+}
 
 // Simple YAML parser for "key: value" lines (no nesting).
 bool loadConfig(const std::string& path, IntegratorParams& ip, ControllerParams& cp) {
@@ -111,6 +143,10 @@ bool loadConfig(const std::string& path, IntegratorParams& ip, ControllerParams&
     else if (key == "G0") ip.G0 = std::stod(val);
     else if (key == "va") ip.va = std::stod(val);
     else if (key == "vb") ip.vb = std::stod(val);
+    else if (key == "use_sched_fo2") ip.use_sched_fo2 = std::stoi(val) != 0;
+    else if (key == "sched_v_kmh")   ip.sched_v_kmh = parseDoubleArray(val);
+    else if (key == "sched_tau_r")   ip.sched_tau_r = parseDoubleArray(val);
+    else if (key == "sched_kss")     ip.sched_kss   = parseDoubleArray(val);
     else if (key == "dt") cp.dt = std::stod(val);
     else if (key == "horizon") cp.horizon = std::stoi(val);
     else if (key == "rate_up") cp.rate_up = std::stod(val);
@@ -330,30 +366,15 @@ class SteeringMpcNode : public rclcpp::Node {
     if (n < 1) return u_prev;
 
     const double dt = ctrl_.dt;
-    const double tau_r = integrator_.tau_r;
-    // Speed-dependent gain: use G0/(va*v^2+vb*v+1) if G0>0, else constant gain_r.
-    const double v = vehicle_speed_mps;
-    const double gain_r = (integrator_.G0 > 0.0)
-        ? integrator_.G0 / (integrator_.va * v * v + integrator_.vb * v + 1.0)
-        : integrator_.gain_r;
-    const double leak = integrator_.leak;
-    const double alpha = dt / (tau_r + dt);
-    const double a_rate = 1.0 - alpha;
-    const double b_rate = alpha * gain_r;
-    const double a_angle = 1.0 - dt * leak;
-    const double b_angle = dt;
+    const double v  = vehicle_speed_mps;
     const double wa = ctrl_.weight_angle;
     const double wt = ctrl_.weight_torque;
-    const double rate_up = ctrl_.rate_up;
+    const double rate_up   = ctrl_.rate_up;
     const double rate_down = ctrl_.rate_down;
-    const double tlim = ctrl_.torque_limit;
+    const double tlim      = ctrl_.torque_limit;
 
-    // Cost = 0.5 x' P x + q' x, x = [U_0 .. U_{n-1}]. Match Python: angle_{k+1} = a_angle*angle_k + b_angle*rate_{k+1}, rate_{k+1} = a_rate*rate_k + b_rate*U_k.
-    // Track constant term and gradient: angle_pred = c_ang + G_ang'*U, rate_pred = c_rate + G_rate'*U.
-    double c_ang = angle_deg;
-    double c_rate = rate_deg_s;
-    std::vector<double> G_ang(n, 0.0), G_rate(n, 0.0);
-
+    // QP cost matrices (lower-triangular CSC for OSQP).
+    // Cost = 0.5 x'Px + q'x, x = [U_0 .. U_{n-1}].
     const int P_nz = n * (n + 1) / 2;
     std::vector<OSQPFloat> P_x(P_nz, 0.0);
     std::vector<OSQPInt>   P_i(P_nz, 0);
@@ -361,31 +382,82 @@ class SteeringMpcNode : public rclcpp::Node {
     for (int j = 0; j < n; j++) P_p[j + 1] = P_p[j] + (j + 1);
     std::vector<OSQPFloat> q(n, 0.0);
 
-    const bool use_traj = (!ref_traj.empty() && (int)ref_traj.size() >= n);
-    for (int k = 0; k < n; k++) {
-      double c_rate_new = a_rate * c_rate;
-      std::vector<double> G_rate_new(n, 0.0);
-      for (int j = 0; j < n; j++)
-        G_rate_new[j] = a_rate * G_rate[j] + (j == k ? b_rate : 0.0);
+    const bool use_traj  = (!ref_traj.empty() && (int)ref_traj.size() >= n);
+    const bool use_fo2   = integrator_.use_sched_fo2 && !integrator_.sched_v_kmh.empty();
 
-      double c_ang_new = a_angle * c_ang + b_angle * c_rate_new;
-      std::vector<double> G_ang_new(n, 0.0);
-      for (int j = 0; j < n; j++)
-        G_ang_new[j] = a_angle * G_ang[j] + b_angle * G_rate_new[j];
+    if (use_fo2) {
+      // --- SchedFO2: 1-state model θ[k+1] = ad·θ[k] + bd·u[k] ---
+      // τ_r(v) and K_ss(v) from piecewise-linear schedule (speed in km/h).
+      const double v_kmh = v * 3.6;
+      const double tau_v = schedInterp(integrator_.sched_v_kmh, integrator_.sched_tau_r, v_kmh, 0.05);
+      const double kss_v = schedInterp(integrator_.sched_v_kmh, integrator_.sched_kss,   v_kmh, 1.0);
+      const double ad = std::exp(-dt / tau_v);
+      const double bd = kss_v * (1.0 - ad);
 
-      c_ang = c_ang_new;
-      c_rate = c_rate_new;
-      G_ang = G_ang_new;
-      G_rate = G_rate_new;
+      double c_ang = angle_deg;
+      std::vector<double> G_ang(n, 0.0);
 
-      double ref_k = use_traj ? ref_traj[k] : desired_angle;
-      double d = c_ang - ref_k;
-      for (int j = 0; j < n; j++)
-        q[j] += 2.0 * wa * d * G_ang[j];
-      for (int i = 0; i < n; i++)
-        for (int j = i; j < n; j++)
-          P_x[P_p[j] + i] += 2.0 * wa * G_ang[i] * G_ang[j];
-      P_x[P_p[k] + k] += 2.0 * wt;
+      for (int k = 0; k < n; k++) {
+        double c_ang_new = ad * c_ang;
+        std::vector<double> G_ang_new(n, 0.0);
+        for (int j = 0; j < n; j++)
+          G_ang_new[j] = ad * G_ang[j] + (j == k ? bd : 0.0);
+        c_ang = c_ang_new;
+        G_ang = G_ang_new;
+
+        double ref_k = use_traj ? ref_traj[k] : desired_angle;
+        double d = c_ang - ref_k;
+        for (int j = 0; j < n; j++)
+          q[j] += 2.0 * wa * d * G_ang[j];
+        for (int i = 0; i < n; i++)
+          for (int j = i; j < n; j++)
+            P_x[P_p[j] + i] += 2.0 * wa * G_ang[i] * G_ang[j];
+        P_x[P_p[k] + k] += 2.0 * wt;
+      }
+    } else {
+      // --- Legacy 2-state rate-integrator model ---
+      // rate[k+1] = a_rate·rate[k] + b_rate·u[k]
+      // angle[k+1] = a_angle·angle[k] + b_angle·rate[k+1]
+      const double tau_r = integrator_.tau_r;
+      const double gain_r = (integrator_.G0 > 0.0)
+          ? integrator_.G0 / (integrator_.va * v * v + integrator_.vb * v + 1.0)
+          : integrator_.gain_r;
+      const double leak   = integrator_.leak;
+      const double alpha  = dt / (tau_r + dt);
+      const double a_rate  = 1.0 - alpha;
+      const double b_rate  = alpha * gain_r;
+      const double a_angle = 1.0 - dt * leak;
+      const double b_angle = dt;
+
+      double c_ang  = angle_deg;
+      double c_rate = rate_deg_s;
+      std::vector<double> G_ang(n, 0.0), G_rate(n, 0.0);
+
+      for (int k = 0; k < n; k++) {
+        double c_rate_new = a_rate * c_rate;
+        std::vector<double> G_rate_new(n, 0.0);
+        for (int j = 0; j < n; j++)
+          G_rate_new[j] = a_rate * G_rate[j] + (j == k ? b_rate : 0.0);
+
+        double c_ang_new = a_angle * c_ang + b_angle * c_rate_new;
+        std::vector<double> G_ang_new(n, 0.0);
+        for (int j = 0; j < n; j++)
+          G_ang_new[j] = a_angle * G_ang[j] + b_angle * G_rate_new[j];
+
+        c_ang  = c_ang_new;
+        c_rate = c_rate_new;
+        G_ang  = G_ang_new;
+        G_rate = G_rate_new;
+
+        double ref_k = use_traj ? ref_traj[k] : desired_angle;
+        double d = c_ang - ref_k;
+        for (int j = 0; j < n; j++)
+          q[j] += 2.0 * wa * d * G_ang[j];
+        for (int i = 0; i < n; i++)
+          for (int j = i; j < n; j++)
+            P_x[P_p[j] + i] += 2.0 * wa * G_ang[i] * G_ang[j];
+        P_x[P_p[k] + k] += 2.0 * wt;
+      }
     }
 
     for (int j = 0; j < n; j++)

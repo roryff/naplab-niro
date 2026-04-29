@@ -72,7 +72,10 @@ def launch_setup(context, *args, **kwargs):
             output='screen',
             parameters=[
                 cfg('steering_mpc_node.yaml'),
-                {'desired_speed_mps': float(desired_speed)},
+                {
+                    'desired_speed_mps': float(desired_speed),
+                    'model_config_path': cfg('sched_fo2_model.yaml'),
+                },
             ],
         ))
 
