@@ -6,7 +6,7 @@
  * performs path following and steering torque control in one OSQP optimisation.
  *
  * 4-state model per step k: [CTE_k, dPsi_k, delta_k, dRate_k]
- *   CTE   — cross-track error [m]  (positive = car left of path)
+ *   CTE   — cross-track error [m]  (positive = car right of path)
  *   dPsi  — heading error [rad]    (positive = car pointing right of path)
  *   delta — front-axle steer [rad]
  *   dRate — steering rate [rad/s]
@@ -46,6 +46,36 @@
 #include <sstream>
 #include <vector>
 #include <deque>
+
+// ============================================================
+// sched_fo2 helpers (piecewise-linear interpolation)
+// ============================================================
+
+static std::vector<double> parseDoubleArray(const std::string& s)
+{
+    std::vector<double> out;
+    std::istringstream iss(s);
+    double d;
+    while (iss >> d) out.push_back(d);
+    return out;
+}
+
+// Piecewise-linear interpolation with clamping at endpoints.
+static double schedInterp(const std::vector<double>& xs,
+                          const std::vector<double>& ys,
+                          double x, double floor_val = 0.0)
+{
+    if (xs.empty()) return floor_val;
+    if (x <= xs.front()) return std::max(floor_val, ys.front());
+    if (x >= xs.back())  return std::max(floor_val, ys.back());
+    for (size_t i = 1; i < xs.size(); ++i) {
+        if (x < xs[i]) {
+            double t = (x - xs[i-1]) / (xs[i] - xs[i-1]);
+            return std::max(floor_val, ys[i-1] + t*(ys[i] - ys[i-1]));
+        }
+    }
+    return std::max(floor_val, ys.back());
+}
 
 // ============================================================
 // Vehicle & control constants
@@ -311,8 +341,16 @@ public:
         declare_parameter("kp_speed",          0.3);
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
+        declare_parameter<std::string>("sched_fo2_model_path", "");
+        declare_parameter("weight_delta", 0.0);  // delta reference tracking weight; 0=disabled
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
+
+        // ---- Load sched_fo2 model (if path provided) ---------------------------
+        std::string sfo2_path = get_parameter("sched_fo2_model_path").as_string();
+        if (!sfo2_path.empty()) {
+            loadSchedFo2(sfo2_path);
+        }
 
         // ---- Subscriptions -----------------------------------------------------
         gnss_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -565,16 +603,6 @@ private:
             pub_pf_cmd_vel_->publish(pf_cmd);
         }
 
-        // Dashboard-compatible topics (mirror cascade node interface)
-        pub_lateral_error_->publish(f64(cte));
-        pub_heading_error_->publish(f64(dpsi));   // [rad] – dashboard calls math.degrees()
-        {
-            geometry_msgs::msg::Twist pf_cmd;
-            pf_cmd.linear.x  = desired_speed;
-            pf_cmd.angular.z = desired_delta_rad;  // front-axle [rad]
-            pub_pf_cmd_vel_->publish(pf_cmd);
-        }
-
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | dPsi=%.2f° | "
             "delta=%.2f° | torque=%.3f | v=%.2f m/s",
@@ -596,7 +624,7 @@ private:
     // Dynamics (linearised, front-axle rad units):
     //   dRate_{k+1} = a_rate * dRate_k + b_rate * u_k
     //   delta_{k+1} = delta_k + dt * dRate_{k+1}
-    //   dPsi_{k+1}  = dPsi_k  + (v * delta_k / L - kappa_k * v) * dt
+    //   dPsi_{k+1}  = dPsi_k  − (v * delta_k / L - kappa_k * v) * dt
     //   CTE_{k+1}   = CTE_k   + v * dPsi_k * dt
     //
     // Propagation: each state = constant + G·U  (linear in U)
@@ -609,23 +637,39 @@ private:
         if (n < 1) return u_prev_;
 
         const double dt        = DT;
-        const double tau_r     = get_parameter("tau_r").as_double();
-        const double gain_r    = get_parameter("gain_r").as_double();
         const double w_cte     = get_parameter("weight_cte").as_double();
         const double w_psi     = get_parameter("weight_psi").as_double();
         const double w_t       = get_parameter("weight_torque").as_double();
+        const double w_d       = get_parameter("weight_delta").as_double();
         const double rate_up   = get_parameter("rate_up").as_double();
         const double rate_down = get_parameter("rate_down").as_double();
         const double tlim      = get_parameter("torque_limit").as_double();
 
-        // Actuator dynamics coefficients (front-axle rad units)
-        const double alpha      = dt / (tau_r + dt);
-        const double a_rate     = 1.0 - alpha;
-        // gain_r: 36 sw-deg/s/unit → rad/s/unit at front axle
-        const double gain_r_rad = gain_r * (M_PI / 180.0) / STEERING_RATIO;
-        const double b_rate     = alpha * gain_r_rad;
-
         const double v_eff = std::max(0.5, v);  // guard against division by zero at low speed
+        const double v_kmh = v * 3.6;
+
+        // ---- Actuator model coefficients ----------------------------------------
+        // sched_fo2 (1-state): delta[k+1] = ad*delta[k] + bd*u[k]
+        // Legacy 2-state:      dRate[k+1] = a_rate*dRate[k] + b_rate*u[k]
+        //                      delta[k+1] = delta[k] + dt*dRate[k+1]
+        double ad = 0.0, bd = 0.0;
+        double a_rate = 0.0, b_rate = 0.0;
+        if (use_sched_fo2_) {
+            const double tau_v  = schedInterp(sched_v_kmh_, sched_tau_r_, v_kmh, 0.05);
+            const double kss_v  = schedInterp(sched_v_kmh_, sched_kss_,   v_kmh, 1.0);
+            // Convert K_ss from [sw-deg/torque] to [front-axle rad/torque]
+            const double kss_rad = kss_v * (M_PI / 180.0) / STEERING_RATIO;
+            ad = std::exp(-dt / tau_v);
+            bd = kss_rad * (1.0 - ad);
+        } else {
+            const double tau_r     = get_parameter("tau_r").as_double();
+            const double gain_r    = get_parameter("gain_r").as_double();
+            const double alpha     = dt / (tau_r + dt);
+            a_rate = 1.0 - alpha;
+            // gain_r: 36 sw-deg/s/unit → rad/s/unit at front axle
+            const double gain_r_rad = gain_r * (M_PI / 180.0) / STEERING_RATIO;
+            b_rate = alpha * gain_r_rad;
+        }
 
         // ---- Build QP cost matrices (upper-triangular P, gradient q) --------
         const int P_nz = n * (n + 1) / 2;
@@ -641,12 +685,12 @@ private:
                 P_i[P_p[j] + i] = i;
 
         // ---- State propagation: x_{k+1} = c_{k+1} + G_{k+1} · U -----------
-        double c_rate  = drate0;
+        double c_rate  = drate0;  // only used by legacy 2-state model
         double c_delta = delta0;
         double c_psi   = dpsi0;
         double c_cte   = cte0;
 
-        std::vector<double> G_rate (n, 0.0);
+        std::vector<double> G_rate (n, 0.0);  // only used by legacy 2-state model
         std::vector<double> G_delta(n, 0.0);
         std::vector<double> G_psi  (n, 0.0);
         std::vector<double> G_cte  (n, 0.0);
@@ -656,17 +700,27 @@ private:
             double s_k   = std::min(s_front + k * dt * v_eff, path_.totalLength());
             double kappa = path_.curvature(s_k);
 
-            // dRate_{k+1} = a_rate * dRate_k + b_rate * u_k
-            double c_rate_new = a_rate * c_rate;
-            std::vector<double> G_rate_new(n, 0.0);
-            for (int j = 0; j < n; j++)
-                G_rate_new[j] = a_rate * G_rate[j] + (j == k ? b_rate : 0.0);
-
-            // delta_{k+1} = delta_k + dt * dRate_{k+1}
-            double c_delta_new = c_delta + dt * c_rate_new;
+            // ---- Actuator model: compute delta_{k+1} ----------------------------
+            double c_delta_new;
             std::vector<double> G_delta_new(n, 0.0);
-            for (int j = 0; j < n; j++)
-                G_delta_new[j] = G_delta[j] + dt * G_rate_new[j];
+            if (use_sched_fo2_) {
+                // 1-state FOH: delta[k+1] = ad*delta[k] + bd*u[k]
+                c_delta_new = ad * c_delta;
+                for (int j = 0; j < n; j++)
+                    G_delta_new[j] = ad * G_delta[j] + (j == k ? bd : 0.0);
+            } else {
+                // dRate_{k+1} = a_rate * dRate_k + b_rate * u_k
+                double c_rate_new = a_rate * c_rate;
+                std::vector<double> G_rate_new(n, 0.0);
+                for (int j = 0; j < n; j++)
+                    G_rate_new[j] = a_rate * G_rate[j] + (j == k ? b_rate : 0.0);
+                // delta_{k+1} = delta_k + dt * dRate_{k+1}
+                c_delta_new = c_delta + dt * c_rate_new;
+                for (int j = 0; j < n; j++)
+                    G_delta_new[j] = G_delta[j] + dt * G_rate_new[j];
+                c_rate = c_rate_new;
+                G_rate = G_rate_new;
+            }
 
             // dPsi_{k+1} = dPsi_k - (v * delta_k / L - kappa_k * v) * dt
             // Positive steer left increases car heading, decreasing dPsi = path_heading - car_heading
@@ -683,7 +737,6 @@ private:
                 G_cte_new[j] = G_cte[j] + v_eff * dt * G_psi[j];
 
             // Advance state
-            c_rate  = c_rate_new;   G_rate  = G_rate_new;
             c_delta = c_delta_new;  G_delta = G_delta_new;
             c_psi   = c_psi_new;    G_psi   = G_psi_new;
             c_cte   = c_cte_new;    G_cte   = G_cte_new;
@@ -702,6 +755,19 @@ private:
                 q_vec[j] += static_cast<OSQPFloat>(
                     2.0 * w_cte * c_cte * G_cte[j] +
                     2.0 * w_psi * c_psi * G_psi[j]);
+            }
+
+            // Delta reference tracking cost: w_d * (delta_{k+1} - kappa_{k+1}*L)^2
+            // Guides MPC to reach the curvature-required steer angle, preventing pre-steer.
+            if (w_d > 0.0) {
+                double s_next = std::min(s_front + (k + 1) * dt * v_eff, path_.totalLength());
+                double delta_ref = path_.curvature(s_next) * WHEELBASE;
+                double d = c_delta - delta_ref;
+                for (int i = 0; i < n; i++)
+                    for (int j = i; j < n; j++)
+                        P_x[P_p[j] + i] += static_cast<OSQPFloat>(2.0 * w_d * G_delta[i] * G_delta[j]);
+                for (int j = 0; j < n; j++)
+                    q_vec[j] += static_cast<OSQPFloat>(2.0 * w_d * d * G_delta[j]);
             }
 
             // Torque regularisation for u_k: ∂²J/∂U_k² += 2*w_t
@@ -877,6 +943,57 @@ private:
     }
 
     // =========================================================================
+    // sched_fo2 loader
+    // =========================================================================
+
+    void loadSchedFo2(const std::string& path)
+    {
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            RCLCPP_ERROR(get_logger(), "Cannot open sched_fo2 model: %s", path.c_str());
+            return;
+        }
+        bool found_use = false;
+        std::string line;
+        while (std::getline(f, line)) {
+            auto pos = line.find('#');
+            if (pos != std::string::npos) line = line.substr(0, pos);
+            pos = line.find(':');
+            if (pos == std::string::npos) continue;
+            std::string key = line.substr(0, pos);
+            std::string val = line.substr(pos + 1);
+            auto trim = [](std::string& s) {
+                size_t i = 0;
+                while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+                s = s.substr(i);
+                while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            };
+            trim(key); trim(val);
+            if (key == "use_sched_fo2") {
+                use_sched_fo2_ = std::stoi(val) != 0;
+                found_use = true;
+            } else if (key == "sched_v_kmh") {
+                sched_v_kmh_ = parseDoubleArray(val);
+            } else if (key == "sched_tau_r") {
+                sched_tau_r_ = parseDoubleArray(val);
+            } else if (key == "sched_kss") {
+                sched_kss_ = parseDoubleArray(val);
+            }
+        }
+        if (!found_use) use_sched_fo2_ = !sched_v_kmh_.empty();
+        if (use_sched_fo2_) {
+            RCLCPP_INFO(get_logger(),
+                "sched_fo2 actuator model loaded from %s  (%zu breakpoints, tau_r %.2f..%.2f s)",
+                path.c_str(), sched_v_kmh_.size(),
+                sched_tau_r_.empty() ? 0.0 : sched_tau_r_.front(),
+                sched_tau_r_.empty() ? 0.0 : sched_tau_r_.back());
+        } else {
+            RCLCPP_WARN(get_logger(),
+                "sched_fo2 file loaded but use_sched_fo2=0 — using legacy 2-state model.");
+        }
+    }
+
+    // =========================================================================
     // Publish helpers
     // =========================================================================
 
@@ -954,6 +1071,12 @@ private:
     // MPC state
     double u_prev_ = 0.0;
     int    N_      = 40;
+
+    // sched_fo2 actuator model (loaded from sched_fo2_model_path if provided)
+    bool use_sched_fo2_ = false;
+    std::vector<double> sched_v_kmh_;
+    std::vector<double> sched_tau_r_;
+    std::vector<double> sched_kss_;
 
     // Path
     Path   path_;

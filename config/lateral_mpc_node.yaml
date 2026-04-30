@@ -9,3 +9,6 @@ lateral_mpc_node:
     weight_cte:    20.0
     weight_psi:    3.0
     weight_torque: 0.01
+    weight_delta:  0.0   # delta reference tracking weight; 0.0 = disabled
+    # Sched_fo2 actuator model path (empty = use fixed tau_r/gain_r above)
+    sched_fo2_model_path: ""
