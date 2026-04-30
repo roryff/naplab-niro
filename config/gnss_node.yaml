@@ -1,6 +1,6 @@
 gnss_node:
   ros__parameters:
-    host: '192.168.2.127'
+    host: '192.168.2.126'
     port: 7799
     auto_set_origin: false
     # ENU origin — shared across all drives so coordinates are consistent
