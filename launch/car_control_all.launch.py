@@ -6,6 +6,14 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch_ros.substitutions import FindPackageShare
 
 
+def gstreamer_pipeline(multicast_ip, port=10030):
+    """Build GStreamer pipeline for UDP multicast HEVC stream."""
+    return (
+        f"udpsrc uri=udp://{multicast_ip}:{port} buffer-size=4194304 ! "
+        "rtph265depay ! h265parse ! avdec_hevc ! videoconvert ! appsink"
+    )
+
+
 def launch_setup(context, *args, **kwargs):
     from launch.substitutions import LaunchConfiguration
     pkg_share = FindPackageShare('car_control').perform(context)
@@ -13,6 +21,7 @@ def launch_setup(context, *args, **kwargs):
     control_mode  = LaunchConfiguration('control_mode').perform(context)
     path_csv_file = LaunchConfiguration('path_csv_file').perform(context)
     desired_speed = LaunchConfiguration('desired_speed_mps').perform(context)
+    enable_cameras = LaunchConfiguration('enable_cameras').perform(context)
 
     # Default path to bundled path.csv when none supplied
     if not path_csv_file:
@@ -103,6 +112,36 @@ def launch_setup(context, *args, **kwargs):
         raise RuntimeError(
             f"Unknown control_mode '{control_mode}'. Use 'cascade' or 'unified'.")
 
+    # ---- camera nodes (conditional) -----------------------------------------------
+    if enable_cameras.lower() == 'true':
+        # Camera definitions: (name, multicast_ip, frame_id, topic)
+        cameras = [
+            ('front', '239.10.0.1', 'camera_front', 'cameras/front/compressed'),
+            ('right', '239.10.0.2', 'camera_right', 'cameras/right/compressed'),
+            ('rear',  '239.10.0.3', 'camera_rear',  'cameras/rear/compressed'),
+            ('left',  '239.10.0.4', 'camera_left',  'cameras/left/compressed'),
+        ]
+        
+        for name, multicast_ip, frame_id, topic in cameras:
+            pipeline_uri = gstreamer_pipeline(multicast_ip)
+            
+            nodes.append(Node(
+                package='gscam2',
+                executable='gscam2_node',
+                name=f'gscam2_{name}',
+                output='screen',
+                parameters=[{
+                    'gscam_config': pipeline_uri,
+                    'frame_id': frame_id,
+                    'use_gst_timestamps': True,
+                    'sync': False,
+                    'drop': True,
+                }],
+                remappings=[
+                    ('image_raw', topic),
+                ],
+            ))
+
     # ---- dashboard_server (always) ---------------------------------------------
     nodes.append(Node(
         package='car_control',
@@ -130,6 +169,10 @@ def generate_launch_description():
             description='Path to recorded drive CSV (empty = bundled paths/path.csv)'),
         DeclareLaunchArgument('desired_speed_mps', default_value='4.0',
             description='Desired driving speed [m/s]'),
+
+        # ---- Cameras ---------------------------------------------------------------
+        DeclareLaunchArgument('enable_cameras', default_value='false',
+            description='Enable multi-camera UDP multicast nodes (true/false)'),
 
         OpaqueFunction(function=launch_setup),
     ])
