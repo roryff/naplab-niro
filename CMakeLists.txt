@@ -143,7 +143,6 @@ install(PROGRAMS
   scripts/dashboard_server.py
   scripts/drive_recorder.py
   scripts/Kia_niro_rosnode.py
-  scripts/gst_camera_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

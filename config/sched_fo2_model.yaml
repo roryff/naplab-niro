@@ -22,9 +22,9 @@ sched_kss: 501.9 314.9 187.4 143.2 105.5 84.6 71.2 63.3 53.9 44.1
 
 # MPC controller parameters
 dt:            0.05   # timestep [s] — 20 Hz
-horizon:       40     # prediction steps (2 s lookahead)
-rate_up:       1.0333333333  # max torque ramp-up rate [1/s]
-rate_down:     1.8333333333  # max torque ramp-down rate [1/s]
+horizon:       20     # prediction steps (2 s lookahead)
+rate_up:       1.4333333333  # averaged slew limit [1/s]
+rate_down:     1.4333333333  # averaged slew limit [1/s]
 torque_limit:  1.0
 weight_angle:  1.0
 weight_torque: 0.01

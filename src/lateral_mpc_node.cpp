@@ -173,7 +173,7 @@ public:
 
     /**
      * Signed cross-track error at (qx, qy) for path point at arc-length s.
-     * Positive = vehicle is to the LEFT of the path.
+     * Positive = vehicle is to the RIGHT of the path.
      */
     double crossTrackError(double qx, double qy, double s) const
     {
@@ -324,6 +324,7 @@ private:
 class LateralMpcNode : public rclcpp::Node
 {
     enum class State { IDLE, FOLLOWING, STOPPING };
+    enum class ReferencePoint { RearAxle, FrontAxle };
 
 public:
     LateralMpcNode()
@@ -343,16 +344,19 @@ public:
         declare_parameter("weight_torque",     0.1);
         declare_parameter("tau_r",             0.78);  // actuator time constant [s]
         declare_parameter("gain_r",            36.0);  // sw-deg/s per unit torque
-        declare_parameter("rate_up",           3.1/3.0);
-        declare_parameter("rate_down",         5.5/3.0);
+        declare_parameter("rate_up",           4.3/3.0);
+        declare_parameter("rate_down",         4.3/3.0);
         declare_parameter("torque_limit",      1.0);
         declare_parameter("kp_speed",          0.3);
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
         declare_parameter<std::string>("sched_fo2_model_path", "");
         declare_parameter("weight_delta", 0.0);  // delta reference tracking weight; 0=disabled
+        declare_parameter<std::string>("reference_point", "rear_axle");
+        declare_parameter("path_smoothing_window_m", 0.0);
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
+        reference_point_ = loadReferencePoint();
 
         // ---- Load sched_fo2 model (if path provided) ---------------------------
         std::string sfo2_path = get_parameter("sched_fo2_model_path").as_string();
@@ -410,9 +414,11 @@ public:
         auto_enable_ = get_parameter("auto_enable").as_bool();
 
         RCLCPP_INFO(get_logger(),
-            "LateralMpcNode ready.  Path: %.1f m  N=%d  "
+            "LateralMpcNode ready. Path: %.1f m  N=%d  ref=%s  smooth=%.2f m  weight_delta=%.2f. "
             "Publish 'true' on ~/enable_path_following to start.",
-            path_.totalLength(), N_);
+            path_.totalLength(), N_, referencePointName(reference_point_),
+            get_parameter("path_smoothing_window_m").as_double(),
+            get_parameter("weight_delta").as_double());
 
         if (auto_enable_) {
             RCLCPP_INFO(get_logger(),
@@ -505,6 +511,7 @@ private:
                 return;
             }
             hint_front_      = 0;
+            hint_rear_       = 0;
             u_prev_          = 0.0;
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
@@ -548,12 +555,17 @@ private:
         }
 
         // --- Project front axle onto path ------------------------------------
-        double front_x = car_x + WHEELBASE * std::cos(car_heading);
-        double front_y = car_y + WHEELBASE * std::sin(car_heading);
+        double rear_x  = car_x;
+        double rear_y  = car_y;
+        double front_x = rear_x + WHEELBASE * std::cos(car_heading);
+        double front_y = rear_y + WHEELBASE * std::sin(car_heading);
+        double s_rear  = path_.findClosest(rear_x, rear_y, hint_rear_);
         double s_front = path_.findClosest(front_x, front_y, hint_front_);
 
-        size_t hint_rear = (hint_front_ > 0) ? hint_front_ - 1 : 0;
-        double s_rear    = path_.findClosest(car_x, car_y, hint_rear);
+        const bool use_front_reference = (reference_point_ == ReferencePoint::FrontAxle);
+        const double ref_x = use_front_reference ? front_x : rear_x;
+        const double ref_y = use_front_reference ? front_y : rear_y;
+        const double s_ref = use_front_reference ? s_front : s_rear;
 
         // --- Check if approaching end of path --------------------------------
         double remaining = path_.totalLength() - s_rear;
@@ -570,17 +582,17 @@ private:
         double ramp    = std::min(1.0, elapsed / SOFT_START_DURATION);
 
         // --- Initial state for MPC -------------------------------------------
-        double cte  = path_.crossTrackError(front_x, front_y, s_front);
-        double dpsi = path_.headingError(s_front, car_heading);
+        double cte  = path_.crossTrackError(ref_x, ref_y, s_ref);
+        double dpsi = path_.headingError(s_ref, car_heading);
 
         // Curvature-based desired steer angle (feedforward reference for debug only)
-        double desired_delta_rad = path_.curvature(s_front) * WHEELBASE;
+        double desired_delta_rad = path_.curvature(s_ref) * WHEELBASE;
 
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
         if (state_ == State::FOLLOWING) {
             torque_cmd = ramp * solveMpc(cte, dpsi, car_delta, car_delta_rate,
-                                         car_speed, s_front);
+                                         car_speed, s_ref);
         }
         torque_cmd = std::clamp(torque_cmd, -1.0, 1.0);
         u_prev_    = torque_cmd;
@@ -640,7 +652,7 @@ private:
     // =========================================================================
 
     double solveMpc(double cte0, double dpsi0, double delta0, double drate0,
-                    double v,    double s_front)
+                    double v,    double s_ref)
     {
         const int n = N_;
         if (n < 1) return u_prev_;
@@ -695,28 +707,41 @@ private:
 
         // ---- State propagation: x_{k+1} = c_{k+1} + G_{k+1} · U -----------
         double c_rate  = drate0;  // only used by legacy 2-state model
+        double c_torque = u_prev_; // actual rate-limited torque (for sched_fo2)
         double c_delta = delta0;
         double c_psi   = dpsi0;
         double c_cte   = cte0;
 
         std::vector<double> G_rate (n, 0.0);  // only used by legacy 2-state model
+        std::vector<double> G_torque(n, 0.0); // actual rate-limited torque (for sched_fo2)
         std::vector<double> G_delta(n, 0.0);
         std::vector<double> G_psi  (n, 0.0);
         std::vector<double> G_cte  (n, 0.0);
 
         for (int k = 0; k < n; k++) {
             // Path curvature feedforward at predicted vehicle position for step k
-            double s_k   = std::min(s_front + k * dt * v_eff, path_.totalLength());
+            double s_k   = std::min(s_ref + k * dt * v_eff, path_.totalLength());
             double kappa = path_.curvature(s_k);
 
             // ---- Actuator model: compute delta_{k+1} ----------------------------
             double c_delta_new;
             std::vector<double> G_delta_new(n, 0.0);
             if (use_sched_fo2_) {
-                // 1-state FOH: delta[k+1] = ad*delta[k] + bd*u[k]
-                c_delta_new = ad * c_delta;
+                // sched_fo2 model: delta[k+1] = ad*delta[k] + bd*u_ratelimit[k]
+                // where u_ratelimit[k] is the actual torque after rate limiting (not raw u[k])
+                // The rate limiting is enforced by OSQP constraints, so we model with the constrained torque.
+                c_delta_new = ad * c_delta + bd * c_torque;
                 for (int j = 0; j < n; j++)
-                    G_delta_new[j] = ad * G_delta[j] + (j == k ? bd : 0.0);
+                    G_delta_new[j] = ad * G_delta[j] + bd * G_torque[j];
+                
+                // Update torque state to current decision variable u[k]
+                // (OSQP rate constraints ensure this respects rate limits)
+                double c_torque_new = u_prev_;  // Overwritten in next step
+                std::vector<double> G_torque_new(n, 0.0);
+                for (int j = 0; j < n; j++)
+                    G_torque_new[j] = (j == k ? 1.0 : 0.0);
+                c_torque = c_torque_new;
+                G_torque = G_torque_new;
             } else {
                 // dRate_{k+1} = a_rate * dRate_k + b_rate * u_k
                 double c_rate_new = a_rate * c_rate;
@@ -769,7 +794,7 @@ private:
             // Delta reference tracking cost: w_d * (delta_{k+1} - kappa_{k+1}*L)^2
             // Guides MPC to reach the curvature-required steer angle, preventing pre-steer.
             if (w_d > 0.0) {
-                double s_next = std::min(s_front + (k + 1) * dt * v_eff, path_.totalLength());
+                double s_next = std::min(s_ref + (k + 1) * dt * v_eff, path_.totalLength());
                 double delta_ref = path_.curvature(s_next) * WHEELBASE;
                 double d = c_delta - delta_ref;
                 for (int i = 0; i < n; i++)
@@ -783,8 +808,9 @@ private:
             P_x[P_p[k] + k] += static_cast<OSQPFloat>(2.0 * w_t);
         }
 
-        // ---- Build constraint matrix A (rate-of-change + magnitude) ---------
-        // Same structure as steering_mpc_node.cpp:
+        // ---- Build constraint matrix A (signed torque slew + magnitude) ------
+        // The a_k magnitude relaxation allowed sign flips at full magnitude in bag5,
+        // which does not match the actuator. Keep the stable signed slew model.
         //   Rows 4k+0: U_{k-1} - U_k ≤ rate_up*dt   (u_prev for k=0)
         //   Rows 4k+1: U_k - U_{k-1} ≤ rate_down*dt
         //   Rows 4k+2: U_k ≤ tlim
@@ -810,13 +836,11 @@ private:
         int nz = 0;
         for (int j = 0; j < n; j++) {
             A_p[j] = nz;
-            // Own rate constraints (rows 4j, 4j+1) and magnitude (rows 4j+2, 4j+3)
             A_x.push_back( 1.0f); A_i.push_back(4*j);
             A_x.push_back(-1.0f); A_i.push_back(4*j+1);
             A_x.push_back( 1.0f); A_i.push_back(4*j+2);
             A_x.push_back(-1.0f); A_i.push_back(4*j+3);
             nz += 4;
-            // Couple into next step's rate rows (u_j acts as u_{k-1} for k=j+1)
             if (j + 1 < n) {
                 A_x.push_back(-1.0f); A_i.push_back(4*(j+1));
                 A_x.push_back( 1.0f); A_i.push_back(4*(j+1)+1);
@@ -886,6 +910,7 @@ private:
     {
         path_.clear();
         hint_front_ = 0;
+        hint_rear_  = 0;
 
         const double sinusoid_len = total_length - 60.0;
         const int    n_sin        = static_cast<int>(sinusoid_len / spacing);
@@ -915,16 +940,14 @@ private:
             path_.addWaypoint(x, last_y * taper);
         }
 
-        path_.smooth(5.0);
-        RCLCPP_INFO(get_logger(),
-            "Sinusoidal path created: %.1f m total, %d waypoints (SG-smoothed 5 m).",
-            path_.totalLength(), n_tot + 1);
+        maybeSmoothPath("Sinusoidal path", n_tot + 1);
     }
 
     void loadPathFromCSV(const std::string& filename)
     {
         path_.clear();
         hint_front_ = 0;
+        hint_rear_  = 0;
 
         std::ifstream f(filename);
         if (!f.is_open()) {
@@ -954,10 +977,43 @@ private:
             return;
         }
 
-        path_.smooth(5.0);
+        maybeSmoothPath(filename.c_str(), count);
+    }
+
+    ReferencePoint loadReferencePoint()
+    {
+        const std::string value = get_parameter("reference_point").as_string();
+        if (value == "rear" || value == "rear_axle" || value == "cg") {
+            return ReferencePoint::RearAxle;
+        }
+        if (value == "front" || value == "front_axle") {
+            return ReferencePoint::FrontAxle;
+        }
+        RCLCPP_WARN(get_logger(),
+            "Unknown reference_point='%s'; defaulting to rear_axle.",
+            value.c_str());
+        return ReferencePoint::RearAxle;
+    }
+
+    const char* referencePointName(ReferencePoint point) const
+    {
+        return (point == ReferencePoint::FrontAxle) ? "front_axle" : "rear_axle";
+    }
+
+    void maybeSmoothPath(const char* path_label, int waypoint_count)
+    {
+        const double smooth_window_m = get_parameter("path_smoothing_window_m").as_double();
+        if (smooth_window_m > 0.0) {
+            path_.smooth(smooth_window_m);
+            RCLCPP_INFO(get_logger(),
+                "Loaded %s: %d waypoints, %.1f m total (SG-smoothed %.2f m).",
+                path_label, waypoint_count, path_.totalLength(), smooth_window_m);
+            return;
+        }
+
         RCLCPP_INFO(get_logger(),
-            "Loaded path from '%s': %d waypoints, %.1f m total (SG-smoothed 5 m).",
-            filename.c_str(), count, path_.totalLength());
+            "Loaded %s: %d waypoints, %.1f m total (path smoothing disabled).",
+            path_label, waypoint_count, path_.totalLength());
     }
 
     // =========================================================================
@@ -1097,8 +1153,10 @@ private:
     std::vector<double> sched_kss_;
 
     // Path
-    Path   path_;
-    size_t hint_front_ = 0;
+    Path           path_;
+    ReferencePoint reference_point_ = ReferencePoint::RearAxle;
+    size_t         hint_front_ = 0;
+    size_t         hint_rear_  = 0;
 
     // OSQP workspace (owned; cleaned up in destructor and re-created each solve)
     OSQPSolver* osqp_solver_ = nullptr;

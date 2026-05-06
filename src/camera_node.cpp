@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <algorithm>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -60,6 +61,8 @@ public:
         topic_  = declare_parameter<std::string>("topic",           "image_compressed");
         frame_  = declare_parameter<std::string>("frame_id",        "camera");
         iface_  = declare_parameter<std::string>("multicast_iface", "enP2p1s0");
+        frame_timeout_ms_    = declare_parameter<double>("frame_timeout_ms", 2000.0);
+        restart_backoff_ms_  = declare_parameter<double>("restart_backoff_ms", 250.0);
 
         pub_ = create_publisher<foxglove_msgs::msg::CompressedVideo>(topic_, 10);
 
@@ -68,7 +71,7 @@ public:
         // supports H.264 universally; H.265 is only decoded on Safari/macOS.
         std::string pipeline_str =
             "udpsrc uri=udp://" + ip_ + ":" + std::to_string(port_) +
-            " buffer-size=4194304 multicast-iface=" + iface_ +
+            " buffer-size=4194304 timeout=2000000000 multicast-iface=" + iface_ +
             " ! tsdemux latency=0"
             " ! queue max-size-buffers=1 leaky=2"
             " ! h265parse"
@@ -79,24 +82,10 @@ public:
             " ! appsink name=sink sync=false max-buffers=2 drop=true";
 
         RCLCPP_INFO(get_logger(), "Pipeline: %s", pipeline_str.c_str());
-
-        GError* err = nullptr;
-        pipeline_ = gst_parse_launch(pipeline_str.c_str(), &err);
-        if (err) {
-            RCLCPP_FATAL(get_logger(), "GStreamer parse error: %s", err->message);
-            g_error_free(err);
+        pipeline_str_ = pipeline_str;
+        if (!start_pipeline()) {
             return;
         }
-
-        sink_ = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(pipeline_), "sink"));
-
-        GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-            RCLCPP_FATAL(get_logger(), "Failed to set pipeline to PLAYING");
-            return;
-        }
-
-        RCLCPP_INFO(get_logger(), "Pipeline PLAYING — publishing H.265 bitstream");
         pull_thread_ = std::thread(&CameraNode::pull_loop, this);
     }
 
@@ -108,13 +97,121 @@ public:
             gst_element_send_event(pipeline_, gst_event_new_eos());
         }
         if (pull_thread_.joinable()) pull_thread_.join();
-        if (pipeline_) {
-            gst_element_set_state(pipeline_, GST_STATE_NULL);
-            gst_object_unref(pipeline_);
-        }
+        stop_pipeline();
     }
 
 private:
+    bool start_pipeline()
+    {
+        stop_pipeline();
+
+        GError* err = nullptr;
+        pipeline_ = gst_parse_launch(pipeline_str_.c_str(), &err);
+        if (err) {
+            RCLCPP_ERROR(get_logger(), "GStreamer parse error: %s", err->message);
+            g_error_free(err);
+            pipeline_ = nullptr;
+            return false;
+        }
+
+        sink_ = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(pipeline_), "sink"));
+        if (!sink_) {
+            RCLCPP_ERROR(get_logger(), "Failed to find appsink in pipeline");
+            stop_pipeline();
+            return false;
+        }
+
+        GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            RCLCPP_ERROR(get_logger(), "Failed to set pipeline to PLAYING");
+            stop_pipeline();
+            return false;
+        }
+
+        RCLCPP_INFO(get_logger(), "Pipeline PLAYING");
+        return true;
+    }
+
+    void stop_pipeline()
+    {
+        if (sink_) {
+            gst_object_unref(sink_);
+            sink_ = nullptr;
+        }
+        if (pipeline_) {
+            gst_element_set_state(pipeline_, GST_STATE_NULL);
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+        }
+    }
+
+    bool pipeline_needs_restart()
+    {
+        if (!pipeline_) {
+            return true;
+        }
+
+        GstBus* bus = gst_element_get_bus(pipeline_);
+        if (!bus) {
+            return false;
+        }
+
+        bool should_restart = false;
+        while (GstMessage* msg = gst_bus_pop_filtered(
+                   bus,
+                   static_cast<GstMessageType>(
+                       GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT))) {
+            switch (GST_MESSAGE_TYPE(msg)) {
+                case GST_MESSAGE_ERROR: {
+                    GError* err = nullptr;
+                    gchar* debug = nullptr;
+                    gst_message_parse_error(msg, &err, &debug);
+                    RCLCPP_ERROR(
+                        get_logger(),
+                        "Camera pipeline error: %s%s%s",
+                        err ? err->message : "unknown",
+                        debug ? " | " : "",
+                        debug ? debug : "");
+                    if (err) g_error_free(err);
+                    if (debug) g_free(debug);
+                    should_restart = true;
+                    break;
+                }
+                case GST_MESSAGE_EOS:
+                    RCLCPP_WARN(get_logger(), "Camera pipeline reached EOS; restarting");
+                    should_restart = true;
+                    break;
+                case GST_MESSAGE_ELEMENT: {
+                    const GstStructure* s = gst_message_get_structure(msg);
+                    if (s && gst_structure_has_name(s, "GstUDPSrcTimeout")) {
+                        RCLCPP_WARN(get_logger(), "Camera UDP source timed out; restarting");
+                        should_restart = true;
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+            gst_message_unref(msg);
+            if (should_restart) break;
+        }
+
+        gst_object_unref(bus);
+        return should_restart;
+    }
+
+    bool restart_pipeline(const char* reason)
+    {
+        RCLCPP_WARN(get_logger(), "Restarting camera pipeline: %s", reason);
+        stop_pipeline();
+        if (!running_ || !rclcpp::ok()) {
+            return false;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(std::max<int64_t>(0, static_cast<int64_t>(restart_backoff_ms_))));
+        return start_pipeline();
+    }
+
     void pull_loop()
     {
         // SCHED_FIFO priority 65: camera publish thread.
@@ -131,14 +228,38 @@ private:
         double sum_pull = 0, sum_pub = 0;
         double max_pull = 0, max_pub = 0;
         auto   report_t = Clock::now();
+        auto   last_frame_t = Clock::now();
+        bool   seen_frame = false;
 
         while (running_ && rclcpp::ok()) {
+            if (pipeline_needs_restart()) {
+                if (!restart_pipeline("GStreamer bus event")) {
+                    break;
+                }
+                seen_frame = false;
+                last_frame_t = Clock::now();
+                continue;
+            }
+
             auto t0 = Clock::now();
             GstSample* sample = gst_app_sink_try_pull_sample(sink_, 100 * GST_MSECOND);
             auto t1 = Clock::now();
             double pull_ms = ms(t1 - t0).count();
 
-            if (!sample) continue;
+            if (!sample) {
+                if (ms(t1 - last_frame_t).count() > frame_timeout_ms_) {
+                    const char* reason = seen_frame ? "frame timeout" : "startup frame timeout";
+                    if (!restart_pipeline(reason)) {
+                        break;
+                    }
+                    seen_frame = false;
+                    last_frame_t = Clock::now();
+                }
+                continue;
+            }
+
+            last_frame_t = t1;
+            seen_frame = true;
 
             GstBuffer* buf = gst_sample_get_buffer(sample);
             GstMapInfo map;
@@ -177,7 +298,10 @@ private:
     }
 
     std::string ip_, topic_, frame_, iface_;
+    std::string pipeline_str_;
     int port_;
+    double frame_timeout_ms_;
+    double restart_backoff_ms_;
 
     rclcpp::Publisher<foxglove_msgs::msg::CompressedVideo>::SharedPtr pub_;
     GstElement*  pipeline_ = nullptr;

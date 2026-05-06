@@ -9,6 +9,9 @@ lateral_mpc_node:
     weight_cte:    20.0
     weight_psi:    3.0
     weight_torque: 0.01
-    weight_delta:  0.0   # delta reference tracking weight; 0.0 = disabled
-    # Sched_fo2 actuator model path (empty = use fixed tau_r/gain_r above)
+    weight_delta:  0.0   # bag3 showed this increased saturation without improving tracking
+    reference_point: "rear_axle"
+    path_smoothing_window_m: 0.0
+    # Sched_fo2 actuator model path (empty = use fixed tau_r/gain_r above)#
+#    sched_fo2_model_path: "/workspaces/isaac_ros-dev/install/car_control/share/car_control/config/sched_fo2_model.yaml"
     sched_fo2_model_path: ""

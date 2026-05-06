@@ -3,7 +3,8 @@ from launch import LaunchDescription
 from launch_ros.actions import Node, ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
 from launch.substitutions import PathJoinSubstitution
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -16,6 +17,7 @@ def launch_setup(context, *args, **kwargs):
     path_csv_file = LaunchConfiguration('path_csv_file').perform(context)
     desired_speed = LaunchConfiguration('desired_speed_mps').perform(context)
     enable_cameras = LaunchConfiguration('enable_cameras').perform(context)
+    enable_lidar   = LaunchConfiguration('enable_lidar').perform(context)
 
     # Default path to bundled path.csv when none supplied
     if not path_csv_file:
@@ -158,6 +160,14 @@ def launch_setup(context, *args, **kwargs):
         parameters=[{'port': 8766}],
     ))
 
+    # ---- lidar nodes (conditional) ---------------------------------------------
+    if enable_lidar.lower() == 'true':
+        nodes.append(IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(pkg_share, 'launch', 'multi_lidar.launch.py')
+            )
+        ))
+
     return nodes
 
 
@@ -175,12 +185,16 @@ def generate_launch_description():
         # ---- Path / speed ------------------------------------------------------
         DeclareLaunchArgument('path_csv_file', default_value='',
             description='Path to recorded drive CSV (empty = bundled paths/path.csv)'),
-        DeclareLaunchArgument('desired_speed_mps', default_value='4.0',
+        DeclareLaunchArgument('desired_speed_mps', default_value='5.5',
             description='Desired driving speed [m/s]'),
 
         # ---- Cameras ---------------------------------------------------------------
         DeclareLaunchArgument('enable_cameras', default_value='false',
             description='Enable multi-camera UDP multicast nodes (true/false)'),
+
+        # ---- Lidar -----------------------------------------------------------------
+        DeclareLaunchArgument('enable_lidar', default_value='false',
+            description='Enable multi-lidar Ouster nodes (true/false)'),
 
         OpaqueFunction(function=launch_setup),
     ])
