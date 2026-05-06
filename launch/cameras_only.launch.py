@@ -1,88 +1,82 @@
 """
 ROS 2 launch file for multi-camera UDP multicast capture.
 
-Launches 4 gscam2 instances (front, right, rear, left) capturing HEVC streams
-via UDP multicast and publishing CompressedImage on separate topics.
+Launches 4 CameraNode composable components in a single ComposableNodeContainer.
+Each CameraNode receives H.265 MPEG-TS over UDP multicast, hardware-decodes with
+nvv4l2decoder, hardware-encodes to H.264 with nvv4l2h264enc (all in NVMM, zero
+CPU copy), and publishes foxglove_msgs/msg/CompressedVideo on cameras/{name}/image_compressed.
 
 Usage:
-    ros2 launch car_control cameras_only.launch.py
+    ros2 launch car_control cameras_only.launch.py [enable_cameras:=true]
 """
 
-import os
 from launch import LaunchDescription
-from launch_ros.actions import Node
-from launch.substitutions import PathJoinSubstitution
+from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.descriptions import ComposableNode
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch_ros.substitutions import FindPackageShare
-
-
-def gstreamer_pipeline(multicast_ip, port=10030):
-    """
-    Build GStreamer pipeline for UDP multicast HEVC stream.
-    
-    Pipeline: udpsrc (multicast) → rtph265depay → h265parse → avdec_hevc → videoconvert → appsink
-    
-    Args:
-        multicast_ip: Multicast group IP (e.g., "239.10.0.1")
-        port: UDP port (default 10030)
-    
-    Returns:
-        GStreamer pipeline URI string
-    """
-    return (
-        f"udpsrc uri=udp://{multicast_ip}:{port} buffer-size=4194304 ! "
-        "rtph265depay ! h265parse ! avdec_hevc ! videoconvert ! appsink"
-    )
 
 
 def launch_setup(context, *args, **kwargs):
     from launch.substitutions import LaunchConfiguration
-    
-    pkg_share = FindPackageShare('car_control').perform(context)
+
     enable_cameras = LaunchConfiguration('enable_cameras').perform(context)
-    
-    nodes = []
-    
     if enable_cameras.lower() != 'true':
-        return nodes
-    
-    # Camera definitions: (name, multicast_ip, frame_id, topic)
+        return []
+
     cameras = [
-        ('front', '239.10.0.1', 'camera_front', 'cameras/front/compressed'),
-        ('right', '239.10.0.2', 'camera_right', 'cameras/right/compressed'),
-        ('rear',  '239.10.0.3', 'camera_rear',  'cameras/rear/compressed'),
-        ('left',  '239.10.0.4', 'camera_left',  'cameras/left/compressed'),
+        ('front', '239.10.0.1', 'camera_front', 'cameras/front'),
+        ('right', '239.10.0.2', 'camera_right', 'cameras/right'),
+        ('rear',  '239.10.0.3', 'camera_rear',  'cameras/rear'),
+        ('left',  '239.10.0.4', 'camera_left',  'cameras/left'),
     ]
-    
-    for name, multicast_ip, frame_id, topic in cameras:
-        pipeline_uri = gstreamer_pipeline(multicast_ip)
-        
-        nodes.append(Node(
-            package='gscam2',
-            executable='gscam2_node',
-            name=f'gscam2_{name}',
-            output='screen',
+
+    composable_nodes = []
+    for name, multicast_ip, frame_id, ns in cameras:
+        compressed_topic = f'{ns}/image_compressed'
+
+        composable_nodes.append(ComposableNode(
+            package='car_control',
+            plugin='CameraNode',
+            name=f'camera_{name}',
             parameters=[{
-                'gscam_config': pipeline_uri,
-                'frame_id': frame_id,
-                'use_gst_timestamps': True,  # Use GStreamer timestamps, not ROS clock
-                'sync': False,  # Don't wait for sync on appsink
-                'drop': True,  # Drop frames if pipeline can't keep up
+                'multicast_ip':    multicast_ip,
+                'port':            10030,
+                'topic':           compressed_topic,
+                'frame_id':        frame_id,
+                'multicast_iface': 'enP2p1s0',
             }],
-            remappings=[
-                ('image_raw', topic),
-            ],
+            extra_arguments=[{'use_intra_process_comms': True}],
         ))
-    
-    return nodes
+
+    return [
+        ComposableNodeContainer(
+            name='camera_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container_mt',
+            composable_node_descriptions=composable_nodes,
+            output='screen',
+        ),
+        Node(
+            package='car_control',
+            executable='dashboard_server.py',
+            name='dashboard_server',
+            output='screen',
+        ),
+        Node(
+            package='foxglove_bridge',
+            executable='foxglove_bridge',
+            name='foxglove_bridge',
+            output='screen',
+        ),
+    ]
 
 
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'enable_cameras',
-            default_value='false',
+            default_value='true',
             description='Enable camera nodes (true/false)'),
-        
         OpaqueFunction(function=launch_setup),
     ])

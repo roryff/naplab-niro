@@ -26,14 +26,13 @@ HTTP endpoints
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import NavSatFix, CompressedImage
+from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import TwistStamped, PoseStamped, Twist, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float64
 from car_control.msg import VehicleState, EsfStatus
 
 import threading
-import base64
 import json
 import time
 import math
@@ -83,18 +82,6 @@ _state = {
         "/lateral_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/heading_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_following_status":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/cameras/front/compressed": {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/cameras/right/compressed": {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/cameras/rear/compressed":  {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/cameras/left/compressed":  {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-    },
-
-    # ── Camera images ────────────────────────────────────────────────────────
-    "cameras": {
-        "front": None,  # base64-encoded compressed image
-        "right": None,
-        "rear":  None,
-        "left":  None,
     },
 
     # ── Vehicle state ────────────────────────────────────────────────────────
@@ -385,12 +372,6 @@ class DashboardNode(Node):
         self.create_subscription(Float64, "/heading_error",          self._cb_hdg_err,   10)
         self.create_subscription(Bool,    "/path_following_status",  self._cb_pf_status, latched_qos)
 
-        # Camera topics (optional)
-        self.create_subscription(CompressedImage, "/cameras/front/compressed", self._cb_camera_front, 10)
-        self.create_subscription(CompressedImage, "/cameras/right/compressed", self._cb_camera_right, 10)
-        self.create_subscription(CompressedImage, "/cameras/rear/compressed",  self._cb_camera_rear,  10)
-        self.create_subscription(CompressedImage, "/cameras/left/compressed",  self._cb_camera_left,  10)
-
         # Publisher – allows dashboard to start/stop path following
         self.enable_pub_ = self.create_publisher(Bool, "/enable_path_following", 1)
 
@@ -550,26 +531,6 @@ class DashboardNode(Node):
             _path_data["length_m"]  = round(length_m, 1)
             _path_data["updated_at"] = time.time()
 
-    def _cb_camera_front(self, msg: CompressedImage):
-        with _state_lock:
-            _touch_topic("/cameras/front/compressed")
-            _state["cameras"]["front"] = base64.b64encode(msg.data).decode('ascii')
-
-    def _cb_camera_right(self, msg: CompressedImage):
-        with _state_lock:
-            _touch_topic("/cameras/right/compressed")
-            _state["cameras"]["right"] = base64.b64encode(msg.data).decode('ascii')
-
-    def _cb_camera_rear(self, msg: CompressedImage):
-        with _state_lock:
-            _touch_topic("/cameras/rear/compressed")
-            _state["cameras"]["rear"] = base64.b64encode(msg.data).decode('ascii')
-
-    def _cb_camera_left(self, msg: CompressedImage):
-        with _state_lock:
-            _touch_topic("/cameras/left/compressed")
-            _state["cameras"]["left"] = base64.b64encode(msg.data).decode('ascii')
-
 
 # ---------------------------------------------------------------------------
 # HTTP server (threaded so parallel tile requests don't block each other)
@@ -675,27 +636,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(exc.code, f"WMTS upstream: {exc.reason}")
             except (URLError, Exception) as exc:
                 self.send_error(502, str(exc))
-
-        elif self.path.startswith("/api/camera/"):
-            cam_name = self.path.split("/")[-1]
-            if cam_name not in ["front", "right", "rear", "left"]:
-                self.send_response(400)
-                self.end_headers()
-                return
-            with _state_lock:
-                img_b64 = _state["cameras"].get(cam_name)
-            if not img_b64:
-                self.send_response(204)  # No content
-                self.end_headers()
-                return
-            img_data = base64.b64decode(img_b64)
-            self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
-            self.send_header("Content-Length", str(len(img_data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(img_data)
 
         else:
             self.send_response(404)

@@ -98,16 +98,6 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
 #rec-modal{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px 22px 16px;width:min(380px,90vw);box-shadow:0 8px 32px #000a}
 #rec-modal h3{margin:0 0 4px;font-size:14px;color:#e6edf3;font-weight:600}
 #rec-modal p{margin:0 0 12px;font-size:11px;color:#6e7681}
-/* ── Camera buttons in header ────────────────────────────────────────────── */
-#camera-buttons{display:flex;gap:6px;align-items:center;margin-left:auto}
-.cam-btn{padding:4px 10px;border:1px solid #30363d;border-radius:4px;background:#21262d;color:#8b949e;font-size:11px;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:.03em;transition:all .2s}
-.cam-btn:hover{background:#30363d}
-.cam-btn.active{background:#3fb950;color:#0d1117;border-color:#3fb950}
-/* ── Camera display ────────────────────────────────────────────────────── */
-#camera-view{position:relative;min-width:320px;flex:2}
-#camera-view .card-body{padding:0}
-#camera-image{width:100%;height:auto;display:block;background:#0d1117}
-#camera-status{position:absolute;bottom:8px;right:8px;font-size:11px;background:rgba(0,0,0,.7);padding:4px 8px;border-radius:4px;color:#6e7681}
 #rec-modal input{width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:13px;padding:7px 10px;outline:none}
 #rec-modal input:focus{border-color:#388bfd}
 #rec-modal .modal-row{display:flex;gap:8px;margin-top:12px}
@@ -121,12 +111,6 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
 <header>
   <div id="conn-dot"></div>
   <h1>Car Control Dashboard</h1>
-  <div id="camera-buttons">
-    <button class="cam-btn active" onclick="switchCamera('front')" title="Front camera">📷 Front</button>
-    <button class="cam-btn" onclick="switchCamera('right')" title="Right camera">📷 Right</button>
-    <button class="cam-btn" onclick="switchCamera('rear')" title="Rear camera">📷 Rear</button>
-    <button class="cam-btn" onclick="switchCamera('left')" title="Left camera">📷 Left</button>
-  </div>
   <span id="uptime"></span>
 </header>
 <div class="page">
@@ -147,17 +131,6 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
         <div id="map-wrap">
           <div id="leaflet-map"></div>
         </div>
-      </div>
-    </div>
-
-    <!-- Camera View -->
-    <div class="card" id="camera-view" style="flex:2;min-width:320px">
-      <div class="card-header">
-        <span id="camera-header">Camera: Front</span>
-        <span id="camera-status" style="font-size:10px;color:#8b949e">—</span>
-      </div>
-      <div class="card-body" style="padding:0;overflow:hidden;border-radius:4px;position:relative">
-        <img id="camera-image" alt="Camera feed" style="width:100%;height:auto;display:block;background:#0d1117"/>
       </div>
     </div>
 
@@ -658,16 +631,16 @@ function render(s){
   // ── Topic Health ──────────────────────────────────────────────────────────
   const TOPICS_CFG = [
     ['/vehicle/state',         50, 'Vehicle State'],
-    ['/gnss/fix',               5, 'GNSS Fix'],
-    ['/gnss/velocity',          5, 'GNSS Velocity'],
-    ['/gnss/odometry',          5, 'GNSS Odometry'],
+    ['/gnss/fix',               30, 'GNSS Fix'],
+    ['/gnss/velocity',          30, 'GNSS Velocity'],
+    ['/gnss/odometry',          30, 'GNSS Odometry'],
     ['/cmd_vel',               20, 'cmd_vel'],
     ['/lateral_error',         20, 'Lateral Error'],
     ['/path_following_status',  1, 'Path Status'],
     ['/path_visualization',     1, 'Path Viz'],
     ['/gnss/esf_status',        1, 'ESF Status'],
-    ['/gnss/gyro',             50, 'Gyro (ESF-INS)'],
-    ['/gnss/accel',            50, 'Accel (ESF-INS)'],
+    ['/gnss/gyro',             30, 'Gyro (ESF-INS)'],
+    ['/gnss/accel',            30, 'Accel (ESF-INS)'],
   ];
   const healthEl = document.getElementById('topic-health');
   if(healthEl){
@@ -939,43 +912,6 @@ async function fetchPath(){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Camera handling
-// ═══════════════════════════════════════════════════════════════════════════
-let gCurrentCamera = 'front';
-const CAMERA_POLL_MS = 100;  // camera refresh interval
-
-async function updateCameraImage() {
-  try {
-    const url = `/api/camera/${gCurrentCamera}`;
-    const r = await fetch(url);
-    if (r.ok) {
-      const blob = await r.blob();
-      const imgUrl = URL.createObjectURL(blob);
-      const img = document.getElementById('camera-image');
-      const old = img.src;
-      img.src = imgUrl;
-      if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
-      document.getElementById('camera-status').textContent = '✓ Live';
-    } else if (r.status === 204) {
-      document.getElementById('camera-status').textContent = '⏳ No data';
-    } else {
-      document.getElementById('camera-status').textContent = '✗ Error';
-    }
-  } catch (e) {
-    document.getElementById('camera-status').textContent = '✗ Offline';
-  }
-  setTimeout(updateCameraImage, CAMERA_POLL_MS);
-}
-
-function switchCamera(cam) {
-  gCurrentCamera = cam;
-  document.querySelectorAll('.cam-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
-  document.getElementById('camera-header').textContent = `Camera: ${cam.charAt(0).toUpperCase() + cam.slice(1)}`;
-  updateCameraImage();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Poll loop
 // ═══════════════════════════════════════════════════════════════════════════
 async function poll(){
@@ -991,7 +927,6 @@ async function poll(){
 // ── Boot ─────────────────────────────────────────────────────────────────────────
 initLeafletMap();
 fetchPath();
-updateCameraImage();  // Start camera polling
 poll();
 </script>
 

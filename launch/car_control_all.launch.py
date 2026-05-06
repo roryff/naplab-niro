@@ -1,17 +1,11 @@
 import os
 from launch import LaunchDescription
-from launch_ros.actions import Node
+from launch_ros.actions import Node, ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
 from launch.substitutions import PathJoinSubstitution
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch_ros.substitutions import FindPackageShare
 
-
-def gstreamer_pipeline(multicast_ip, port=10030):
-    """Build GStreamer pipeline for UDP multicast HEVC stream."""
-    return (
-        f"udpsrc uri=udp://{multicast_ip}:{port} buffer-size=4194304 ! "
-        "rtph265depay ! h265parse ! avdec_hevc ! videoconvert ! appsink"
-    )
 
 
 def launch_setup(context, *args, **kwargs):
@@ -114,40 +108,54 @@ def launch_setup(context, *args, **kwargs):
 
     # ---- camera nodes (conditional) -----------------------------------------------
     if enable_cameras.lower() == 'true':
-        # Camera definitions: (name, multicast_ip, frame_id, topic)
         cameras = [
-            ('front', '239.10.0.1', 'camera_front', 'cameras/front/compressed'),
-            ('right', '239.10.0.2', 'camera_right', 'cameras/right/compressed'),
-            ('rear',  '239.10.0.3', 'camera_rear',  'cameras/rear/compressed'),
-            ('left',  '239.10.0.4', 'camera_left',  'cameras/left/compressed'),
+            ('front', '239.10.0.1', 'camera_front', 'cameras/front'),
+            ('right', '239.10.0.2', 'camera_right', 'cameras/right'),
+            ('rear',  '239.10.0.3', 'camera_rear',  'cameras/rear'),
+            ('left',  '239.10.0.4', 'camera_left',  'cameras/left'),
         ]
-        
-        for name, multicast_ip, frame_id, topic in cameras:
-            pipeline_uri = gstreamer_pipeline(multicast_ip)
-            
-            nodes.append(Node(
-                package='gscam2',
-                executable='gscam2_node',
-                name=f'gscam2_{name}',
-                output='screen',
+        # CameraNode now publishes H.265 bitstream directly as CompressedImage —
+        # no hardware decode, no NITROS re-encode, no raw topics on the bus.
+        cam_nodes = []
+        for name, multicast_ip, frame_id, ns in cameras:
+            compressed_topic = f'{ns}/image_compressed'
+            cam_nodes.append(ComposableNode(
+                package='car_control',
+                plugin='CameraNode',
+                name=f'camera_{name}',
                 parameters=[{
-                    'gscam_config': pipeline_uri,
-                    'frame_id': frame_id,
-                    'use_gst_timestamps': True,
-                    'sync': False,
-                    'drop': True,
+                    'multicast_ip':    multicast_ip,
+                    'port':            10030,
+                    'topic':           compressed_topic,
+                    'frame_id':        frame_id,
+                    'multicast_iface': 'enP2p1s0',
                 }],
-                remappings=[
-                    ('image_raw', topic),
-                ],
+                extra_arguments=[{'use_intra_process_comms': True}],
             ))
+        nodes.append(ComposableNodeContainer(
+            name='camera_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container_mt',
+            composable_node_descriptions=cam_nodes,
+            output='screen',
+        ))
 
-    # ---- dashboard_server (always) ---------------------------------------------
+    # ---- dashboard_server (always) -----------------------------------------------
     nodes.append(Node(
         package='car_control',
         executable='dashboard_server.py',
         name='dashboard_server',
         output='screen',
+    ))
+
+    # ---- foxglove_bridge (always) ------------------------------------------------
+    nodes.append(Node(
+        package='foxglove_bridge',
+        executable='foxglove_bridge',
+        name='foxglove_bridge',
+        output='screen',
+        parameters=[{'port': 8766}],
     ))
 
     return nodes

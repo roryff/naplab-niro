@@ -8,11 +8,17 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(foxglove_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+
+# GStreamer (for camera_node)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0)
 
 # Set path for nlohmann_json
 set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} "/usr/share/cmake")
@@ -93,6 +99,25 @@ add_executable(lateral_mpc_node src/lateral_mpc_node.cpp)
 ament_target_dependencies(lateral_mpc_node rclcpp std_msgs geometry_msgs nav_msgs)
 target_include_directories(lateral_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
 target_link_libraries(lateral_mpc_node osqpstatic ${cpp_typesupport_target})
+add_executable(sysid_node src/sysid_node.cpp)
+ament_target_dependencies(sysid_node rclcpp std_msgs geometry_msgs)
+target_link_libraries(sysid_node ${cpp_typesupport_target})
+
+add_executable(camera_node src/camera_node.cpp)
+ament_target_dependencies(camera_node rclcpp rclcpp_components sensor_msgs foxglove_msgs)
+target_include_directories(camera_node PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(camera_node ${GST_LIBRARIES})
+
+# Composable component library (for intra-process use with isaac_ros_h264_encoder)
+add_library(camera_node_component SHARED src/camera_node.cpp)
+ament_target_dependencies(camera_node_component rclcpp rclcpp_components sensor_msgs foxglove_msgs)
+target_include_directories(camera_node_component PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(camera_node_component ${GST_LIBRARIES})
+rclcpp_components_register_node(camera_node_component
+  PLUGIN "CameraNode"
+  EXECUTABLE camera_node_component_exe
+)
+
 
 # Install executables
 install(TARGETS
@@ -101,13 +126,24 @@ install(TARGETS
   path_follower_node
   steering_mpc_node
   lateral_mpc_node
+  sysid_node
+  camera_node
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install camera component library
+install(TARGETS camera_node_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 # Install Python scripts
 install(PROGRAMS
   scripts/dashboard_server.py
   scripts/drive_recorder.py
+  scripts/Kia_niro_rosnode.py
+  scripts/gst_camera_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
