@@ -22,6 +22,11 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -44,6 +49,12 @@ public:
             gst_init(nullptr, nullptr);
         }
 
+        // Lock all memory now — prevents page-fault stalls mid-frame in both
+        // standalone and composable-component execution modes.
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            RCLCPP_WARN(get_logger(), "mlockall failed: %s", strerror(errno));
+        }
+
         ip_     = declare_parameter<std::string>("multicast_ip",    "239.10.0.1");
         port_   = declare_parameter<int>        ("port",            10030);
         topic_  = declare_parameter<std::string>("topic",           "image_compressed");
@@ -59,7 +70,7 @@ public:
             "udpsrc uri=udp://" + ip_ + ":" + std::to_string(port_) +
             " buffer-size=4194304 multicast-iface=" + iface_ +
             " ! tsdemux latency=0"
-            " ! queue max-size-buffers=2 leaky=2"
+            " ! queue max-size-buffers=1 leaky=2"
             " ! h265parse"
             " ! nvv4l2decoder disable-dpb=true low-latency-mode=true"
             " ! nvv4l2h264enc idrinterval=30 insert-sps-pps=true"
@@ -106,6 +117,16 @@ public:
 private:
     void pull_loop()
     {
+        // SCHED_FIFO priority 65: camera publish thread.
+        // Above ADR wheel-speed sender (60) — low-latency video matters more
+        // than the 10 Hz feedback signal. Below control nodes (70+).
+        struct sched_param sp{};
+        sp.sched_priority = 65;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+            RCLCPP_WARN(get_logger(),
+                "pull_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+        }
+
         int    frame_count = 0;
         double sum_pull = 0, sum_pub = 0;
         double max_pull = 0, max_pub = 0;
@@ -171,6 +192,9 @@ RCLCPP_COMPONENTS_REGISTER_NODE(CameraNode)
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
+    // mlockall already called in constructor, but call again here in case
+    // main thread allocates before the node is constructed.
+    mlockall(MCL_CURRENT | MCL_FUTURE);
     rclcpp::spin(std::make_shared<CameraNode>());
     rclcpp::shutdown();
     return 0;

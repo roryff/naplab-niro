@@ -30,6 +30,7 @@
  */
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -37,6 +38,9 @@
 #include "car_control/msg/vehicle_state.hpp"
 #include <nav_msgs/msg/path.hpp>
 #include <osqp.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 #include <algorithm>
 #include <cmath>
@@ -46,6 +50,8 @@
 #include <sstream>
 #include <vector>
 #include <deque>
+#include <cerrno>
+#include <cstring>
 
 // ============================================================
 // sched_fo2 helpers (piecewise-linear interpolation)
@@ -326,6 +332,8 @@ public:
       path_start_time_(this->now()),
       hint_front_(0)
     {
+        timer_cb_group_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
         // ---- Parameters --------------------------------------------------------
         declare_parameter("desired_speed_mps", 4.0);
         declare_parameter("stop_distance",     3.0);
@@ -396,7 +404,8 @@ public:
         // ---- Control timer -----------------------------------------------------
         control_timer_ = create_wall_timer(
             std::chrono::duration<double>(DT),
-            std::bind(&LateralMpcNode::controlLoop, this));
+            std::bind(&LateralMpcNode::controlLoop, this),
+            timer_cb_group_);
 
         auto_enable_ = get_parameter("auto_enable").as_bool();
 
@@ -844,7 +853,16 @@ private:
             return u_prev_;
         }
 
-        osqp_solve(osqp_solver_);
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            osqp_solve(osqp_solver_);
+            auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+            if (dt_us > 40000) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "OSQP solve overrun: %ld µs (budget 40 ms)", dt_us);
+            }
+        }
         OSQPInt status_val = osqp_solver_->info->status_val;
         if (status_val != OSQP_SOLVED && status_val != OSQP_SOLVED_INACCURATE) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -1105,12 +1123,29 @@ private:
 
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp::TimerBase::SharedPtr auto_enable_timer_;
+    rclcpp::CallbackGroup::SharedPtr timer_cb_group_;
 };
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<LateralMpcNode>());
+
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("lateral_mpc_node"),
+            "mlockall failed: %s", strerror(errno));
+    }
+
+    struct sched_param sp{};
+    sp.sched_priority = 70;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("lateral_mpc_node"),
+            "SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+    }
+
+    auto node = std::make_shared<LateralMpcNode>();
+    rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions{}, 2);
+    exec.add_node(node);
+    exec.spin();
     rclcpp::shutdown();
     return 0;
 }

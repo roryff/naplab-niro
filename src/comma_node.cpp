@@ -16,6 +16,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <iostream>
 
 using json = nlohmann::json;
@@ -103,30 +104,40 @@ public:
 private:
     void adb_sender_loop()
     {
-        // Send control commands at 50 Hz
-        const auto send_interval = std::chrono::milliseconds(20);
-        
+        // SCHED_FIFO priority 85: most critical thread — delivers commands to Comma 3X actuator
+        struct sched_param sp{};
+        sp.sched_priority = 85;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "adb_sender_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE). Timing may jitter.");
+        }
+
+        // Drift-free 50 Hz loop: sleep_until advances an absolute deadline each tick.
+        // Unlike sleep_for(remaining), this does NOT accumulate scheduler wake-up latency.
+        auto next = std::chrono::steady_clock::now();
         while (running_) {
-            auto start_time = std::chrono::steady_clock::now();
-            
+            next += std::chrono::milliseconds(20);  // 50 Hz absolute tick
             if (socket_fd_ >= 0) {
                 send_control_command();
             } else if (running_) {
-                // Only sleep if still running
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                next = std::chrono::steady_clock::now();  // reset deadline after long disconnect sleep
+                continue;
             }
-            
-            // Maintain precise 50 Hz timing
-            auto elapsed = std::chrono::steady_clock::now() - start_time;
-            auto sleep_time = send_interval - elapsed;
-            if (sleep_time > std::chrono::milliseconds(0) && running_) {
-                std::this_thread::sleep_for(sleep_time);
-            }
+            std::this_thread::sleep_until(next);
         }
     }
     
     void adb_reader_loop()
     {
+        // SCHED_FIFO priority 80: receives vehicle state that feeds all controllers
+        struct sched_param sp{};
+        sp.sched_priority = 80;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "adb_reader_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE). Timing may jitter.");
+        }
+
         bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
         
         if (use_tcp_tunnel) {
@@ -574,13 +585,24 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    
+
+    // Lock all memory pages to prevent page-fault latency spikes on RT kernel
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("comma_node"),
+            "mlockall failed: %s", strerror(errno));
+    }
+
+    // Promote main/executor thread (runs publish_timer_) to RT priority 55
+    struct sched_param sp{};
+    sp.sched_priority = 55;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("comma_node"),
+            "main SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+    }
+
     auto node = std::make_shared<CommaNode>();
     auto executor = rclcpp::executors::SingleThreadedExecutor();
     executor.add_node(node);
-    
-
-    
     executor.spin();
     rclcpp::shutdown();
     return 0;

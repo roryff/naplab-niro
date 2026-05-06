@@ -11,6 +11,13 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cerrno>
+#include <cstring>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 
 #include <osqp.h>
 #include <rclcpp/rclcpp.hpp>
@@ -164,6 +171,10 @@ bool loadConfig(const std::string& path, IntegratorParams& ip, ControllerParams&
 class SteeringMpcNode : public rclcpp::Node {
  public:
   SteeringMpcNode() : Node("steering_mpc_node") {
+    // Dedicate a MutuallyExclusive callback group for the MPC timer so it runs
+    // on its own executor thread and is not blocked by incoming topic callbacks
+    timer_cb_group_ = create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
     declare_parameter<std::string>("model_config_path", "");
     declare_parameter<double>("dt", kDefaultDt);
     declare_parameter<int>("horizon", kDefaultHorizon);
@@ -242,7 +253,7 @@ class SteeringMpcNode : public rclcpp::Node {
         [this](const car_control::msg::VehicleState::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(mutex_);
           double new_angle = static_cast<double>(msg->steering_angle_deg);
-          double t = rclcpp::Clock().now().seconds();
+          double t = this->now().seconds();
           if (last_angle_time_ > 0) {
             double dt = t - last_angle_time_;
             if (dt > 0 && dt < 1.0) {
@@ -279,7 +290,8 @@ class SteeringMpcNode : public rclcpp::Node {
 
     timer_ = create_wall_timer(
         std::chrono::duration<double>(ctrl_.dt),
-        [this]() { runMpcStep(); });
+        [this]() { runMpcStep(); },
+        timer_cb_group_);
 
     RCLCPP_INFO(get_logger(),
       "SteeringMpcNode ready  sub: path_follower/cmd_vel + vehicle/state  pub: cmd_vel");
@@ -523,7 +535,16 @@ class SteeringMpcNode : public rclcpp::Node {
     }
     OSQPInt err = osqp_setup(&osqp_workspace_, &P_csc, q.data(), &A_csc, l.data(), u.data(), m, n, &settings);
     if (err != 0) return u_prev;
-    osqp_solve(osqp_workspace_);
+    {
+      auto t0 = std::chrono::steady_clock::now();
+      osqp_solve(osqp_workspace_);
+      auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - t0).count();
+      if (dt_us > 80000) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "OSQP solve overrun: %ld µs (budget 80 ms)", dt_us);
+      }
+    }
     OSQPInt status = osqp_workspace_->info->status_val;
     if (status != OSQP_SOLVED && status != OSQP_SOLVED_INACCURATE) {
       return u_prev;
@@ -552,6 +573,7 @@ class SteeringMpcNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_dbg_actual_speed_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_dbg_speed_error_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::CallbackGroup::SharedPtr timer_cb_group_;
   std::mutex mutex_;
   double current_angle_     = 0.0;
   double current_rate_      = 0.0;
@@ -568,7 +590,23 @@ class SteeringMpcNode : public rclcpp::Node {
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<SteeringMpcNode>());
+
+  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    RCLCPP_WARN(rclcpp::get_logger("steering_mpc_node"),
+        "mlockall failed: %s", strerror(errno));
+  }
+
+  struct sched_param sp{};
+  sp.sched_priority = 70;
+  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+    RCLCPP_WARN(rclcpp::get_logger("steering_mpc_node"),
+        "SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+  }
+
+  auto node = std::make_shared<SteeringMpcNode>();
+  rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions{}, 2);
+  exec.add_node(node);
+  exec.spin();
   rclcpp::shutdown();
   return 0;
 }

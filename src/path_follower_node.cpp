@@ -24,11 +24,15 @@
  */
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include "car_control/msg/vehicle_state.hpp"
 
@@ -39,6 +43,8 @@
 #include <mutex>
 #include <sstream>
 #include <vector>
+#include <cerrno>
+#include <cstring>
 
 // ============================================================
 // Tuning constants (overridable via ROS 2 parameters)
@@ -208,6 +214,8 @@ public:
             last_gnss_time_(this->now()),
             hint_front_(0)
     {
+        timer_cb_group_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
         // ---- Parameters --------------------------------------------------------
         this->declare_parameter("desired_speed_mps", DEFAULT_SPEED);
         this->declare_parameter("stop_distance",     STOP_DISTANCE);
@@ -274,7 +282,8 @@ public:
         using namespace std::chrono_literals;
         control_timer_ = this->create_wall_timer(
             std::chrono::duration<double>(1.0 / CONTROL_HZ),
-            std::bind(&PathFollowerNode::controlLoop, this));
+            std::bind(&PathFollowerNode::controlLoop, this),
+            timer_cb_group_);
 
         RCLCPP_INFO(this->get_logger(),
             "PathFollowerNode ready.  Path length: %.1f m.  "
@@ -712,12 +721,29 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr    steer_ref_traj_pub_;
 
     rclcpp::TimerBase::SharedPtr                                      control_timer_;
+    rclcpp::CallbackGroup::SharedPtr                                  timer_cb_group_;
 };
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PathFollowerNode>());
+
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("path_follower_node"),
+            "mlockall failed: %s", strerror(errno));
+    }
+
+    struct sched_param sp{};
+    sp.sched_priority = 65;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("path_follower_node"),
+            "SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+    }
+
+    auto node = std::make_shared<PathFollowerNode>();
+    rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions{}, 2);
+    exec.add_node(node);
+    exec.spin();
     rclcpp::shutdown();
     return 0;
 }

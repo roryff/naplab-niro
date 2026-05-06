@@ -25,6 +25,9 @@
 #include <netinet/tcp.h>
 #include "car_control/ubx_protocol.hpp"
 #include "car_control/geo_utils.hpp"
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 /**
  * @brief GNSS Node for autonomous vehicle navigation
@@ -143,6 +146,14 @@ private:
      */
     void reader_loop()
     {
+        // SCHED_FIFO priority 75: GNSS data source for all control nodes
+        struct sched_param sp{};
+        sp.sched_priority = 75;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "reader_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+        }
+
         while (running_) {
             if (socket_fd_ < 0) {
                 if (!running_) break;
@@ -162,11 +173,6 @@ private:
             // Block on socket read - will return immediately when data arrives
             read_gnss_data();
 
-            // If read_gnss_data() closed the socket (error / remote close),
-            // wait before reconnecting.  The C103's sp_l2sw ethernet driver can
-            // lock up under sustained SYN load; exponential backoff keeps the
-            // retry rate low during an extended outage while still recovering
-            // quickly after a brief glitch.
             if (socket_fd_ < 0 && running_) {
                 int steps = reconnect_backoff_s_ * 10;  // 100 ms granularity
                 for (int i = 0; i < steps && running_; i++) {
@@ -180,10 +186,7 @@ private:
     /**
      * @brief Attempt to connect to u-blox receiver
      *
-     * Uses a local fd throughout so that socket_fd_ (visible to the sender
-     * thread) is only set once the socket is fully connected, configured, and
-     * back in blocking mode.  This prevents the sender from calling send() on
-     * a non-blocking or not-yet-connected fd (which would return EAGAIN).
+
      */
     void try_connect()
     {
@@ -906,6 +909,14 @@ private:
      */
     void sender_loop()
     {
+        // SCHED_FIFO priority 60: ADR wheel-speed feedback — important but not on actuator path
+        struct sched_param sp{};
+        sp.sched_priority = 60;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "sender_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
+        }
+
         using namespace std::chrono;
         auto next = steady_clock::now();
 
@@ -1055,6 +1066,13 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
+
+    // Lock all memory pages to prevent page-fault latency spikes on RT kernel
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        RCLCPP_WARN(rclcpp::get_logger("gnss_node"),
+            "mlockall failed: %s", strerror(errno));
+    }
+
     rclcpp::spin(std::make_shared<GNSSNode>());
     rclcpp::shutdown();
     return 0;
