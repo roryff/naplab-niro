@@ -965,7 +965,7 @@ private:
             path_.addWaypoint(x, last_y * taper);
         }
 
-        maybeSmoothPath("Sinusoidal path", n_tot + 1);
+        applyPathSmoothing("Sinusoidal path", n_tot + 1);
     }
 
     void loadPathFromCSV(const std::string& filename)
@@ -1002,7 +1002,7 @@ private:
             return;
         }
 
-        maybeSmoothPath(filename.c_str(), count);
+        applyPathSmoothing(filename.c_str(), count);
     }
 
     ReferencePoint loadReferencePoint()
@@ -1025,7 +1025,7 @@ private:
         return (point == ReferencePoint::FrontAxle) ? "front_axle" : "rear_axle";
     }
 
-    void maybeSmoothPath(const char* path_label, int waypoint_count)
+    void applyPathSmoothing(const char* path_label, int waypoint_count)
     {
         const double knot_m = get_parameter("path_spline_knot_m").as_double();
         if (knot_m > 0.0) {
