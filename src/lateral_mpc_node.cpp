@@ -42,6 +42,8 @@
 #include <sched.h>
 #include <sys/mman.h>
 
+#include <Eigen/Dense>
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -211,50 +213,102 @@ public:
     const std::vector<std::pair<double,double>>& waypoints() const { return wpts_; }
 
     /**
-     * Savitzky-Golay path smoother.
-     * For each waypoint fits a degree-2 polynomial over all neighbours within
-     * ±(window_m/2) arc-length, then replaces it with p(0) (the constant term).
-     * Arc-lengths are rebuilt afterwards.
+     * Cubic B-spline least-squares path smoother.
+     *
+     * Fits independent cubic B-splines x(s) and y(s) with interior knots
+     * placed every knot_spacing_m metres along the arc-length.  Solves the
+     * normal equations via Cholesky decomposition (Eigen::LLT), then
+     * resamples the spline at all original waypoint arc-lengths.
+     *
+     * This matches the Python LSQUnivariateSpline(k=3) implementation used
+     * for offline analysis, with the same 5 m default knot spacing.
      */
-    void smooth(double window_m)
+    void smoothSpline(double knot_spacing_m)
     {
         const int n = static_cast<int>(wpts_.size());
-        if (n < 3) return;
-        const double half = window_m / 2.0;
+        if (n < 4) return;
 
-        std::vector<double> sx(n), sy(n);
-        for (int i = 0; i < n; i++) {
-            const double s0 = s_[i];
-            double ATA[3][3] = {};
-            double ATbx[3]   = {};
-            double ATby[3]   = {};
+        const double L = s_.back();
+        if (L < knot_spacing_m) return;
 
-            for (int j = 0; j < n; j++) {
-                double dt = s_[j] - s0;
-                if (dt < -half || dt > half) continue;
-                double basis[3] = {1.0, dt, dt * dt};
-                for (int r = 0; r < 3; r++) {
-                    for (int c = 0; c < 3; c++)
-                        ATA[r][c] += basis[r] * basis[c];
-                    ATbx[r] += basis[r] * wpts_[j].first;
-                    ATby[r] += basis[r] * wpts_[j].second;
+        // --- Build interior knot vector ---
+        std::vector<double> interior_knots;
+        for (double t = knot_spacing_m; t < L - knot_spacing_m * 0.5; t += knot_spacing_m)
+            interior_knots.push_back(t);
+
+        // Full knot vector: degree k=3 requires k+1 repeated knots at each end.
+        const int k = 3;
+        std::vector<double> knots;
+        for (int i = 0; i <= k; i++) knots.push_back(0.0);
+        for (double t : interior_knots) knots.push_back(t);
+        for (int i = 0; i <= k; i++) knots.push_back(L);
+
+        const int m = static_cast<int>(knots.size());
+        const int nc = m - k - 1;  // number of B-spline control points
+
+        // --- Cox–de Boor basis evaluation ---
+        // Returns row vector of B_{i,k}(t) for i = 0 … nc-1.
+        auto bsplineBasis = [&](double t) -> Eigen::RowVectorXd {
+            // Clamp to valid range
+            t = std::clamp(t, 0.0, L);
+            // For t == L, push into last span
+            if (t >= L) t = L - 1e-10;
+
+            Eigen::RowVectorXd B = Eigen::RowVectorXd::Zero(nc);
+
+            // Degree-0 basis: indicator for knot span
+            std::vector<double> d(m - 1, 0.0);
+            for (int i = 0; i < m - 1; i++) {
+                if (t >= knots[i] && t < knots[i+1])
+                    d[i] = 1.0;
+            }
+
+            // De Boor recursion from degree 1 to k
+            for (int deg = 1; deg <= k; deg++) {
+                std::vector<double> d2(m - 1 - deg, 0.0);
+                for (int i = 0; i < static_cast<int>(d2.size()); i++) {
+                    double left = 0.0, right = 0.0;
+                    double dl = knots[i + deg] - knots[i];
+                    double dr = knots[i + deg + 1] - knots[i + 1];
+                    if (dl > 1e-12) left  = (t - knots[i])           / dl * d[i];
+                    if (dr > 1e-12) right = (knots[i+deg+1] - t)     / dr * d[i+1];
+                    d2[i] = left + right;
                 }
+                d.resize(d2.size());
+                d = d2;
             }
 
-            double cx[3] = {}, cy[3] = {};
-            if (!solveNE3(ATA, ATbx, cx) || !solveNE3(ATA, ATby, cy)) {
-                sx[i] = wpts_[i].first;
-                sy[i] = wpts_[i].second;
-            } else {
-                sx[i] = cx[0];
-                sy[i] = cy[0];
-            }
-        }
+            for (int i = 0; i < nc; i++) B(i) = d[i];
+            return B;
+        };
 
+        // --- Build least-squares system A (n x nc) ---
+        Eigen::MatrixXd A(n, nc);
+        for (int i = 0; i < n; i++)
+            A.row(i) = bsplineBasis(s_[i]);
+
+        Eigen::VectorXd fx(n), fy(n);
         for (int i = 0; i < n; i++) {
-            wpts_[i].first  = sx[i];
-            wpts_[i].second = sy[i];
+            fx(i) = wpts_[i].first;
+            fy(i) = wpts_[i].second;
         }
+
+        // Normal equations: (A^T A) c = A^T f
+        Eigen::MatrixXd ATA = A.transpose() * A;
+        Eigen::LLT<Eigen::MatrixXd> llt(ATA);
+        if (llt.info() != Eigen::Success) return;  // singular — skip smoothing
+
+        Eigen::VectorXd cx = llt.solve(A.transpose() * fx);
+        Eigen::VectorXd cy = llt.solve(A.transpose() * fy);
+
+        // --- Resample spline at original arc-lengths ---
+        for (int i = 0; i < n; i++) {
+            Eigen::RowVectorXd B = bsplineBasis(s_[i]);
+            wpts_[i].first  = B.dot(cx);
+            wpts_[i].second = B.dot(cy);
+        }
+
+        // Rebuild arc-length table
         s_[0] = 0.0;
         for (int i = 1; i < n; i++) {
             double dx = wpts_[i].first  - wpts_[i-1].first;
@@ -266,35 +320,6 @@ public:
 private:
     std::vector<std::pair<double,double>> wpts_;
     std::vector<double>                   s_;
-
-    /** Solve 3×3 system via Gaussian elimination with partial pivoting. */
-    static bool solveNE3(double A[3][3], const double b[3], double x[3])
-    {
-        double M[3][3], rhs[3];
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) M[i][j] = A[i][j];
-            rhs[i] = b[i];
-        }
-        for (int p = 0; p < 3; p++) {
-            int maxR = p;
-            for (int r = p+1; r < 3; r++)
-                if (std::abs(M[r][p]) > std::abs(M[maxR][p])) maxR = r;
-            for (int c = 0; c < 3; c++) std::swap(M[p][c], M[maxR][c]);
-            std::swap(rhs[p], rhs[maxR]);
-            if (std::abs(M[p][p]) < 1e-12) return false;
-            for (int r = p+1; r < 3; r++) {
-                double f = M[r][p] / M[p][p];
-                for (int c = p; c < 3; c++) M[r][c] -= f * M[p][c];
-                rhs[r] -= f * rhs[p];
-            }
-        }
-        for (int i = 2; i >= 0; i--) {
-            x[i] = rhs[i];
-            for (int j = i+1; j < 3; j++) x[i] -= M[i][j] * x[j];
-            x[i] /= M[i][i];
-        }
-        return true;
-    }
 
     std::pair<double,double> interp(double s) const
     {
@@ -353,7 +378,7 @@ public:
         declare_parameter<std::string>("sched_fo2_model_path", "");
         declare_parameter("weight_delta", 0.0);  // delta reference tracking weight; 0=disabled
         declare_parameter<std::string>("reference_point", "rear_axle");
-        declare_parameter("path_smoothing_window_m", 0.0);
+        declare_parameter("path_spline_knot_m", 5.0);
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
         reference_point_ = loadReferencePoint();
@@ -414,10 +439,10 @@ public:
         auto_enable_ = get_parameter("auto_enable").as_bool();
 
         RCLCPP_INFO(get_logger(),
-            "LateralMpcNode ready. Path: %.1f m  N=%d  ref=%s  smooth=%.2f m  weight_delta=%.2f. "
+            "LateralMpcNode ready. Path: %.1f m  N=%d  ref=%s  spline_knot=%.2f m  weight_delta=%.2f. "
             "Publish 'true' on ~/enable_path_following to start.",
             path_.totalLength(), N_, referencePointName(reference_point_),
-            get_parameter("path_smoothing_window_m").as_double(),
+            get_parameter("path_spline_knot_m").as_double(),
             get_parameter("weight_delta").as_double());
 
         if (auto_enable_) {
@@ -1002,12 +1027,12 @@ private:
 
     void maybeSmoothPath(const char* path_label, int waypoint_count)
     {
-        const double smooth_window_m = get_parameter("path_smoothing_window_m").as_double();
-        if (smooth_window_m > 0.0) {
-            path_.smooth(smooth_window_m);
+        const double knot_m = get_parameter("path_spline_knot_m").as_double();
+        if (knot_m > 0.0) {
+            path_.smoothSpline(knot_m);
             RCLCPP_INFO(get_logger(),
-                "Loaded %s: %d waypoints, %.1f m total (SG-smoothed %.2f m).",
-                path_label, waypoint_count, path_.totalLength(), smooth_window_m);
+                "Loaded %s: %d waypoints, %.1f m total (B-spline smoothed, knot spacing %.2f m).",
+                path_label, waypoint_count, path_.totalLength(), knot_m);
             return;
         }
 

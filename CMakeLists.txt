@@ -15,6 +15,7 @@ find_package(foxglove_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 # GStreamer (for camera_node)
 find_package(PkgConfig REQUIRED)
@@ -98,7 +99,7 @@ target_link_libraries(steering_mpc_node osqpstatic ${cpp_typesupport_target})
 add_executable(lateral_mpc_node src/lateral_mpc_node.cpp)
 ament_target_dependencies(lateral_mpc_node rclcpp std_msgs geometry_msgs nav_msgs)
 target_include_directories(lateral_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
-target_link_libraries(lateral_mpc_node osqpstatic ${cpp_typesupport_target})
+target_link_libraries(lateral_mpc_node osqpstatic ${cpp_typesupport_target} Eigen3::Eigen)
 add_executable(sysid_node src/sysid_node.cpp)
 ament_target_dependencies(sysid_node rclcpp std_msgs geometry_msgs)
 target_link_libraries(sysid_node ${cpp_typesupport_target})
@@ -142,7 +143,6 @@ install(TARGETS camera_node_component
 install(PROGRAMS
   scripts/dashboard_server.py
   scripts/drive_recorder.py
-  scripts/Kia_niro_rosnode.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
