@@ -41,5 +41,10 @@ camera_node:
       # UDP multicast socket buffer (bytes)
       udp_buffer_size: 4194304  # 4 MB for bursty HEVC data
       
+      # H.264 re-encode bitrate (bps). Default 20 Mbps reduces macroblocking.
+      # Original Comma 3X stream is H.265; this re-encodes for Foxglove compatibility.
+      # Increase for better quality at the cost of bag file size.
+      encode_bitrate_bps: 20000000  # 20 Mbps
+      
       # Ring buffer duration (ms) for sync tolerance
       ring_buffer_ms: 100
