@@ -143,6 +143,10 @@ install(TARGETS camera_node_component
 # Install Python scripts
 install(PROGRAMS
   scripts/dashboard_server.py
+  scripts/Kia_niro_rosnode.py
+  scripts/Kia-rosnode_v2.py
+  scripts/nmpc_path_follower_node.py
+  scripts/nmpc_core.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
