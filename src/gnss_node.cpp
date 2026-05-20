@@ -68,6 +68,9 @@ public:
         this->declare_parameter("origin_lat", 0.0);
         this->declare_parameter("origin_lon", 0.0);
         this->declare_parameter("origin_alt", 0.0);
+        this->declare_parameter<double>("antenna_forward_offset_m", 0.30);
+        // Antenna is mounted 30 cm forward of the rear axle (where the IMU receiver sits).
+        // Subtracting this offset along the heading vector corrects gnss/pose to the rear axle.
         
         // Publishers
         pose_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
@@ -539,8 +542,6 @@ private:
         auto pose_msg = geometry_msgs::msg::PoseStamped();
         pose_msg.header = navsat_msg.header;
         pose_msg.header.frame_id = "utm32"; // UTM zone 32N (EPSG:25832)
-        pose_msg.pose.position.x = east;
-        pose_msg.pose.position.y = north;
         pose_msg.pose.position.z = navsat_msg.altitude - origin_alt_;
         
         // headVeh: NED heading (CW from North), in 1e-5 deg. Valid when flags2 bit 5 set.
@@ -551,6 +552,12 @@ private:
         }
         // else: hold last valid heading (fusion momentarily unavailable)
         double enu_yaw = last_valid_enu_yaw_;
+
+        // Correct antenna position to rear axle: antenna is antenna_forward_offset_m
+        // ahead of the rear axle along the vehicle heading direction.
+        double ant_offset = this->get_parameter("antenna_forward_offset_m").as_double();
+        pose_msg.pose.position.x = east  - ant_offset * std::cos(enu_yaw);
+        pose_msg.pose.position.y = north - ant_offset * std::sin(enu_yaw);
         pose_msg.pose.orientation.w = std::cos(enu_yaw / 2.0);
         pose_msg.pose.orientation.x = 0.0;
         pose_msg.pose.orientation.y = 0.0;
