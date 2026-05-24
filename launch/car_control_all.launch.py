@@ -47,6 +47,18 @@ def launch_setup(context, *args, **kwargs):
         parameters=[cfg('gnss_node.yaml')],
     ))
 
+    # ---- sensor frames / TF tree (always) -------------------------------------
+    urdf_path = os.path.join(pkg_share, 'config', 'kia_niro_frames.urdf')
+    with open(urdf_path, 'r') as _f:
+        robot_description = _f.read()
+    nodes.append(Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{'robot_description': robot_description}],
+    ))
+
     if control_mode == 'cascade':
         # ---- Option A: path_follower_node + steering_mpc_node ------------------
         #

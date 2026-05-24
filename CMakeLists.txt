@@ -164,6 +164,12 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install mesh files
+install(DIRECTORY
+  meshes
+  DESTINATION share/${PROJECT_NAME}
+)
+
 # Install bundled paths
 install(DIRECTORY
   paths
