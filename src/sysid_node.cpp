@@ -1,7 +1,13 @@
 /**
  * @file sysid_node.cpp
  * @brief Steering actuator system identification node.
- *
+ * 
+ *ros2 run car_control sysid_node \
+    --ros-args -p test_mode:=steady_state \
+               -p amplitude:=1.0 \
+               -p desired_speed_kmh:=20.0 \
+               -p step_hold_s:=20.0
+10,15,20,25,30,35,40,45,50
  * Generates open-loop torque excitation signals (chirp, PRBS, step sequence, rate-limit
  * characterisation) while holding target speed with a P-controller.
  * All signals are recorded via rosbag — record /vehicle/state, /cmd_vel,
@@ -25,16 +31,21 @@
  *
  * Test modes
  * ----------
- *   prbs       – random binary signal: alternates +/-amplitude with random hold times.
- *                Broadband excitation that works correctly with the panda rate limiter —
- *                signal is always fully settled at +/-A so rate-limited transitions are
- *                brief transients, not distorted waveforms. Use car_output_torque as the
- *                MATLAB input u. Default min/max hold: 0.5–3.0 s (covers 0.15–2 Hz).
- *   chirp      – linear frequency sweep. Only use at amplitude <= 0.30 to stay below
- *                the panda rate limiter and keep sinusoids undistorted.
- *   step       – one-shot: +A hold, 0 hold, -A hold, 0 hold (step_hold_s each)
- *   ratelimit  – fast full-step to characterise panda safety rate limits
- *   idle       – zero torque (for baseline / debug)
+ *   prbs         – random binary signal: alternates +/-amplitude with random hold times.
+ *                  Broadband excitation that works correctly with the panda rate limiter —
+ *                  signal is always fully settled at +/-A so rate-limited transitions are
+ *                  brief transients, not distorted waveforms. Use car_output_torque as the
+ *                  MATLAB input u. Default min/max hold: 0.5–3.0 s (covers 0.15–2 Hz).
+ *   chirp        – linear frequency sweep. Only use at amplitude <= 0.30 to stay below
+ *                  the panda rate limiter and keep sinusoids undistorted.
+ *   step         – one-shot: -A hold, 0 hold, +A hold, 0 hold (step_hold_s each)
+ *   steady_state – long saturated hold to find true steering steady-state:
+ *                  1 s baseline → +A held for step_hold_s → 2 s neutral →
+ *                  -A held for step_hold_s → 2 s neutral.
+ *                  Use step_hold_s >= 20 s so the wheel fully converges before the
+ *                  operator takes over. lat_active dropping always terminates safely.
+ *   ratelimit    – fast full-step to characterise panda safety rate limits
+ *   idle         – zero torque (for baseline / debug)
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -72,10 +83,10 @@ public:
         declare_parameter<double>     ("freq_start",       0.20);
         declare_parameter<double>     ("freq_end",         2.0);
         declare_parameter<double>     ("duration_s",       60.0);
-        declare_parameter<double>     ("desired_speed_mps", 5.0);
+        declare_parameter<double>     ("desired_speed_kmh", 18.0);
         declare_parameter<double>     ("kp_speed",         0.3);
-        declare_parameter<double>     ("speed_tol_mps",    0.5);
-        declare_parameter<double>     ("step_hold_s",      3.0);
+        declare_parameter<double>     ("speed_tol_kmh",    2.0);
+        declare_parameter<double>     ("step_hold_s",      20.0);
         declare_parameter<double>     ("prbs_min_hold_s",  0.5);
         declare_parameter<double>     ("prbs_max_hold_s",  3.0);
 
@@ -84,14 +95,15 @@ public:
         freq_start_     = get_parameter("freq_start").as_double();
         freq_end_       = get_parameter("freq_end").as_double();
         duration_s_     = get_parameter("duration_s").as_double();
-        desired_speed_  = get_parameter("desired_speed_mps").as_double();
+        desired_speed_  = get_parameter("desired_speed_kmh").as_double() / 3.6;
         kp_speed_       = get_parameter("kp_speed").as_double();
-        speed_tol_mps_  = get_parameter("speed_tol_mps").as_double();
+        speed_tol_mps_  = get_parameter("speed_tol_kmh").as_double() / 3.6;
         step_hold_s_    = get_parameter("step_hold_s").as_double();
         prbs_min_hold_  = get_parameter("prbs_min_hold_s").as_double();
         prbs_max_hold_  = get_parameter("prbs_max_hold_s").as_double();
-        // One-shot step mode: duration auto-set from step_hold_s
-        if (test_mode_ == "step") duration_s_ = 4.0 * step_hold_s_;
+        // Auto-set duration from step_hold_s for timed modes
+        if (test_mode_ == "step")         duration_s_ = 4.0 * step_hold_s_;
+        if (test_mode_ == "steady_state") duration_s_ = 2.0 * step_hold_s_ + 5.0;
 
         // ---- Subscriptions -----------------------------------------------------
         sub_state_ = create_subscription<car_control::msg::VehicleState>(
@@ -126,9 +138,9 @@ public:
 
         RCLCPP_INFO(get_logger(),
             "SysidNode ready.  mode=%s  A=%.2f  f=%.2f-%.2f Hz  dur=%.0fs  "
-            "target_speed=%.1f m/s",
+            "target_speed=%.1f km/h",
             test_mode_.c_str(), amplitude_,
-            freq_start_, freq_end_, duration_s_, desired_speed_);
+            freq_start_, freq_end_, duration_s_, desired_speed_ * 3.6);
         RCLCPP_INFO(get_logger(),
             "Waiting for lat_active=true to begin excitation.");
 
@@ -235,6 +247,8 @@ private:
             return chirp(t);
         } else if (test_mode_ == "step") {
             return stepSequence(t);
+        } else if (test_mode_ == "steady_state") {
+            return steadyState(t);
         } else if (test_mode_ == "ratelimit") {
             return rateLimitTest(t);
         }
@@ -289,6 +303,28 @@ private:
         else if (t < 2.0 * step_hold_s_)     return  0.0;
         else if (t < 3.0 * step_hold_s_)     return amplitude_;
         else                                  return  0.0;
+    }
+
+    /**
+     * Saturated hold sequence — finds the true steady-state steering angle.
+     *
+     * Timeline (step_hold_s = H):
+     *   0–1 s        →  0          (baseline, wheel centred)
+     *   1–(1+H) s    → +amplitude  (hold until wheel converges — watch steering_angle_deg)
+     *   (1+H)–(3+H)  →  0          (recovery)
+     *   (3+H)–(3+2H) → −amplitude  (opposite direction)
+     *   (3+2H)–(5+2H)→  0          (trailing rest; DONE triggered by duration timer)
+     *
+     * Set step_hold_s >= 20 s.  The operator can safely take over at any time
+     * (lat_active drop stops excitation immediately).
+     */
+    double steadyState(double t)
+    {
+        if      (t < 1.0)                          return  0.0;
+        else if (t < 1.0 + step_hold_s_)           return  amplitude_;
+        else if (t < 3.0 + step_hold_s_)           return  0.0;
+        else if (t < 3.0 + 2.0 * step_hold_s_)    return -amplitude_;
+        else                                        return  0.0;
     }
 
     /**
