@@ -369,8 +369,9 @@ public:
         declare_parameter("weight_torque",     0.1);
         declare_parameter("tau_r",             0.78);  // actuator time constant [s]
         declare_parameter("gain_r",            36.0);  // sw-deg/s per unit torque
-        declare_parameter("rate_up",           4.3/3.0);
-        declare_parameter("rate_down",         4.3/3.0);
+        declare_parameter("rate_up",           1.033);   // rise: magnitude increase [norm/s]
+        declare_parameter("rate_down",         1.833);   // fall: magnitude decrease [norm/s]
+        declare_parameter("split_l1",          5e-2);    // L1 penalty on u_p+u_m: enforces complementarity
         declare_parameter("torque_limit",      1.0);
         declare_parameter("kp_speed",          0.3);
         declare_parameter<std::string>("path_csv_file", "");
@@ -538,6 +539,8 @@ private:
             hint_front_      = 0;
             hint_rear_       = 0;
             u_prev_          = 0.0;
+            u_prev_p_        = 0.0;
+            u_prev_m_        = 0.0;
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
             RCLCPP_INFO(get_logger(), "Path following STARTED.");
@@ -690,6 +693,7 @@ private:
         const double rate_up   = get_parameter("rate_up").as_double();
         const double rate_down = get_parameter("rate_down").as_double();
         const double tlim      = get_parameter("torque_limit").as_double();
+        const double split_l1  = get_parameter("split_l1").as_double();
 
         const double v_eff = std::max(0.5, v);  // guard against division by zero at low speed
         const double v_kmh = v * 3.6;
@@ -717,7 +721,9 @@ private:
             b_rate = alpha * gain_r_rad;
         }
 
-        // ---- Build QP cost matrices (upper-triangular P, gradient q) --------
+        // ---- Build QP cost matrices (n×n upper-triangular P, gradient q) ----
+        // The propagation uses n scalar torques u_k. After the loop P and q are
+        // expanded to 2n variables via the u+/u- split (see below).
         const int P_nz = n * (n + 1) / 2;
         std::vector<OSQPFloat> P_x(P_nz, 0.0);
         std::vector<OSQPInt>   P_i(P_nz, 0);
@@ -833,58 +839,118 @@ private:
             P_x[P_p[k] + k] += static_cast<OSQPFloat>(2.0 * w_t);
         }
 
-        // ---- Build constraint matrix A (signed torque slew + magnitude) ------
-        // The a_k magnitude relaxation allowed sign flips at full magnitude in bag5,
-        // which does not match the actuator. Keep the stable signed slew model.
-        //   Rows 4k+0: U_{k-1} - U_k ≤ rate_up*dt   (u_prev for k=0)
-        //   Rows 4k+1: U_k - U_{k-1} ≤ rate_down*dt
-        //   Rows 4k+2: U_k ≤ tlim
-        //   Rows 4k+3: -U_k ≤ tlim
-        const int m = 4 * n;
-        std::vector<OSQPFloat> A_x;
-        std::vector<OSQPInt>   A_i;
-        std::vector<OSQPInt>   A_p(n + 1, 0);
-        std::vector<OSQPFloat> l_c(m, static_cast<OSQPFloat>(-OSQP_INFTY));
-        std::vector<OSQPFloat> u_c(m,  static_cast<OSQPFloat>( OSQP_INFTY));
+        // ---- Expand P (n×n) → P2 (2n×2n) and q (n) → q2 (2n) ---------------
+        // Decision variables: [u_0_p, u_0_m, u_1_p, u_1_m, ..., u_{N-1}_p, u_{N-1}_m]
+        // where u_k = u_k_p - u_k_m,  u_k_p >= 0,  u_k_m >= 0.
+        // Mapping: P2 = T^T P_orig T,  q2 = T^T q_orig,
+        //   with T[k, 2k]=+1, T[k, 2k+1]=-1.
+        // Complementarity (u_k_p * u_k_m = 0) is enforced implicitly: the
+        // quadratic cost w_t*(u_k_p - u_k_m)^2 drives one component to zero.
+        const int n2    = 2 * n;
+        const int P_nz2 = n2 * (n2 + 1) / 2;
+        std::vector<OSQPFloat> P2_x(P_nz2, 0.0f);
+        std::vector<OSQPInt>   P2_i(P_nz2);
+        std::vector<OSQPInt>   P2_p(n2 + 1, 0);
+        for (int j = 0; j < n2; j++) P2_p[j + 1] = P2_p[j] + (j + 1);
+        for (int j = 0; j < n2; j++)
+            for (int i = 0; i <= j; i++)
+                P2_i[P2_p[j] + i] = i;
 
-        u_c[0] = static_cast<OSQPFloat>( u_prev_ + rate_up   * dt);
-        u_c[1] = static_cast<OSQPFloat>(-u_prev_ + rate_down * dt);
-        u_c[2] = static_cast<OSQPFloat>(tlim);
-        u_c[3] = static_cast<OSQPFloat>(tlim);
-        for (int k = 1; k < n; k++) {
-            u_c[4*k]   = static_cast<OSQPFloat>(rate_up   * dt);
-            u_c[4*k+1] = static_cast<OSQPFloat>(rate_down * dt);
-            u_c[4*k+2] = static_cast<OSQPFloat>(tlim);
-            u_c[4*k+3] = static_cast<OSQPFloat>(tlim);
-        }
-
-        int nz = 0;
-        for (int j = 0; j < n; j++) {
-            A_p[j] = nz;
-            A_x.push_back( 1.0f); A_i.push_back(4*j);
-            A_x.push_back(-1.0f); A_i.push_back(4*j+1);
-            A_x.push_back( 1.0f); A_i.push_back(4*j+2);
-            A_x.push_back(-1.0f); A_i.push_back(4*j+3);
-            nz += 4;
-            if (j + 1 < n) {
-                A_x.push_back(-1.0f); A_i.push_back(4*(j+1));
-                A_x.push_back( 1.0f); A_i.push_back(4*(j+1)+1);
-                nz += 2;
+        for (int j_o = 0; j_o < n; j_o++) {
+            for (int i_o = 0; i_o <= j_o; i_o++) {
+                const double val = static_cast<double>(P_x[P_p[j_o] + i_o]);
+                if (val == 0.0) continue;
+                auto add = [&](int row, int col, double v) {
+                    if (row > col) return;
+                    P2_x[P2_p[col] + row] += static_cast<OSQPFloat>(v);
+                };
+                add(2*i_o,   2*j_o,    val);   // pp
+                add(2*i_o+1, 2*j_o+1,  val);   // mm
+                add(2*i_o,   2*j_o+1, -val);   // pm (always upper-tri when i_o<=j_o)
+                if (i_o < j_o)
+                    add(2*i_o+1, 2*j_o, -val); // mp (upper-tri only when i_o<j_o)
             }
         }
-        A_p[n] = nz;
+
+        // Expand gradient q and add L1 penalty on u_p+u_m.
+        // split_l1*(u_p+u_m) breaks the u_p==u_m degeneracy and enforces complementarity.
+        std::vector<OSQPFloat> q2_vec(n2);
+        for (int k = 0; k < n; k++) {
+            q2_vec[2*k]   = static_cast<OSQPFloat>( q_vec[k] + split_l1);
+            q2_vec[2*k+1] = static_cast<OSQPFloat>(-q_vec[k] + split_l1);
+        }
+
+        // ---- Build constraint matrix A (7n rows × 2n cols) ------------------
+        // Per step k, rows 7k..7k+6:
+        //   7k+0  rise_p:  u_k_p - u_{k-1}_p  <= rate_rise*dt   (magnitude build limit)
+        //   7k+1  fall_p:  u_{k-1}_p - u_k_p  <= rate_fall*dt   (magnitude release limit)
+        //   7k+2  rise_m:  u_k_m - u_{k-1}_m  <= rate_rise*dt
+        //   7k+3  fall_m:  u_{k-1}_m - u_k_m  <= rate_fall*dt
+        //   7k+4  nonneg_p: u_k_p >= 0
+        //   7k+5  nonneg_m: u_k_m >= 0
+        //   7k+6  mag:     -tlim <= u_k_p - u_k_m <= tlim
+        const double rate_rise  = rate_up;
+        const double rate_fall  = rate_down;
+        const int m2 = 7 * n;
+        std::vector<OSQPFloat> A2_x;
+        std::vector<OSQPInt>   A2_i;
+        std::vector<OSQPInt>   A2_p(n2 + 1, 0);
+        std::vector<OSQPFloat> l2_c(m2, static_cast<OSQPFloat>(-OSQP_INFTY));
+        std::vector<OSQPFloat> u2_c(m2, static_cast<OSQPFloat>( OSQP_INFTY));
+
+        for (int k = 0; k < n; k++) {
+            const double pp = (k == 0) ? u_prev_p_ : 0.0;
+            const double mp = (k == 0) ? u_prev_m_ : 0.0;
+            u2_c[7*k+0] = static_cast<OSQPFloat>( pp + rate_rise * dt);
+            u2_c[7*k+1] = static_cast<OSQPFloat>(-pp + rate_fall * dt);
+            u2_c[7*k+2] = static_cast<OSQPFloat>( mp + rate_rise * dt);
+            u2_c[7*k+3] = static_cast<OSQPFloat>(-mp + rate_fall * dt);
+            l2_c[7*k+4] = 0.0f;
+            l2_c[7*k+5] = 0.0f;
+            l2_c[7*k+6] = static_cast<OSQPFloat>(-tlim);
+            u2_c[7*k+6] = static_cast<OSQPFloat>( tlim);
+        }
+
+        int nz2 = 0;
+        for (int k = 0; k < n; k++) {
+            // Column 2k: u_k_p
+            A2_p[2*k] = nz2;
+            A2_x.push_back( 1.0f); A2_i.push_back(7*k+0);  // rise_p
+            A2_x.push_back(-1.0f); A2_i.push_back(7*k+1);  // fall_p
+            A2_x.push_back( 1.0f); A2_i.push_back(7*k+4);  // nonneg_p
+            A2_x.push_back( 1.0f); A2_i.push_back(7*k+6);  // mag
+            nz2 += 4;
+            if (k + 1 < n) {
+                A2_x.push_back(-1.0f); A2_i.push_back(7*(k+1)+0);  // next rise_p
+                A2_x.push_back( 1.0f); A2_i.push_back(7*(k+1)+1);  // next fall_p
+                nz2 += 2;
+            }
+            // Column 2k+1: u_k_m
+            A2_p[2*k+1] = nz2;
+            A2_x.push_back( 1.0f); A2_i.push_back(7*k+2);  // rise_m
+            A2_x.push_back(-1.0f); A2_i.push_back(7*k+3);  // fall_m
+            A2_x.push_back( 1.0f); A2_i.push_back(7*k+5);  // nonneg_m
+            A2_x.push_back(-1.0f); A2_i.push_back(7*k+6);  // mag
+            nz2 += 4;
+            if (k + 1 < n) {
+                A2_x.push_back(-1.0f); A2_i.push_back(7*(k+1)+2);  // next rise_m
+                A2_x.push_back( 1.0f); A2_i.push_back(7*(k+1)+3);  // next fall_m
+                nz2 += 2;
+            }
+        }
+        A2_p[n2] = nz2;
 
         // ---- OSQP setup & solve ---------------------------------------------
-        OSQPCscMatrix P_csc;
-        P_csc.m = n; P_csc.n = n; P_csc.nzmax = P_nz; P_csc.nz = -1;
-        P_csc.x = P_x.data(); P_csc.i = P_i.data(); P_csc.p = P_p.data();
-        P_csc.owned = 0;
+        OSQPCscMatrix P2_csc;
+        P2_csc.m = n2; P2_csc.n = n2; P2_csc.nzmax = P_nz2; P2_csc.nz = -1;
+        P2_csc.x = P2_x.data(); P2_csc.i = P2_i.data(); P2_csc.p = P2_p.data();
+        P2_csc.owned = 0;
 
-        OSQPCscMatrix A_csc;
-        A_csc.m = m; A_csc.n = n;
-        A_csc.nzmax = static_cast<OSQPInt>(A_x.size()); A_csc.nz = -1;
-        A_csc.x = A_x.data(); A_csc.i = A_i.data(); A_csc.p = A_p.data();
-        A_csc.owned = 0;
+        OSQPCscMatrix A2_csc;
+        A2_csc.m = m2; A2_csc.n = n2;
+        A2_csc.nzmax = static_cast<OSQPInt>(A2_x.size()); A2_csc.nz = -1;
+        A2_csc.x = A2_x.data(); A2_csc.i = A2_i.data(); A2_csc.p = A2_p.data();
+        A2_csc.owned = 0;
 
         OSQPSettings settings;
         osqp_set_default_settings(&settings);
@@ -894,8 +960,8 @@ private:
             osqp_cleanup(osqp_solver_);
             osqp_solver_ = nullptr;
         }
-        OSQPInt err = osqp_setup(&osqp_solver_, &P_csc, q_vec.data(),
-                                 &A_csc, l_c.data(), u_c.data(), m, n, &settings);
+        OSQPInt err = osqp_setup(&osqp_solver_, &P2_csc, q2_vec.data(),
+                                 &A2_csc, l2_c.data(), u2_c.data(), m2, n2, &settings);
         if (err != 0) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                 "OSQP setup failed (err=%d); holding previous torque.", static_cast<int>(err));
@@ -920,7 +986,10 @@ private:
             return u_prev_;
         }
 
-        double u0 = osqp_solver_->solution->x[0];
+        // u_k = u_k_p - u_k_m; update split state for next cycle
+        u_prev_p_ = std::max(0.0, static_cast<double>(osqp_solver_->solution->x[0]));
+        u_prev_m_ = std::max(0.0, static_cast<double>(osqp_solver_->solution->x[1]));
+        const double u0 = u_prev_p_ - u_prev_m_;
         return std::clamp(u0, -tlim, tlim);
     }
 
@@ -1168,8 +1237,10 @@ private:
     bool   auto_enable_fired_  = false;
 
     // MPC state
-    double u_prev_ = 0.0;
-    int    N_      = 40;
+    double u_prev_   = 0.0;
+    double u_prev_p_ = 0.0;  // positive component of u_prev_ (u_prev_ = u_prev_p_ - u_prev_m_)
+    double u_prev_m_ = 0.0;  // negative magnitude component
+    int    N_        = 40;
 
     // sched_fo2 actuator model (loaded from sched_fo2_model_path if provided)
     bool use_sched_fo2_ = false;
