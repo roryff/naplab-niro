@@ -105,7 +105,29 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
 .modal-save{background:#1a3d1f;color:#3fb950;border:1px solid #2a5c2f!important}
 .modal-save:hover{background:#2a5c2f}
 .modal-discard{background:#3d0f0a;color:#f85149;border:1px solid #6b1d17!important}
-.modal-discard:hover{background:#6b1d17}</style>
+.modal-discard:hover{background:#6b1d17}
+/* ── Path picker modal ──────────────────────────────────────────────────── */
+#path-modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9000;align-items:center;justify-content:center}
+#path-modal-overlay.open{display:flex}
+#path-modal{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px 22px 16px;width:min(420px,92vw);box-shadow:0 8px 32px #000a;max-height:80vh;display:flex;flex-direction:column}
+#path-modal h3{margin:0 0 4px;font-size:14px;color:#e6edf3;font-weight:600}
+#path-modal p{margin:0 0 10px;font-size:11px;color:#6e7681}
+#path-list{overflow-y:auto;flex:1;border:1px solid #21262d;border-radius:6px;margin-bottom:10px}
+.path-item{padding:9px 12px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;justify-content:space-between;align-items:center;transition:background .12s}
+.path-item:last-child{border-bottom:none}
+.path-item:hover{background:#1c2128}
+.path-item.path-active{background:#0d2116;border-left:3px solid #3fb950}
+.path-item .path-name{font-size:12px;color:#e6edf3;font-family:monospace}
+.path-item .path-meta{font-size:10px;color:#6e7681}
+#path-modal .modal-row{display:flex;gap:8px;margin-top:4px}
+#path-modal .modal-row button{flex:1;padding:7px 0;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;background:#21262d;color:#8b949e}
+#path-modal .modal-row button:hover{background:#30363d}
+/* path selector row */
+.path-selector-row{display:flex;justify-content:space-between;align-items:center;margin-top:8px;margin-bottom:2px}
+#path-loaded-name{font-size:11px;color:#6e7681;font-family:monospace;padding:3px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+#path-loaded-name.loaded{color:#3fb950}
+.btn-load-path{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#8b949e;font-size:11px;padding:4px 8px;cursor:pointer;white-space:nowrap}
+.btn-load-path:hover{background:#161b22;color:#e6edf3;border-color:#58a6ff}</style>
 </head>
 <body>
 <header>
@@ -124,7 +146,7 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
         <span>Satellite Map</span>
         <span style="display:flex;gap:8px;align-items:center">
           <button id="follow-car-btn" class="badge bg-grey" style="border:none;cursor:pointer;padding:2px 8px" title="Re-centre on car">⊛ Follow</button>
-          <span id="map-status-badge" class="badge bg-grey">NO PATH</span>
+          <button id="map-status-badge" class="badge bg-grey" onclick="openPathPicker()" style="border:none;cursor:pointer;padding:2px 8px" title="Click to load a path">LOAD PATH</button>
         </span>
       </div>
       <div class="card-body" style="padding:8px;position:relative">
@@ -165,7 +187,7 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
           </div>
           <button id="enable-btn" class="enable-btn start" onclick="togglePathFollowing()">▶ Start Path Following</button>
           <div id="enable-status"></div>          <button id="record-btn" class="record-btn idle" onclick="toggleRecording()">&#9210; Record Path</button>
-          <div id="record-status"></div>        </div>
+          <div id="record-status"></div>
       </div>
 
       <!-- Steering gauge -->
@@ -381,6 +403,68 @@ function setHTML(id,v){ const el=document.getElementById(id); if(el) el.innerHTM
 function setClass(id,c){ const el=document.getElementById(id); if(el) el.className=c; }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Path picker
+// ═══════════════════════════════════════════════════════════════════════════
+function openPathPicker(){
+  const overlay = document.getElementById('path-modal-overlay');
+  if(overlay) overlay.classList.add('open');
+  const listEl = document.getElementById('path-list');
+  if(listEl) listEl.innerHTML = '<div style="color:#6e7681;text-align:center;padding:16px">Loading…</div>';
+  fetch('/api/paths')
+    .then(r=>r.json())
+    .then(d=>{
+      if(!listEl) return;
+      if(!d.paths || d.paths.length===0){
+        listEl.innerHTML='<div style="color:#6e7681;text-align:center;padding:16px">No CSV files found</div>';
+        return;
+      }
+      listEl.innerHTML = d.paths.map(p=>`
+        <div class="path-item${p.active?' path-active':''}" onclick="loadPath('${p.name.replace(/'/g,'\\&#39;')}')">
+          <span class="path-name">${p.name}</span>
+          <span class="path-meta">${p.size_kb} KB</span>
+        </div>`).join('');
+    })
+    .catch(()=>{ if(listEl) listEl.innerHTML='<div style="color:#f85149;padding:16px">Failed to load list</div>'; });
+}
+
+function closePathPicker(){
+  const overlay = document.getElementById('path-modal-overlay');
+  if(overlay) overlay.classList.remove('open');
+}
+
+function removePath(){
+  closePathPicker();
+  const el = document.getElementById('map-status-badge');
+  if(el){ el.textContent='Removing…'; el.className='badge bg-grey'; }
+  fetch('/api/unload_path',{method:'POST'})
+    .then(r=>r.json())
+    .then(()=>{ if(el){ el.textContent='LOAD PATH'; el.className='badge bg-grey'; } })
+    .catch(err=>{ console.warn('unload_path failed:',err); });
+}
+
+function loadPath(name){
+  closePathPicker();
+  const el = document.getElementById('map-status-badge');
+  if(el){ el.textContent='Loading…'; el.className='badge bg-grey'; }
+  fetch('/api/load_path',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name})
+  }).then(r=>r.json()).then(d=>{
+    if(el){
+      if(d.ok){ el.textContent='📁 '+name; el.className='badge bg-cyan'; }
+      else    { el.textContent='ERR'; el.className='badge bg-grey'; console.warn('load_path error:', d.error); }
+    }
+  }).catch(err=>{ console.warn('load_path failed:',err); if(el){ el.textContent='Error'; el.className=''; } });
+}
+
+// close path picker on overlay click
+document.addEventListener('DOMContentLoaded',()=>{
+  const pov = document.getElementById('path-modal-overlay');
+  if(pov) pov.addEventListener('click', e=>{ if(e.target===pov) closePathPicker(); });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Enable / disable path following
 // ═══════════════════════════════════════════════════════════════════════════
 let _pfActive = false;
@@ -464,6 +548,9 @@ document.addEventListener('DOMContentLoaded', ()=>{
 function render(s){
   gLastS = s;
   const {vehicle:v, gnss:g, esf:e, controller:c, topics:t, uptime_s:u} = s;
+
+  // ── Path info ─────────────────────────────────────────────────────────────
+  const pi = s.path_info || {};
 
   // ── Staleness flags ─────────────────────────────────────────────────────
   const vsStale   = staleSec(t['/vehicle/state']?.last_recv);
@@ -662,6 +749,19 @@ function render(s){
     }).join('');
   }
 
+  // ── Map status badge ──────────────────────────────────────────────────────
+  const mapBadge = document.getElementById('map-status-badge');
+  if(mapBadge){
+    const pathName = pi.loaded_name || null;
+    if(!pathName){
+      mapBadge.textContent='LOAD PATH'; mapBadge.className='badge bg-grey';
+    } else if(c?.active){
+      mapBadge.textContent='▶ '+pathName; mapBadge.className='badge bg-green';
+    } else {
+      mapBadge.textContent='📁 '+pathName; mapBadge.className='badge bg-cyan';
+    }
+  }
+
   // ── Leaflet satellite map ────────────────────────────────────────────────────
   updateLeafletCar(g.latitude, g.longitude, g.heading_deg, c);
 }
@@ -733,13 +833,6 @@ function updateLeafletCar(lat, lon, headingDeg, c){
     if(_trailPts.length >= 2)
       _trailLayer = L.polyline(_trailPts, {color:'#3fb950', weight:2, opacity:0.75, smoothFactor:1}).addTo(_lmap);
     if(_followCar) _lmap.panTo(ll, {animate: true, duration: 0.3});
-  }
-  // Map status badge
-  const mapBadge = document.getElementById('map-status-badge');
-  if(mapBadge){
-    if(!gPath){ mapBadge.textContent='NO PATH'; mapBadge.className='badge bg-grey'; }
-    else if(c?.active){ mapBadge.textContent='FOLLOWING'; mapBadge.className='badge bg-green'; }
-    else{ mapBadge.textContent='PATH LOADED'; mapBadge.className='badge bg-cyan'; }
   }
 }
 
@@ -928,6 +1021,18 @@ fetchPath();
 poll();
 </script>
 
+<!-- Path picker modal -->
+<div id="path-modal-overlay">
+  <div id="path-modal">
+    <h3>&#128193; Load Path</h3>
+    <p>Select a CSV file from the paths directory:</p>
+    <div id="path-list"></div>
+    <div class="modal-row">
+      <button onclick="closePathPicker()">Cancel</button>
+      <button id="path-remove-btn" onclick="removePath()" style="background:#21262d;color:#f85149" title="Unload current path">&#10005; Remove Path</button>
+    </div>
+  </div>
+</div>
 <!-- Save-recording modal -->
 <div id="rec-modal-overlay">
   <div id="rec-modal">
