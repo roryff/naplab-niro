@@ -25,12 +25,12 @@ HTTP endpoints
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import TwistStamped, PoseStamped, Twist, Vector3Stamped
 from car_control.msg import DriveCommand
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool, Float64
+from std_msgs.msg import Bool, Float64, String
 from car_control.msg import VehicleState, EsfStatus
 
 import threading
@@ -160,6 +160,9 @@ _state = {
     },
 
     "uptime_s": 0.0,
+    "path_info": {
+        "loaded_name": None,
+    },
 }
 
 # Path waypoints are large – served via a separate /api/path endpoint
@@ -169,6 +172,30 @@ _path_data  = {"waypoints": [], "length_m": 0.0, "updated_at": 0.0}
 _start_time_mono = time.monotonic()
 _HZ_WINDOW_SEC   = 3.0
 _dashboard_node  = None   # set in main(), used by POST handler
+
+# ---------------------------------------------------------------------------
+# Paths directory helper
+# ---------------------------------------------------------------------------
+def _find_paths_dir() -> pathlib.Path:
+    """Return the src/car_control/paths directory, creating it if needed."""
+    ws_root = pathlib.Path(__file__).resolve().parents[4]
+    src_pkg = ws_root / 'src' / 'car_control'
+    if src_pkg.exists():
+        d = src_pkg / 'paths'
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    # fallback: walk up looking for package.xml
+    p = pathlib.Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / 'package.xml').exists():
+            d = p / 'paths'
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        p = p.parent
+    d = pathlib.Path(__file__).resolve().parent.parent / 'paths'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 
 # ---------------------------------------------------------------------------
 # Path recording state
@@ -344,7 +371,7 @@ class DashboardNode(Node):
         )
 
         # Existing topics
-        self.create_subscription(VehicleState, "/vehicle/state",   self._cb_vehicle,  10)
+        self.create_subscription(VehicleState, "/vehicle/state",   self._cb_vehicle,  qos_profile_sensor_data)
         self.create_subscription(NavSatFix,    "/gnss/fix",        self._cb_gnss_fix, 10)
         self.create_subscription(TwistStamped, "/gnss/velocity",   self._cb_velocity, 10)
         self.create_subscription(Odometry,     "/gnss/odometry",   self._cb_odom,     10)
@@ -364,6 +391,8 @@ class DashboardNode(Node):
 
         # Publisher – allows dashboard to start/stop path following
         self.enable_pub_ = self.create_publisher(Bool, "/enable_path_following", 1)
+        # Publisher – allows dashboard to load a path at runtime
+        self.load_path_pub_ = self.create_publisher(String, "/lateral_mpc/load_path", 1)
 
     # ── Existing callbacks ───────────────────────────────────────────────────
 
@@ -574,6 +603,7 @@ class Handler(BaseHTTPRequestHandler):
                     "gnss":       dict(_state["gnss"]),
                     "esf":        dict(_state["esf"]),
                     "controller": ctrl,
+                    "path_info":  dict(_state["path_info"]),
                     "uptime_s":   round(time.monotonic() - _start_time_mono, 1),
                 }
             with _rec_lock:
@@ -583,6 +613,21 @@ class Handler(BaseHTTPRequestHandler):
                     "waypoint_count": _rec_count,
                 }
             self._respond_json(payload)
+
+        elif self.path == "/api/paths":
+            paths_dir = _find_paths_dir()
+            files = sorted(paths_dir.glob("*.csv"))
+            with _state_lock:
+                loaded = _state["path_info"]["loaded_name"]
+            entries = [
+                {
+                    "name": f.name,
+                    "size_kb": round(f.stat().st_size / 1024, 1),
+                    "active": (f.name == loaded),
+                }
+                for f in files
+            ]
+            self._respond_json({"paths": entries, "dir": str(paths_dir)})
 
         elif self.path == "/api/path":
             with _path_lock:
@@ -631,7 +676,45 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/enable_path_following":
+        if self.path == "/api/load_path":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(body)
+                name = str(data.get("name", "")).strip()
+            except (json.JSONDecodeError, KeyError):
+                self._respond(400, "application/json", b'{"error":"bad json"}')
+                return
+            if not name:
+                self._respond(400, "application/json", b'{"error":"empty name"}')
+                return
+            # Resolve to the paths directory so only files inside it can be loaded
+            paths_dir = _find_paths_dir()
+            csv_path = (paths_dir / name).resolve()
+            if not str(csv_path).startswith(str(paths_dir.resolve())):
+                self._respond(400, "application/json", b'{"error":"invalid path"}')
+                return
+            if not csv_path.exists():
+                self._respond_json({"ok": False, "error": f"{name} not found"})
+                return
+            msg = String()
+            msg.data = str(csv_path)
+            _dashboard_node.load_path_pub_.publish(msg)
+            with _state_lock:
+                _state["path_info"]["loaded_name"] = name
+            _dashboard_node.get_logger().info(f"Loading path: {name}")
+            self._respond_json({"ok": True, "path": str(csv_path)})
+
+        elif self.path == "/api/unload_path":
+            msg = String()
+            msg.data = ""  # empty string signals the node to clear the path
+            _dashboard_node.load_path_pub_.publish(msg)
+            with _state_lock:
+                _state["path_info"]["loaded_name"] = None
+            _dashboard_node.get_logger().info("Path unloaded")
+            self._respond_json({"ok": True})
+
+        elif self.path == "/api/enable_path_following":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b"{}"
             try:
@@ -686,7 +769,7 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 def main():
     global _dashboard_node
-    PORT = 8765
+    PORT = 5000
     rclpy.init()
     node = DashboardNode()
     _dashboard_node = node
@@ -694,8 +777,13 @@ def main():
     server = _QuietThreadedServer(("0.0.0.0", PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    print(f"[dashboard] Listening on http://localhost:{PORT}  (VS Code: forward this port to open in browser)")
-    print("[dashboard] Ctrl+C to stop")
+    import socket as _socket
+    _hostname = _socket.gethostname()
+    try:
+        _ip = _socket.gethostbyname(_hostname)
+    except Exception:
+        _ip = "localhost"
+    node.get_logger().info(f"Dashboard running at http://{_hostname}:{PORT}  |  http://{_ip}:{PORT}")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

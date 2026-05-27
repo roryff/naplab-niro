@@ -36,9 +36,6 @@ def launch_setup(context, *args, **kwargs):
     enable_cameras = LaunchConfiguration('enable_cameras').perform(context)
     enable_lidar   = LaunchConfiguration('enable_lidar').perform(context)
 
-    if not path_csv_file:
-        path_csv_file = os.path.join(pkg_share, 'paths', 'path.csv')
-
     def cfg(name):
         return os.path.join(pkg_share, 'config', name)
 
@@ -133,19 +130,14 @@ def launch_setup(context, *args, **kwargs):
         _spec.loader.exec_module(_m)
         nodes.append(_m.build_camera_container(pkg_share))
 
-    # ---- dashboard + foxglove (always) ----------------------------------------
+    # ---- dashboard (always) -------------------------------------------------------
+    # Note: foxglove_bridge must be started separately, e.g.:
+    #   ros2 run foxglove_bridge foxglove_bridge
     nodes.append(Node(
         package='car_control',
         executable='dashboard_server.py',
         name='dashboard_server',
         output='screen',
-    ))
-    nodes.append(Node(
-        package='foxglove_bridge',
-        executable='foxglove_bridge',
-        name='foxglove_bridge',
-        output='screen',
-        parameters=[{'port': 8766}],
     ))
 
     # ---- lidar nodes (conditional) --------------------------------------------
