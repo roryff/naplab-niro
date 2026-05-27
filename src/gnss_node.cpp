@@ -16,13 +16,10 @@
 #include <atomic>
 #include <mutex>
 #include <sys/socket.h>
-#include <sys/select.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <netinet/tcp.h>
 #include "car_control/ubx_protocol.hpp"
 #include "car_control/geo_utils.hpp"
 #include <pthread.h>
@@ -32,7 +29,7 @@
 /**
  * @brief GNSS Node for autonomous vehicle navigation
  * 
- * This node connects directly to a u-blox GNSS receiver via TCP, parses UBX protocol
+ * This node connects directly to a u-blox GNSS receiver via UDP, parses UBX protocol
  * messages, and converts GPS coordinates to local ENU frame for path following.
  * Supports RTK and Automotive Dead Reckoning (ADR) modes.
  * 
@@ -125,8 +122,8 @@ public:
     {
         running_ = false;
         {
-            // shutdown() immediately unblocks recv() in the reader thread.
-            // close() alone is not guaranteed to do so on Linux.
+            // close() unblocks a pending recv() on Linux; shutdown() is added
+            // as an extra safety net.
             std::lock_guard<std::mutex> lock(socket_write_mutex_);
             if (socket_fd_ >= 0) {
                 ::shutdown(socket_fd_, SHUT_RDWR);
@@ -149,14 +146,6 @@ private:
      */
     void reader_loop()
     {
-        // SCHED_FIFO priority 75: GNSS data source for all control nodes
-        struct sched_param sp{};
-        sp.sched_priority = 75;
-        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                "reader_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
-        }
-
         while (running_) {
             if (socket_fd_ < 0) {
                 if (!running_) break;
@@ -187,56 +176,34 @@ private:
     }
     
     /**
-     * @brief Attempt to connect to u-blox receiver
+     * @brief Set up UDP socket aimed at the u-blox receiver.
      *
-
+     * connect() on a UDP socket records the remote address so that send()/recv()
+     * can be used without specifying the peer each time, and filters incoming
+     * datagrams to only those arriving from that address.  It returns immediately
+     * (no handshake), so no non-blocking dance is needed.
      */
     void try_connect()
     {
         std::string host = this->get_parameter("host").as_string();
         int port = this->get_parameter("port").as_int();
 
-        // Work with a local fd until the connection is fully established.
+        // Work with a local fd until fully initialised.
         // socket_fd_ is only written at the very end, under socket_write_mutex_,
         // so the sender thread never sees a half-ready descriptor.
-        int new_fd = socket(AF_INET, SOCK_STREAM, 0);
+        int new_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (new_fd < 0) {
             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "Failed to create socket: %s", strerror(errno));
+                "Failed to create UDP socket: %s", strerror(errno));
             return;
         }
 
-        // Set recv timeout – fallback so reader_loop can notice shutdown
-        // even if shutdown(SHUT_RDWR) somehow doesn't unblock recv immediately.
+        // Set recv timeout so reader_loop can notice shutdown even if close()
+        // doesn't immediately unblock a pending recv().
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
         setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        // TCP keepalive: keeps the connection entry alive in the switch/router
-        // ARP and MAC tables, and detects a dead peer without waiting for a
-        // send to fail.  Without this some switches age out the entry after
-        // ~30 s of inactivity and then isolate the port, making the u-blox
-        // completely unreachable until the cable is replugged.
-        int keepalive = 1;
-        setsockopt(new_fd, SOL_SOCKET,  SO_KEEPALIVE,  &keepalive, sizeof(keepalive));
-        int keepidle  = 10;  // start probing after 10 s idle
-        int keepintvl =  5;  // probe every 5 s
-        int keepcnt   =  3;  // drop after 3 consecutive failures (~25 s total)
-        setsockopt(new_fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keepidle,  sizeof(keepidle));
-        setsockopt(new_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-        setsockopt(new_fd, IPPROTO_TCP, TCP_KEEPCNT,   &keepcnt,   sizeof(keepcnt));
-
-        // Disable Nagle: we send many small 50 Hz ESF-MEAS frames that must
-        // not be held back by the coalescing algorithm.
-        int nodelay = 1;
-        setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-        // Use non-blocking connect with a short timeout so SIGINT isn't blocked
-        // by the OS TCP timeout (which can be ~2 minutes).
-        // NOTE: new_fd is NOT published to socket_fd_ yet, so the sender thread
-        // cannot touch it while it is in O_NONBLOCK mode.
-        fcntl(new_fd, F_SETFL, O_NONBLOCK);
 
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
@@ -248,7 +215,7 @@ private:
             struct addrinfo hints;
             memset(&hints, 0, sizeof(hints));
             hints.ai_family = AF_INET;
-            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_socktype = SOCK_DGRAM;
 
             struct addrinfo* result = nullptr;
             int gai = getaddrinfo(host.c_str(), nullptr, &hints, &result);
@@ -264,60 +231,24 @@ private:
             freeaddrinfo(result);
         }
 
-        int ret = connect(new_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-        if (ret < 0 && errno != EINPROGRESS) {
-            RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "Connection to %s:%d failed: %s - retrying...",
-                host.c_str(), port, strerror(errno));
+        // connect() on a UDP socket is non-blocking: it records the remote
+        // address and assigns a local ephemeral port; no packet is sent.
+        if (connect(new_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Failed to set UDP peer %s:%d: %s", host.c_str(), port, strerror(errno));
             close(new_fd);
             return;
         }
 
-        if (ret != 0) {
-            // Wait up to 5 seconds for connect, but bail immediately if shutting down
-            fd_set write_fds;
-            FD_ZERO(&write_fds);
-            FD_SET(new_fd, &write_fds);
-            struct timeval connect_tv = {5, 0};
-            int sel = select(new_fd + 1, nullptr, &write_fds, nullptr, &connect_tv);
-
-            if (!running_) {
-                close(new_fd);
-                return;
-            }
-
-            if (sel <= 0) {
-                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                    "Connection to %s:%d timed out - retrying...", host.c_str(), port);
-                close(new_fd);
-                return;
-            }
-
-            // Check if connect actually succeeded
-            int sock_err = 0;
-            socklen_t sock_err_len = sizeof(sock_err);
-            getsockopt(new_fd, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len);
-            if (sock_err != 0) {
-                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                    "Connection to %s:%d failed: %s - retrying...",
-                    host.c_str(), port, strerror(sock_err));
-                close(new_fd);
-                return;
-            }
-        }
-
-        // Restore blocking mode BEFORE handing the fd to the sender thread.
-        fcntl(new_fd, F_SETFL, fcntl(new_fd, F_GETFL) & ~O_NONBLOCK);
-
         // Publish the ready fd atomically so the sender thread sees a fully
-        // connected, blocking socket or nothing at all.
+        // initialised socket or nothing at all.
         {
             std::lock_guard<std::mutex> lock(socket_write_mutex_);
             socket_fd_ = new_fd;
         }
 
         reconnect_backoff_s_ = 2;  // reset exponential backoff on success
-        RCLCPP_INFO(this->get_logger(), "Connected to u-blox receiver at %s:%d",
+        RCLCPP_INFO(this->get_logger(), "UDP socket ready, peer %s:%d",
             host.c_str(), port);
     }
     
@@ -340,43 +271,19 @@ private:
         int bytes_read = recv(fd, buffer, sizeof(buffer), 0);
 
         if (bytes_read < 0) {
-            // Timeout is OK - just means no data yet, loop will continue
+            // Timeout is OK - just means no datagram arrived, loop will continue
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             }
-            RCLCPP_ERROR(this->get_logger(), "Socket read error: %s - reconnecting...",
-                strerror(errno));
-            // Close under the mutex so the sender never uses a dead fd.
-            // Use SO_LINGER with l_linger=0 to send RST instead of FIN: this
-            // immediately clears the TCP entry on the u-blox side so a fresh
-            // connection is accepted right away instead of waiting for its
-            // TIME_WAIT to expire.
-            {
-                std::lock_guard<std::mutex> lock(socket_write_mutex_);
-                if (socket_fd_ == fd) {   // guard against concurrent reconnect
-                    struct linger rst = {1, 0};
-                    setsockopt(socket_fd_, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
-                    close(socket_fd_);
-                    socket_fd_ = -1;
-                }
-            }
-            rx_buffer_.clear();
+            // ECONNREFUSED means an ICMP unreachable was received from the remote
+            // (e.g. receiver restarted). The socket remains usable; log and continue.
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "UDP recv error: %s", strerror(errno));
             return;
         }
 
         if (bytes_read == 0) {
-            RCLCPP_WARN(this->get_logger(), "Connection closed - reconnecting...");
-            {
-                std::lock_guard<std::mutex> lock(socket_write_mutex_);
-                if (socket_fd_ == fd) {
-                    struct linger rst = {1, 0};
-                    setsockopt(socket_fd_, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
-                    close(socket_fd_);
-                    socket_fd_ = -1;
-                }
-            }
-            rx_buffer_.clear();
-            return;
+            return;  // empty datagram, ignore
         }
 
         // Add to buffer and parse UBX messages
@@ -916,14 +823,6 @@ private:
      */
     void sender_loop()
     {
-        // SCHED_FIFO priority 60: ADR wheel-speed feedback — important but not on actuator path
-        struct sched_param sp{};
-        sp.sched_priority = 60;
-        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                "sender_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
-        }
-
         using namespace std::chrono;
         auto next = steady_clock::now();
 
@@ -1037,7 +936,7 @@ private:
     std::thread sender_thread_;
     std::atomic<bool> running_;
     
-    // TCP connection
+    // UDP socket
     int socket_fd_;
     int reconnect_backoff_s_{2};  // exponential backoff: 2→4→8→16→30s, reset on connect
     std::vector<uint8_t> rx_buffer_;
