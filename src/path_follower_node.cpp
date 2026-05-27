@@ -30,8 +30,6 @@
 #include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include "car_control/msg/vehicle_state.hpp"
@@ -731,13 +729,6 @@ int main(int argc, char** argv)
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         RCLCPP_WARN(rclcpp::get_logger("path_follower_node"),
             "mlockall failed: %s", strerror(errno));
-    }
-
-    struct sched_param sp{};
-    sp.sched_priority = 65;
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-        RCLCPP_WARN(rclcpp::get_logger("path_follower_node"),
-            "SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
     }
 
     auto node = std::make_shared<PathFollowerNode>();

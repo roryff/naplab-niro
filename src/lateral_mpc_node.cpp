@@ -35,11 +35,11 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
+#include "car_control/msg/drive_command.hpp"
 #include "car_control/msg/vehicle_state.hpp"
 #include <nav_msgs/msg/path.hpp>
 #include <osqp.h>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
 
 #include <Eigen/Dense>
@@ -422,14 +422,20 @@ public:
         pub_heading_error_ = create_publisher<std_msgs::msg::Float64>("heading_error",                 10);
         pub_pf_cmd_vel_    = create_publisher<geometry_msgs::msg::Twist>("path_follower/cmd_vel",       10);
 
+        // ---- Load-path subscription (runtime path switching) -----------------
+        load_path_sub_ = create_subscription<std_msgs::msg::String>(
+            "/lateral_mpc/load_path", rclcpp::QoS(1),
+            std::bind(&LateralMpcNode::loadPathCallback, this, std::placeholders::_1));
+
         // ---- Build path --------------------------------------------------------
         std::string csv_file = get_parameter("path_csv_file").as_string();
         if (!csv_file.empty()) {
             loadPathFromCSV(csv_file);
+            publishPathVisualization();
         } else {
-            createSinusoidalPath(500.0, 3.0, 8.0, 80.0, 50.0, 1.0);
+            RCLCPP_INFO(get_logger(),
+                "No path loaded. Publish a CSV filename to ~/load_path to load one.");
         }
-        publishPathVisualization();
 
         // ---- Control timer -----------------------------------------------------
         control_timer_ = create_wall_timer(
@@ -1037,6 +1043,49 @@ private:
         applyPathSmoothing("Sinusoidal path", n_tot + 1);
     }
 
+    void loadPathCallback(const std_msgs::msg::String::SharedPtr msg)
+    {
+        const std::string& path = msg->data;
+
+        // Empty string = unload path
+        if (path.empty()) {
+            bool was_following = (state_ == State::FOLLOWING || state_ == State::STOPPING);
+            if (was_following) {
+                state_ = State::IDLE;
+                publishCmd(0.0, 0.0);
+                publishStatus(false);
+            }
+            {
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                path_.clear();
+                hint_front_ = 0;
+                hint_rear_  = 0;
+                u_prev_     = 0.0;
+            }
+            publishPathVisualization();
+            RCLCPP_INFO(get_logger(), "Path unloaded.");
+            return;
+        }
+        // Stop following before swapping the path under the controller
+        bool was_following = (state_ == State::FOLLOWING || state_ == State::STOPPING);
+        if (was_following) {
+            state_ = State::IDLE;
+            publishCmd(0.0, 0.0);
+            publishStatus(false);
+        }
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            loadPathFromCSV(path);
+            hint_front_ = 0;
+            hint_rear_  = 0;
+            u_prev_     = 0.0;
+        }
+        publishPathVisualization();
+        if (was_following) {
+            RCLCPP_INFO(get_logger(), "Path swapped while following — stopped. Re-enable to continue.");
+        }
+    }
+
     void loadPathFromCSV(const std::string& filename)
     {
         path_.clear();
@@ -1261,6 +1310,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  gnss_pose_sub_;
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr   vehicle_state_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              enable_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr            load_path_sub_;
 
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr   cmd_vel_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr          path_vis_pub_;
@@ -1287,13 +1337,6 @@ int main(int argc, char** argv)
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         RCLCPP_WARN(rclcpp::get_logger("lateral_mpc_node"),
             "mlockall failed: %s", strerror(errno));
-    }
-
-    struct sched_param sp{};
-    sp.sched_priority = 70;
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-        RCLCPP_WARN(rclcpp::get_logger("lateral_mpc_node"),
-            "SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
     }
 
     auto node = std::make_shared<LateralMpcNode>();
