@@ -14,8 +14,6 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <iostream>
 
@@ -103,14 +101,6 @@ public:
 private:
     void adb_sender_loop()
     {
-        // SCHED_FIFO priority 85: most critical thread — delivers commands to Comma 3X actuator
-        struct sched_param sp{};
-        sp.sched_priority = 85;
-        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                "adb_sender_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE). Timing may jitter.");
-        }
-
         // Drift-free 50 Hz loop: sleep_until advances an absolute deadline each tick.
         // Unlike sleep_for(remaining), this does NOT accumulate scheduler wake-up latency.
         auto next = std::chrono::steady_clock::now();
@@ -129,14 +119,6 @@ private:
     
     void adb_reader_loop()
     {
-        // SCHED_FIFO priority 80: receives vehicle state that feeds all controllers
-        struct sched_param sp{};
-        sp.sched_priority = 80;
-        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                "adb_reader_loop: SCHED_FIFO failed (not root / no CAP_SYS_NICE). Timing may jitter.");
-        }
-
         bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
         
         if (use_tcp_tunnel) {
@@ -579,14 +561,6 @@ int main(int argc, char** argv)
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         RCLCPP_WARN(rclcpp::get_logger("comma_node"),
             "mlockall failed: %s", strerror(errno));
-    }
-
-    // Promote main/executor thread (runs publish_timer_) to RT priority 55
-    struct sched_param sp{};
-    sp.sched_priority = 55;
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-        RCLCPP_WARN(rclcpp::get_logger("comma_node"),
-            "main SCHED_FIFO failed (not root / no CAP_SYS_NICE).");
     }
 
     auto node = std::make_shared<CommaNode>();
