@@ -1,11 +1,15 @@
 """
 Standalone camera launch file.
 
-Starts all four camera nodes in a composable container, plus dashboard_server and
-foxglove_bridge for monitoring.  Each camera receives H.265 MPEG-TS over UDP multicast,
-hardware-decodes with nvv4l2decoder, re-encodes to H.264 with nvv4l2h264enc (all in
-NVMM, zero CPU copy), and publishes foxglove_msgs/msg/CompressedVideo on
-cameras/{name}/image_compressed.
+Starts all four camera nodes in a composable container plus dashboard_server.
+Each camera receives H.265 MPEG-TS over UDP multicast and publishes raw
+foxglove_msgs/msg/CompressedVideo (format="h265") on cameras/{name}/image_compressed.
+
+For Foxglove Studio preview, also run:
+    ros2 launch car_control foxglove_relay.launch.py
+
+That launch provides H.264 preview topics (cameras/{name}/image_compressed_preview)
+and foxglove_bridge.  The relay only uses GPU while Foxglove is connected.
 
 Usage:
     ros2 launch car_control cameras.launch.py
@@ -34,12 +38,6 @@ def launch_setup(context, *args, **kwargs):
             package='car_control',
             executable='dashboard_server.py',
             name='dashboard_server',
-            output='screen',
-        ),
-        Node(
-            package='foxglove_bridge',
-            executable='foxglove_bridge',
-            name='foxglove_bridge',
             output='screen',
         ),
     ]
