@@ -61,9 +61,9 @@ public:
         topic_  = declare_parameter<std::string>("topic",           "image_compressed");
         frame_  = declare_parameter<std::string>("frame_id",        "camera");
         iface_  = declare_parameter<std::string>("multicast_iface", "enP2p1s0");
-        frame_timeout_ms_    = declare_parameter<double>("frame_timeout_ms", 500.0);
-        restart_backoff_ms_  = declare_parameter<double>("restart_backoff_ms", 100.0);
-        encode_bitrate_bps_  = declare_parameter<int>("encode_bitrate_bps", 20000000);
+        frame_timeout_ms_    = declare_parameter<double>("frame_timeout_ms", 2000.0);
+        restart_backoff_ms_  = declare_parameter<double>("restart_backoff_ms", 250.0);
+        encode_bitrate_bps_  = declare_parameter<int>("encode_bitrate_bps", 8000000);
 
         pub_ = create_publisher<foxglove_msgs::msg::CompressedVideo>(topic_, 10);
 
@@ -74,7 +74,7 @@ public:
             "udpsrc uri=udp://" + ip_ + ":" + std::to_string(port_) +
             " buffer-size=8388608 timeout=2000000000 multicast-iface=" + iface_ +
             " ! tsdemux latency=0"
-            " ! queue max-size-buffers=2 leaky=1"
+            " ! queue max-size-buffers=2 leaky=2"
             " ! h265parse config-interval=-1"
             " ! nvv4l2decoder disable-dpb=true low-latency-mode=true skip-frames=2"
             " ! nvv4l2h264enc idrinterval=15 insert-sps-pps=true"
