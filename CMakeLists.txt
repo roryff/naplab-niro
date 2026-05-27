@@ -109,7 +109,7 @@ ament_target_dependencies(camera_node rclcpp rclcpp_components sensor_msgs foxgl
 target_include_directories(camera_node PRIVATE ${GST_INCLUDE_DIRS})
 target_link_libraries(camera_node ${GST_LIBRARIES})
 
-# Composable component library (for intra-process use with isaac_ros_h264_encoder)
+# Composable component library for camera_node
 add_library(camera_node_component SHARED src/camera_node.cpp)
 ament_target_dependencies(camera_node_component rclcpp rclcpp_components sensor_msgs foxglove_msgs)
 target_include_directories(camera_node_component PRIVATE ${GST_INCLUDE_DIRS})
@@ -117,6 +117,21 @@ target_link_libraries(camera_node_component ${GST_LIBRARIES})
 rclcpp_components_register_node(camera_node_component
   PLUGIN "CameraNode"
   EXECUTABLE camera_node_component_exe
+)
+
+# Foxglove relay — lazy H.265→H.264 transcode for Foxglove Studio preview
+add_executable(foxglove_relay_node src/foxglove_relay_node.cpp)
+ament_target_dependencies(foxglove_relay_node rclcpp rclcpp_components foxglove_msgs)
+target_include_directories(foxglove_relay_node PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(foxglove_relay_node ${GST_LIBRARIES})
+
+add_library(foxglove_relay_node_component SHARED src/foxglove_relay_node.cpp)
+ament_target_dependencies(foxglove_relay_node_component rclcpp rclcpp_components foxglove_msgs)
+target_include_directories(foxglove_relay_node_component PRIVATE ${GST_INCLUDE_DIRS})
+target_link_libraries(foxglove_relay_node_component ${GST_LIBRARIES})
+rclcpp_components_register_node(foxglove_relay_node_component
+  PLUGIN "FoxgloveRelayNode"
+  EXECUTABLE foxglove_relay_node_component_exe
 )
 
 
@@ -129,11 +144,12 @@ install(TARGETS
   lateral_mpc_node
   sysid_node
   camera_node
+  foxglove_relay_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install camera component library
-install(TARGETS camera_node_component
+# Install component libraries
+install(TARGETS camera_node_component foxglove_relay_node_component
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
