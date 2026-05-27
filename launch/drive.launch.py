@@ -1,30 +1,45 @@
+"""
+Main launch file for the autonomous driving stack.
+
+Always starts: comma_node, gnss_node, robot_state_publisher, dashboard_server, foxglove_bridge.
+
+Selectable control architecture via control_mode:
+  unified  (default) — lateral_mpc_node: single 4-state MPC [CTE, dPsi, delta, dRate]
+  cascade            — path_follower_node (Stanley) + steering_mpc_node (torque MPC)
+ 
+Optional sensors:
+  enable_cameras:=true   — 4× UDP multicast H.265→H.264 camera nodes
+  enable_lidar:=true     — 2× Ouster OS1 lidar nodes (lifecycle-managed)
+
+Examples:
+    ros2 launch car_control drive.launch.py
+    ros2 launch car_control drive.launch.py desired_speed_mps:=8.0 enable_cameras:=true
+    ros2 launch car_control drive.launch.py control_mode:=cascade
+"""
+
 import os
 from launch import LaunchDescription
-from launch_ros.actions import Node, ComposableNodeContainer
-from launch_ros.descriptions import ComposableNode
+from launch_ros.actions import Node
 from launch.substitutions import PathJoinSubstitution
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
 
 
-
 def launch_setup(context, *args, **kwargs):
     from launch.substitutions import LaunchConfiguration
     pkg_share = FindPackageShare('car_control').perform(context)
 
-    control_mode  = LaunchConfiguration('control_mode').perform(context)
-    path_csv_file = LaunchConfiguration('path_csv_file').perform(context)
-    desired_speed = LaunchConfiguration('desired_speed_mps').perform(context)
+    control_mode   = LaunchConfiguration('control_mode').perform(context)
+    path_csv_file  = LaunchConfiguration('path_csv_file').perform(context)
+    desired_speed  = LaunchConfiguration('desired_speed_mps').perform(context)
     enable_cameras = LaunchConfiguration('enable_cameras').perform(context)
     enable_lidar   = LaunchConfiguration('enable_lidar').perform(context)
 
-    # Default path to bundled path.csv when none supplied
     if not path_csv_file:
         path_csv_file = os.path.join(pkg_share, 'paths', 'path.csv')
 
     def cfg(name):
-        """Return the installed path for a node config YAML."""
         return os.path.join(pkg_share, 'config', name)
 
     nodes = []
@@ -60,12 +75,7 @@ def launch_setup(context, *args, **kwargs):
     ))
 
     if control_mode == 'cascade':
-        # ---- Option A: path_follower_node + steering_mpc_node ------------------
-        #
-        # path_follower_node:  Stanley controller → desired angle + 40-step
-        #                      reference trajectory on path_follower/steer_ref_traj_deg
-        # steering_mpc_node:   Torque MPC using per-step reference trajectory
-        #
+        # path_follower_node (Stanley) → steering_mpc_node (torque MPC)
         nodes.append(Node(
             package='car_control',
             executable='path_follower_node',
@@ -89,19 +99,12 @@ def launch_setup(context, *args, **kwargs):
             output='screen',
             parameters=[
                 cfg('steering_mpc_node.yaml'),
-                {
-                    'desired_speed_mps': float(desired_speed),
-                    'model_config_path': cfg('sched_fo2_model.yaml'),
-                },
+                {'desired_speed_mps': float(desired_speed)},
             ],
         ))
 
     elif control_mode == 'unified':
-        # ---- Option B: lateral_mpc_node (replaces both above) -----------------
-        #
-        # 4-state MPC [CTE, dPsi, delta, dRate] directly minimises cross-track
-        # and heading error using path curvature as feed-forward.
-        #
+        # lateral_mpc_node: single MPC replacing path_follower + steering_mpc
         nodes.append(Node(
             package='car_control',
             executable='lateral_mpc_node',
@@ -120,50 +123,23 @@ def launch_setup(context, *args, **kwargs):
         raise RuntimeError(
             f"Unknown control_mode '{control_mode}'. Use 'cascade' or 'unified'.")
 
-    # ---- camera nodes (conditional) -----------------------------------------------
+    # ---- cameras (conditional) ------------------------------------------------
     if enable_cameras.lower() == 'true':
-        cameras = [
-            ('front', '239.10.0.1', 'camera_front', 'cameras/front'),
-            ('right', '239.10.0.2', 'camera_right', 'cameras/right'),
-            ('rear',  '239.10.0.3', 'camera_rear',  'cameras/rear'),
-            ('left',  '239.10.0.4', 'camera_left',  'cameras/left'),
-        ]
-        # CameraNode now publishes H.265 bitstream directly as CompressedImage —
-        # no hardware decode, no NITROS re-encode, no raw topics on the bus.
-        cam_nodes = []
-        for name, multicast_ip, frame_id, ns in cameras:
-            compressed_topic = f'{ns}/image_compressed'
-            cam_nodes.append(ComposableNode(
-                package='car_control',
-                plugin='CameraNode',
-                name=f'camera_{name}',
-                parameters=[{
-                    'multicast_ip':    multicast_ip,
-                    'port':            10030,
-                    'topic':           compressed_topic,
-                    'frame_id':        frame_id,
-                    'multicast_iface': 'enP2p1s0',
-                }],
-                extra_arguments=[{'use_intra_process_comms': True}],
-            ))
-        nodes.append(ComposableNodeContainer(
-            name='camera_container',
-            namespace='',
-            package='rclcpp_components',
-            executable='component_container_mt',
-            composable_node_descriptions=cam_nodes,
-            output='screen',
-        ))
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            'launch_utils',
+            os.path.join(pkg_share, 'launch', 'launch_utils.py'))
+        _m = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_m)
+        nodes.append(_m.build_camera_container(pkg_share))
 
-    # ---- dashboard_server (always) -----------------------------------------------
+    # ---- dashboard + foxglove (always) ----------------------------------------
     nodes.append(Node(
         package='car_control',
         executable='dashboard_server.py',
         name='dashboard_server',
         output='screen',
     ))
-
-    # ---- foxglove_bridge (always) ------------------------------------------------
     nodes.append(Node(
         package='foxglove_bridge',
         executable='foxglove_bridge',
@@ -172,11 +148,11 @@ def launch_setup(context, *args, **kwargs):
         parameters=[{'port': 8766}],
     ))
 
-    # ---- lidar nodes (conditional) ---------------------------------------------
+    # ---- lidar nodes (conditional) --------------------------------------------
     if enable_lidar.lower() == 'true':
         nodes.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                os.path.join(pkg_share, 'launch', 'multi_lidar.launch.py')
+                os.path.join(pkg_share, 'launch', 'lidars.launch.py')
             )
         ))
 
@@ -185,28 +161,24 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
-        # ---- Control mode ------------------------------------------------------
         DeclareLaunchArgument(
             'control_mode', default_value='unified',
             description=(
                 'Steering control architecture: '
-                '"cascade" = path_follower_node + steering_mpc_node (Option A), '
-                '"unified" = lateral_mpc_node only (Option B)'
+                '"unified" = lateral_mpc_node (default), '
+                '"cascade" = path_follower_node + steering_mpc_node'
             )),
-
-        # ---- Path / speed ------------------------------------------------------
-        DeclareLaunchArgument('path_csv_file', default_value='',
+        DeclareLaunchArgument(
+            'path_csv_file', default_value='',
             description='Path to recorded drive CSV (empty = bundled paths/path.csv)'),
-        DeclareLaunchArgument('desired_speed_mps', default_value='5.5',
+        DeclareLaunchArgument(
+            'desired_speed_mps', default_value='5.5',
             description='Desired driving speed [m/s]'),
-
-        # ---- Cameras ---------------------------------------------------------------
-        DeclareLaunchArgument('enable_cameras', default_value='false',
-            description='Enable multi-camera UDP multicast nodes (true/false)'),
-
-        # ---- Lidar -----------------------------------------------------------------
-        DeclareLaunchArgument('enable_lidar', default_value='false',
-            description='Enable multi-lidar Ouster nodes (true/false)'),
-
+        DeclareLaunchArgument(
+            'enable_cameras', default_value='false',
+            description='Enable 4× camera nodes (true/false)'),
+        DeclareLaunchArgument(
+            'enable_lidar', default_value='false',
+            description='Enable Ouster lidar nodes (true/false)'),
         OpaqueFunction(function=launch_setup),
     ])

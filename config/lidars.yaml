@@ -1,0 +1,23 @@
+# Parameters for both Ouster OS1 lidar drivers.
+# Shared settings (/**:) apply to all nodes; per-lidar sections override below.
+
+/**:
+  ros__parameters:
+    udp_dest: ''
+    lidar_mode: ''
+    timestamp_mode: ''
+    point_type: 'xyzir'
+
+/lidar_1/os_driver:
+  ros__parameters:
+    sensor_hostname: '192.168.2.182'   # lidar_side
+    sensor_frame: 'lidar_side/os_sensor'
+    lidar_frame:  'lidar_side/os_lidar'
+    imu_frame:    'lidar_side/os_imu'
+
+/lidar_2/os_driver:
+  ros__parameters:
+    sensor_hostname: '192.168.2.206'   # lidar_top
+    sensor_frame: 'lidar_top/os_sensor'
+    lidar_frame:  'lidar_top/os_lidar'
+    imu_frame:    'lidar_top/os_imu'

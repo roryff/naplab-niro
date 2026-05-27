@@ -25,7 +25,7 @@
  *
  * Publications
  * ------------
- *   cmd_vel         (geometry_msgs/Twist)                – linear.x=accel, angular.z=torque
+ *   cmd_vel         (car_control/DriveCommand)            – accel [-1,1], torque [-1,1]
  *   sysid/torque_cmd  (std_msgs/Float64)                 – excitation signal (debug)
  *   sysid/status      (std_msgs/String)                  – IDLE/RUNNING/DONE/ABORTED
  *
@@ -49,10 +49,10 @@
  */
 
 #include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include "car_control/msg/drive_command.hpp"
 #include "car_control/msg/vehicle_state.hpp"
 
 #include <algorithm>
@@ -73,9 +73,8 @@ class SysidNode : public rclcpp::Node
 
 public:
     SysidNode() : Node("sysid_node"), state_(State::IDLE), t_elapsed_(0.0),
-                  u_prev_(0.0), gyro_z_(0.0), has_gyro_(false),
-                  prbs_current_val_(1.0), prbs_switch_t_(0.0),
-                  rng_(std::random_device{}())
+                  u_prev_(0.0), prbs_current_val_(1.0), prbs_switch_t_(0.0),
+                  rng_(std::random_device{}()), gyro_z_(0.0), has_gyro_(false)
     {
         // ---- Parameters --------------------------------------------------------
         declare_parameter<std::string>("test_mode",        "chirp");
@@ -107,7 +106,7 @@ public:
 
         // ---- Subscriptions -----------------------------------------------------
         sub_state_ = create_subscription<car_control::msg::VehicleState>(
-            "vehicle/state", 10,
+            "vehicle/state", rclcpp::SensorDataQoS(),
             [this](const car_control::msg::VehicleState::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 v_ego_kmh_         = static_cast<double>(msg->v_ego);
@@ -127,7 +126,7 @@ public:
             });
 
         // ---- Publications ------------------------------------------------------
-        pub_cmd_vel_  = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+        pub_cmd_vel_  = create_publisher<car_control::msg::DriveCommand>("cmd_vel", 10);
         pub_torque_   = create_publisher<std_msgs::msg::Float64>("sysid/torque_cmd", 10);
         pub_status_   = create_publisher<std_msgs::msg::String>("sysid/status", 10);
 
@@ -156,12 +155,11 @@ private:
 
     void controlLoop()
     {
-        double v_ego_kmh, steering_angle;
+        double v_ego_kmh;
         bool lat_active, state_received;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             v_ego_kmh      = v_ego_kmh_;
-            steering_angle = steering_angle_;
             lat_active     = lat_active_;
             state_received = state_received_;
         }
@@ -225,9 +223,9 @@ private:
         double accel_cmd  = std::clamp(kp_speed_ * speed_err, -1.0, 1.0);
 
         // ---- Publish --------------------------------------------------------
-        geometry_msgs::msg::Twist cmd;
-        cmd.linear.x  = accel_cmd;
-        cmd.angular.z = u_torque;
+        car_control::msg::DriveCommand cmd;
+        cmd.accel  = static_cast<float>(accel_cmd);
+        cmd.torque = static_cast<float>(u_torque);
         pub_cmd_vel_->publish(cmd);
 
         std_msgs::msg::Float64 torque_msg;
@@ -358,9 +356,9 @@ private:
 
     void publishBrake()
     {
-        geometry_msgs::msg::Twist msg;
-        msg.linear.x  = -4.0;   // partial brake
-        msg.angular.z =  0.0;
+        car_control::msg::DriveCommand msg;
+        msg.accel  = -1.0f;
+        msg.torque =  0.0f;
         pub_cmd_vel_->publish(msg);
     }
 
@@ -368,9 +366,9 @@ private:
     void publishHold(double v_mps)
     {
         double accel_cmd = std::clamp(kp_speed_ * (desired_speed_ - v_mps), -1.0, 1.0);
-        geometry_msgs::msg::Twist msg;
-        msg.linear.x  = accel_cmd;
-        msg.angular.z = 0.0;
+        car_control::msg::DriveCommand msg;
+        msg.accel  = static_cast<float>(accel_cmd);
+        msg.torque =  0.0f;
         pub_cmd_vel_->publish(msg);
     }
 
@@ -422,7 +420,7 @@ private:
     // ROS handles
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr          sub_state_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr       sub_gyro_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr                   pub_cmd_vel_;
+    rclcpp::Publisher<car_control::msg::DriveCommand>::SharedPtr              pub_cmd_vel_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr                      pub_torque_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr                       pub_status_;
     rclcpp::TimerBase::SharedPtr                                              timer_;

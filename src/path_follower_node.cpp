@@ -232,7 +232,7 @@ public:
             std::bind(&PathFollowerNode::gnssPoseCallback, this, std::placeholders::_1));
 
         vehicle_state_sub_ = this->create_subscription<car_control::msg::VehicleState>(
-            "vehicle/state", 10,
+            "vehicle/state", rclcpp::SensorDataQoS(),
             std::bind(&PathFollowerNode::vehicleStateCallback, this, std::placeholders::_1));
 
         enable_sub_ = this->create_subscription<std_msgs::msg::Bool>(
@@ -320,7 +320,8 @@ private:
 
         // steering_angle_deg is the steering-wheel angle [deg].
         // Convert to front-axle angle [rad] via the mechanical ratio.
-        // Kia Niro: ~460 deg lock-to-lock steering wheel → ~30 deg front axle
+        // Kia Niro: ~460 deg lock-to-lock steering wheel → ~30 deg front axle (ratio ≈ 15.33)
+        // Same constant as STEERING_RATIO in lateral_mpc_node.cpp (expressed differently).
         constexpr double RATIO = MAX_STEER_ANGLE / (460.0 * M_PI / 180.0);
         car_steer_rad_ = static_cast<double>(msg->steering_angle_deg) * (M_PI / 180.0) * RATIO;
     }

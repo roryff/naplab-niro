@@ -27,6 +27,7 @@ find_package(nlohmann_json REQUIRED)
 
 # Generate custom messages
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/DriveCommand.msg"
   "msg/VehicleState.msg"
   "msg/EsfSensor.msg"
   "msg/EsfStatus.msg"
@@ -142,7 +143,6 @@ install(TARGETS camera_node_component
 # Install Python scripts
 install(PROGRAMS
   scripts/dashboard_server.py
-  scripts/drive_recorder.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

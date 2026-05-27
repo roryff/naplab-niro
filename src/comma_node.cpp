@@ -1,7 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <car_control/msg/vehicle_state.hpp>
+#include "car_control/msg/drive_command.hpp"
+#include "car_control/msg/vehicle_state.hpp"
 #include <chrono>
 #include <memory>
 #include <cstring>
@@ -34,12 +34,12 @@ public:
         this->declare_parameter("reconnect_interval_sec", 5.0);
         
         // Subscriber for control commands
-        cmd_subscriber_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        cmd_subscriber_ = this->create_subscription<car_control::msg::DriveCommand>(
             "cmd_vel", 10,
             std::bind(&CommaNode::cmd_callback, this, std::placeholders::_1));
         
         speed_publisher_ = this->create_publisher<car_control::msg::VehicleState>(
-            "vehicle/state", 10);
+            "vehicle/state", rclcpp::SensorDataQoS());
         
         // Initialize control state
         current_acceleration_ = 0.0;
@@ -53,7 +53,6 @@ public:
         latest_state_.steering_angle_deg = 0.0f;  // float32
         latest_state_.rear_wheel_speed_left = 0.0f;    // float32
         latest_state_.rear_wheel_speed_right = 0.0f;   // float32
-        latest_state_.steering_torque = 0.0f;     // float32
         latest_state_.actuators_accel = 0.0f;     // float32
         latest_state_.actuators_torque = 0.0f;    // float32
         latest_state_.car_output_accel = 0.0f;    // float32
@@ -410,7 +409,6 @@ private:
             bool has_speed = msg.contains("vEgo") && !msg["vEgo"].is_null();
             bool has_steering = msg.contains("steeringAngleDeg") && !msg["steeringAngleDeg"].is_null();
             bool has_timestamp = msg.contains("timestamp") && !msg["timestamp"].is_null();
-            bool has_steering_torque = msg.contains("steeringTorque") && !msg["steeringTorque"].is_null();
             bool has_actuators_accel = msg.contains("actuators_accel") && !msg["actuators_accel"].is_null();
             bool has_actuators_torque = msg.contains("actuators_torque") && !msg["actuators_torque"].is_null();
             bool has_car_output_accel = msg.contains("carOutput_accel") && !msg["carOutput_accel"].is_null();
@@ -447,11 +445,6 @@ private:
             if (has_wheel_speeds) {
                 latest_state_.rear_wheel_speed_left = msg["wheelSpeeds_rl"].get<float>();
                 latest_state_.rear_wheel_speed_right = msg["wheelSpeeds_rr"].get<float>();
-                updated = true;
-            }
-            
-            if (has_steering_torque) {
-                latest_state_.steering_torque = msg["steeringTorque"].get<float>();
                 updated = true;
             }
             
@@ -494,16 +487,11 @@ private:
         }
     }
     
-    void cmd_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    void cmd_callback(const car_control::msg::DriveCommand::SharedPtr msg)
     {
-        // Store control commands from path follower or planner
-        // msg->linear.x = acceleration (-1 to 1, where 1 = full throttle, -1 = full brake)
-        // msg->angular.z = steering torque (-1 to 1)
         std::lock_guard<std::mutex> lock(cmd_mutex_);
-        
-        // Clamp values to [-1, 1] range
-        current_acceleration_ = std::max(-1.0, std::min(1.0, msg->linear.x));
-        current_steering_ = std::max(-1.0, std::min(1.0, msg->angular.z));
+        current_acceleration_ = std::max(-1.0, std::min(1.0, static_cast<double>(msg->accel)));
+        current_steering_     = std::max(-1.0, std::min(1.0, static_cast<double>(msg->torque)));
         
         RCLCPP_DEBUG(this->get_logger(), 
             "Control command - Accel: %.3f, Steer: %.3f", 
@@ -516,9 +504,9 @@ private:
         
         std::lock_guard<std::mutex> lock(cmd_mutex_);
         
-        // Build joystick command JSON
-        // axes[0] = acceleration (gas/brake, -1 to 1)
-        // axes[1] = steering_torque (steering wheel angle, -1 to 1)
+        // Build joystick command JSON for Comma panda protocol
+        // axes[0] = accel  (gas/brake, -1 to 1)
+        // axes[1] = torque (steering torque, -1 to 1)
         json cmd;
         cmd["type"] = "joystick";
         cmd["axes"] = json::array({current_acceleration_, current_steering_});
@@ -550,6 +538,7 @@ private:
         
         // Always publish latest state at steady 50 Hz (even if data unchanged since last tick)
         // This keeps the dashboard Hz counter accurate and matches behaviour of all other nodes
+        latest_state_.header.stamp = this->now();
         speed_publisher_->publish(latest_state_);
         
         RCLCPP_DEBUG(this->get_logger(),
@@ -557,7 +546,7 @@ private:
             latest_state_.v_ego, latest_state_.steering_angle_deg, latest_state_.timestamp);
     }
 
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_subscriber_;
+    rclcpp::Subscription<car_control::msg::DriveCommand>::SharedPtr cmd_subscriber_;
     rclcpp::Publisher<car_control::msg::VehicleState>::SharedPtr speed_publisher_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
     

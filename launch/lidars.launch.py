@@ -1,4 +1,4 @@
-"""Launch three Ouster lidar drivers simultaneously, each in its own namespace."""
+"""Launch two Ouster lidar drivers with lifecycle state management."""
 
 from pathlib import Path
 import launch
@@ -60,16 +60,12 @@ def make_lidar_nodes(ns: str, params_file: str):
 
 def generate_launch_description():
     car_control_pkg_dir = get_package_share_directory('car_control')
-    config_dir = Path(car_control_pkg_dir) / 'config'
+    lidars_yaml = str(Path(car_control_pkg_dir) / 'config' / 'lidars.yaml')
 
-    sensors = [
-        ('lidar_1', str(config_dir / 'lidar_1_params.yaml')),  # 192.168.2.181
-        ('lidar_2', str(config_dir / 'lidar_2_params.yaml')),  # 192.168.2.205
-        # ('lidar_3', str(config_dir / 'lidar_3_params.yaml')),  # 192.168.2.228 - sensor in ERROR state
-    ]
+    sensors = ['lidar_1', 'lidar_2']  # lidar_3 (192.168.2.228) is in ERROR state
 
     actions = []
-    for ns, params_file in sensors:
-        actions.extend(make_lidar_nodes(ns, params_file))
+    for ns in sensors:
+        actions.extend(make_lidar_nodes(ns, lidars_yaml))
 
     return launch.LaunchDescription(actions)

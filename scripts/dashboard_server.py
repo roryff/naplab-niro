@@ -10,7 +10,7 @@ Extends the original GNSS/ESF dashboard with full path-follower telemetry:
 
 New ROS 2 topics consumed
 --------------------------
-  /cmd_vel                   geometry_msgs/Twist      – controller output
+  /cmd_vel                   car_control/DriveCommand  – controller output
   /path_visualization        nav_msgs/Path            – ENU path waypoints
   /lateral_error             std_msgs/Float64         – cross-track error [m]
   /heading_error             std_msgs/Float64         – heading error [rad]
@@ -28,6 +28,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import TwistStamped, PoseStamped, Twist, Vector3Stamped
+from car_control.msg import DriveCommand
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, Float64
 from car_control.msg import VehicleState, EsfStatus
@@ -88,7 +89,6 @@ _state = {
     "vehicle": {
         "v_ego_kmh":         0.0,
         "steering_deg":      0.0,
-        "steering_torque":   0.0,
         "wheel_left_mps":    0.0,
         "wheel_right_mps":   0.0,
         "lat_active":        False,
@@ -173,30 +173,26 @@ _dashboard_node  = None   # set in main(), used by POST handler
 # ---------------------------------------------------------------------------
 # Path recording state
 # ---------------------------------------------------------------------------
-_RECORD_MIN_DIST_M = 0.5   # metres – skip if moved less than this
-_RECORD_HZ         = 5.0   # sampling rate for waypoints
+_RECORD_HZ = 30.0  # sampling rate for waypoints — matches gnss/odometry rate
 
 _rec_lock     = threading.Lock()
 _rec_active   = False
 _rec_file     = None
 _rec_writer   = None
-_rec_last_x   = None
-_rec_last_y   = None
 _rec_count    = 0
 _rec_filename = None
 _rec_thread   = None
 
 
 def _recording_loop():
-    """Background thread: samples gnss/odometry pos at ~_RECORD_HZ Hz, writes CSV."""
-    global _rec_active, _rec_count, _rec_last_x, _rec_last_y
+    """Background thread: samples gnss/odometry pos at _RECORD_HZ Hz, writes CSV."""
+    global _rec_active, _rec_count
     interval = 1.0 / _RECORD_HZ
     while True:
         time.sleep(interval)
         with _rec_lock:
             if not _rec_active:
                 break
-        # read position from shared state (no topic lock needed for atomic float reads)
         with _state_lock:
             x   = _state["gnss"]["pos_x_m"]
             y   = _state["gnss"]["pos_y_m"]
@@ -206,21 +202,13 @@ def _recording_loop():
         with _rec_lock:
             if not _rec_active:
                 break
-            if _rec_last_x is not None:
-                dx = x - _rec_last_x
-                dy = y - _rec_last_y
-                if (dx * dx + dy * dy) < (_RECORD_MIN_DIST_M ** 2):
-                    continue
             _rec_writer.writerow([f'{x:.4f}', f'{y:.4f}'])
             _rec_file.flush()
-            _rec_last_x = x
-            _rec_last_y = y
             _rec_count += 1
 
 
 def _start_recording() -> dict:
-    global _rec_active, _rec_file, _rec_writer, _rec_last_x, _rec_last_y
-    global _rec_count, _rec_filename, _rec_thread
+    global _rec_active, _rec_file, _rec_writer, _rec_count, _rec_filename, _rec_thread
     with _rec_lock:
         if _rec_active:
             return {"ok": False, "error": "already recording"}
@@ -242,8 +230,6 @@ def _start_recording() -> dict:
         _rec_file   = open(filename, 'w', newline='')
         _rec_writer = csv.writer(_rec_file)
         _rec_writer.writerow(['x', 'y'])
-        _rec_last_x = None
-        _rec_last_y = None
         _rec_count  = 0
         _rec_filename = str(filename)
         _rec_active = True
@@ -366,7 +352,7 @@ class DashboardNode(Node):
         # path_follower/cmd_vel: desired steer angle [rad] + desired speed [m/s]
         self.create_subscription(Twist,   "/path_follower/cmd_vel",  self._cb_pf_cmd,    10)
         # cmd_vel: MPC torque [-1,1] + accel command [-1,1]
-        self.create_subscription(Twist,   "/cmd_vel",                self._cb_cmd_vel,   10)
+        self.create_subscription(DriveCommand, "/cmd_vel",            self._cb_cmd_vel,   10)
         self.create_subscription(Path,    "/path_visualization",     self._cb_path,      latched_qos)
         self.create_subscription(Float64, "/lateral_error",          self._cb_lat_err,   10)
         self.create_subscription(Float64, "/heading_error",          self._cb_hdg_err,   10)
@@ -384,7 +370,6 @@ class DashboardNode(Node):
             v["v_ego_kmh"]         = round(float(msg.v_ego), 2)
             # Negate: positive = left (CCW) to match conventional sign convention
             v["steering_deg"]      = round(-float(msg.steering_angle_deg), 2)
-            v["steering_torque"]   = round(float(msg.steering_torque), 3)
             v["wheel_left_mps"]    = round(float(msg.rear_wheel_speed_left), 3)
             v["wheel_right_mps"]   = round(float(msg.rear_wheel_speed_right), 3)
             v["lat_active"]        = bool(msg.lat_active)
@@ -478,14 +463,14 @@ class DashboardNode(Node):
             c["target_steer_deg"] = round(deg, 3)
             _push_history(c["steer_cmd_history"], deg)
 
-    def _cb_cmd_vel(self, msg: Twist):
-        """cmd_vel (steering_mpc output): angular.z = torque [-1,1], linear.x = accel cmd [-1,1]"""
+    def _cb_cmd_vel(self, msg: DriveCommand):
+        """cmd_vel: torque [-1,1], accel cmd [-1,1]"""
         with _state_lock:
             _touch_topic("/cmd_vel")
             c = _state["controller"]
-            c["mpc_torque"]    = round(float(msg.angular.z), 4)
-            c["mpc_accel_cmd"] = round(float(msg.linear.x), 3)
-            _push_history(c["torque_history"], float(msg.angular.z))
+            c["mpc_torque"]    = round(float(msg.torque), 4)
+            c["mpc_accel_cmd"] = round(float(msg.accel), 3)
+            _push_history(c["torque_history"], float(msg.torque))
 
     def _cb_lat_err(self, msg: Float64):
         with _state_lock:

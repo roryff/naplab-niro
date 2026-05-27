@@ -1,9 +1,27 @@
 steering_mpc_node:
   ros__parameters:
-    # desired_speed_mps is supplied at launch time
-    # Leave model_config_path empty to use the bundled integrator_model.yaml
-    model_config_path: ""
-    dt:     0.05
-    horizon: 40
-    tau_r:   0.78
-    gain_r:  36.0
+
+    # ── Controller ────────────────────────────────────────────────────────────
+    dt:           0.05   # timestep [s] — node runs at 20 Hz
+    horizon:      40     # prediction steps (2 s lookahead)
+    rate_up:      1.033  # torque-magnitude rise rate limit [norm/s]
+    rate_down:    1.833  # torque-magnitude fall rate limit [norm/s]
+    torque_limit: 1.0
+    weight_angle:  1.0
+    weight_torque: 0.01
+    # desired_speed_mps: supplied at launch time
+
+    # ── Speed-scheduled first-order actuator model (SchedFO2) ─────────────────
+    # Identified from step-response tests on Kia Niro EV, NAPLab NTNU, 2025.
+    # θ[k+1] = exp(-Ts/τ(v))·θ[k]  +  Kss(v)·(1-exp(-Ts/τ(v)))·u[k]
+    # NRMSE fit: 84–92 % across 5–50 km/h (10 step-response tests).
+    # Set use_sched_fo2: false to fall back to the fixed tau_r / gain_r below.
+    use_sched_fo2: true
+
+    sched_v_kmh: [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 36.0, 40.0, 45.0, 50.0]
+    sched_tau_r:  [2.953, 1.386, 0.722, 0.627, 0.437, 0.390, 0.342, 0.295, 0.247, 0.200]
+    sched_kss:    [501.9, 314.9, 187.4, 143.2, 105.5, 84.6, 71.2, 63.3, 53.9, 44.1]
+
+    # ── Fallback fixed model (use_sched_fo2: false only) ─────────────────────
+    tau_r:  0.78    # first-order time constant [s]
+    gain_r: 36.0    # steady-state sw-deg/s per unit torque

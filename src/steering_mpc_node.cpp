@@ -1,14 +1,11 @@
 /**
- * ROS2 C++ MPC node for steering torque control.
- * Loads integrator model from YAML, builds QP (same as Python torque_controller.py),
- * solves with OSQP, publishes first torque. Can be copied into an existing ROS2 project.
+ * ROS2 C++ MPC node for steering torque control (cascade mode).
+ * Actuator model and all tuning parameters are loaded from steering_mpc_node.yaml.
  */
 
 #include <cmath>
-#include <fstream>
 #include <limits>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <cerrno>
@@ -25,6 +22,7 @@
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include "car_control/msg/drive_command.hpp"
 #include "car_control/msg/vehicle_state.hpp"
 
 namespace {
@@ -97,15 +95,6 @@ struct ControllerParams {
   double lookahead_s = kDefaultLookaheadS;
 };
 
-// Parse a space-separated list of doubles from a string.
-static std::vector<double> parseDoubleArray(const std::string& s) {
-  std::vector<double> out;
-  std::istringstream iss(s);
-  double d;
-  while (iss >> d) out.push_back(d);
-  return out;
-}
-
 // Piecewise-linear interpolation with clamping. floor_val clips the lower bound.
 static double schedInterp(const std::vector<double>& xs,
                           const std::vector<double>& ys,
@@ -122,50 +111,6 @@ static double schedInterp(const std::vector<double>& xs,
   return std::max(floor_val, ys.back());
 }
 
-// Simple YAML parser for "key: value" lines (no nesting).
-bool loadConfig(const std::string& path, IntegratorParams& ip, ControllerParams& cp) {
-  std::ifstream f(path);
-  if (!f.is_open()) return false;
-  std::string line;
-  while (std::getline(f, line)) {
-    auto pos = line.find('#');
-    if (pos != std::string::npos) line = line.substr(0, pos);
-    pos = line.find(':');
-    if (pos == std::string::npos) continue;
-    std::string key = line.substr(0, pos);
-    std::string val = line.substr(pos + 1);
-    auto trim = [](std::string& s) {
-      size_t i = 0; while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
-      s = s.substr(i);
-      while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
-    };
-    trim(key); trim(val);
-    if (key == "tau_r") ip.tau_r = std::stod(val);
-    else if (key == "gain_r") ip.gain_r = std::stod(val);
-    else if (key == "leak") ip.leak = std::stod(val);
-    else if (key == "u0") ip.u0 = std::stod(val);
-    else if (key == "rate_clip") ip.rate_clip = std::stod(val);
-    else if (key == "max_angle_deg") ip.max_angle_deg = std::stod(val);
-    else if (key == "delay_s") ip.delay_s = std::stod(val);
-    else if (key == "G0") ip.G0 = std::stod(val);
-    else if (key == "va") ip.va = std::stod(val);
-    else if (key == "vb") ip.vb = std::stod(val);
-    else if (key == "use_sched_fo2") ip.use_sched_fo2 = std::stoi(val) != 0;
-    else if (key == "sched_v_kmh")   ip.sched_v_kmh = parseDoubleArray(val);
-    else if (key == "sched_tau_r")   ip.sched_tau_r = parseDoubleArray(val);
-    else if (key == "sched_kss")     ip.sched_kss   = parseDoubleArray(val);
-    else if (key == "dt") cp.dt = std::stod(val);
-    else if (key == "horizon") cp.horizon = std::stoi(val);
-    else if (key == "rate_up") cp.rate_up = std::stod(val);
-    else if (key == "rate_down") cp.rate_down = std::stod(val);
-    else if (key == "torque_limit") cp.torque_limit = std::stod(val);
-    else if (key == "weight_angle") cp.weight_angle = std::stod(val);
-    else if (key == "weight_torque") cp.weight_torque = std::stod(val);
-    else if (key == "lookahead_s") cp.lookahead_s = std::stod(val);
-  }
-  return true;
-}
-
 }  // namespace
 
 class SteeringMpcNode : public rclcpp::Node {
@@ -175,45 +120,49 @@ class SteeringMpcNode : public rclcpp::Node {
     // on its own executor thread and is not blocked by incoming topic callbacks
     timer_cb_group_ = create_callback_group(
         rclcpp::CallbackGroupType::MutuallyExclusive);
-    declare_parameter<std::string>("model_config_path", "");
+    // ── Actuator model ──────────────────────────────────────────────────────
+    declare_parameter<bool>  ("use_sched_fo2", false);
+    declare_parameter<std::vector<double>>("sched_v_kmh", std::vector<double>{});
+    declare_parameter<std::vector<double>>("sched_tau_r", std::vector<double>{});
+    declare_parameter<std::vector<double>>("sched_kss",   std::vector<double>{});
+    declare_parameter<double>("tau_r",  kDefaultTauR);
+    declare_parameter<double>("gain_r", kDefaultGainR);
+    // ── Controller ──────────────────────────────────────────────────────────
     declare_parameter<double>("dt", kDefaultDt);
     declare_parameter<int>("horizon", kDefaultHorizon);
-    declare_parameter<double>("rate_up", kDefaultRateUp);
-    declare_parameter<double>("rate_down", kDefaultRateDown);
-    declare_parameter<double>("torque_limit",   kDefaultTorqueLimit);
-    declare_parameter<double>("weight_angle",    kDefaultWeightAngle);
-    declare_parameter<double>("weight_torque",   kDefaultWeightTorque);
-    declare_parameter<double>("lookahead_s",     kDefaultLookaheadS);
-    declare_parameter<double>("kp_speed",        kDefaultKpSpeed);
-    declare_parameter<double>("max_speed_mps",   kDefaultMaxSpeedMps);
+    declare_parameter<double>("rate_up",       kDefaultRateUp);
+    declare_parameter<double>("rate_down",     kDefaultRateDown);
+    declare_parameter<double>("torque_limit",  kDefaultTorqueLimit);
+    declare_parameter<double>("weight_angle",  kDefaultWeightAngle);
+    declare_parameter<double>("weight_torque", kDefaultWeightTorque);
+    declare_parameter<double>("lookahead_s",   kDefaultLookaheadS);
+    declare_parameter<double>("kp_speed",      kDefaultKpSpeed);
+    declare_parameter<double>("max_speed_mps", kDefaultMaxSpeedMps);
     declare_parameter<double>("desired_speed_mps", 0.0);
 
-    std::string config_path = get_parameter("model_config_path").as_string();
-    if (!config_path.empty()) {
-      if (!loadConfig(config_path, integrator_, ctrl_)) {
-        RCLCPP_ERROR(get_logger(), "Failed to load model config: %s", config_path.c_str());
-      } else {
-        if (integrator_.G0 > 0.0) {
-          RCLCPP_INFO(get_logger(),
-            "Loaded model from %s  [speed-dependent gain: G0=%.0f va=%.4f vb=%.4f]",
-            config_path.c_str(), integrator_.G0, integrator_.va, integrator_.vb);
-        } else {
-          RCLCPP_INFO(get_logger(), "Loaded model from %s  [constant gain_r=%.1f]",
-            config_path.c_str(), integrator_.gain_r);
-        }
-      }
+    integrator_.use_sched_fo2 = get_parameter("use_sched_fo2").as_bool();
+    if (integrator_.use_sched_fo2) {
+      integrator_.sched_v_kmh = get_parameter("sched_v_kmh").as_double_array();
+      integrator_.sched_tau_r = get_parameter("sched_tau_r").as_double_array();
+      integrator_.sched_kss   = get_parameter("sched_kss").as_double_array();
+      RCLCPP_INFO(get_logger(), "Actuator model: speed-scheduled SchedFO2 (%zu breakpoints)",
+                  integrator_.sched_v_kmh.size());
+    } else {
+      integrator_.tau_r  = get_parameter("tau_r").as_double();
+      integrator_.gain_r = get_parameter("gain_r").as_double();
+      RCLCPP_INFO(get_logger(), "Actuator model: fixed integrator tau_r=%.2f gain_r=%.1f",
+                  integrator_.tau_r, integrator_.gain_r);
     }
-    ctrl_.dt = get_parameter("dt").as_double();
-    ctrl_.horizon = get_parameter("horizon").as_int();
-    ctrl_.rate_up = get_parameter("rate_up").as_double();
-    ctrl_.rate_down = get_parameter("rate_down").as_double();
+    ctrl_.dt           = get_parameter("dt").as_double();
+    ctrl_.horizon      = get_parameter("horizon").as_int();
+    ctrl_.rate_up      = get_parameter("rate_up").as_double();
+    ctrl_.rate_down    = get_parameter("rate_down").as_double();
     ctrl_.torque_limit = get_parameter("torque_limit").as_double();
     ctrl_.weight_angle = get_parameter("weight_angle").as_double();
     ctrl_.weight_torque = get_parameter("weight_torque").as_double();
-    ctrl_.lookahead_s = get_parameter("lookahead_s").as_double();
+    ctrl_.lookahead_s  = get_parameter("lookahead_s").as_double();
     kp_speed_          = get_parameter("kp_speed").as_double();
     max_speed_mps_     = get_parameter("max_speed_mps").as_double();
-    // Initialize desired speed from parameter so accel runs immediately at startup
     desired_speed_mps_ = get_parameter("desired_speed_mps").as_double();
     N_ = std::max(1, std::min(ctrl_.horizon, 64));
 
@@ -249,7 +198,7 @@ class SteeringMpcNode : public rclcpp::Node {
 
     // Subscribe to vehicle/state for steering wheel angle [deg] and speed [km/h]
     sub_vehicle_state_ = create_subscription<car_control::msg::VehicleState>(
-        "vehicle/state", 10,
+        "vehicle/state", rclcpp::SensorDataQoS(),
         [this](const car_control::msg::VehicleState::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(mutex_);
           double new_angle = static_cast<double>(msg->steering_angle_deg);
@@ -266,8 +215,7 @@ class SteeringMpcNode : public rclcpp::Node {
           vehicle_speed_mps_ = static_cast<double>(msg->v_ego) / 3.6;
         });
 
-    // Publish cmd_vel to comma_node: angular.z = steering torque [-1,1], linear.x = accel cmd [-1,1]
-    pub_cmd_vel_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+    pub_cmd_vel_ = create_publisher<car_control::msg::DriveCommand>("cmd_vel", 10);
 
     // Subscribe to reference trajectory from path follower (N future steering angles in SW deg)
     sub_ref_traj_ = create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -325,18 +273,9 @@ class SteeringMpcNode : public rclcpp::Node {
 
     // Do not run MPC when path following is inactive — hold brake
     if (!active) {
-      geometry_msgs::msg::Twist brake;
-      brake.linear.x  = -1.0;  // full brake
-      brake.angular.z =  0.0;
-      pub_cmd_vel_->publish(brake);
-      return;
-    }
-
-    // Do not run MPC when path following is inactive — hold brake
-    if (!active) {
-      geometry_msgs::msg::Twist brake;
-      brake.linear.x  = -1.0;  // full brake
-      brake.angular.z =  0.0;
+      car_control::msg::DriveCommand brake;
+      brake.accel  = -1.0f;
+      brake.torque =  0.0f;
       pub_cmd_vel_->publish(brake);
       return;
     }
@@ -349,10 +288,9 @@ class SteeringMpcNode : public rclcpp::Node {
     double speed_err  = desired_speed - vehicle_speed;
     double accel_cmd  = std::clamp(kp_speed_ * speed_err, -1.0, 1.0);
 
-    // Publish to cmd_vel – comma_node axes[0]=accel, axes[1]=steering torque
-    geometry_msgs::msg::Twist cmd;
-    cmd.linear.x  = accel_cmd;  // closed-loop accel [-1, 1]
-    cmd.angular.z = u_cmd;      // MPC steering torque [-1, 1]
+    car_control::msg::DriveCommand cmd;
+    cmd.accel  = static_cast<float>(accel_cmd);
+    cmd.torque = static_cast<float>(u_cmd);
     pub_cmd_vel_->publish(cmd);
 
     // Publish debug topics
@@ -561,7 +499,7 @@ class SteeringMpcNode : public rclcpp::Node {
   rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr sub_vehicle_state_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_ref_traj_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr            sub_pf_status_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr         pub_cmd_vel_;
+  rclcpp::Publisher<car_control::msg::DriveCommand>::SharedPtr    pub_cmd_vel_;
   // Debug publishers (rosbag / rqt_plot)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_dbg_desired_angle_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_dbg_actual_angle_;

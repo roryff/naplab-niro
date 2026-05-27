@@ -235,7 +235,6 @@ header h1{font-size:17px;font-weight:600;color:#f0f6fc}
         <div class="big green" id="speed-big">—</div>
         <div class="sub">Speed (km/h)</div>
         <div class="row"><span class="label">Steer Wheel</span><span><span id="sw-val" class="value">—</span>°</span></div>
-        <div class="row"><span class="label">Steer Torque</span><span id="stq-val" class="value">—</span></div>
         <hr class="divider">
         <div class="row"><span class="label">Wheel L</span><span><span id="whl-l" class="value">—</span> m/s</span></div>
         <div class="row"><span class="label">Wheel R</span><span><span id="whl-r" class="value">—</span> m/s</span></div>
@@ -587,7 +586,6 @@ function render(s){
   const spdBig=document.getElementById('speed-big');
   if(spdBig){ spdBig.textContent=fmt(v.v_ego_kmh,1); spdBig.className='big '+(vsStale>STALE_SEC?'grey':'green'); }
   setText('sw-val',  fmt(v.steering_deg,1));
-  setText('stq-val', fmt(v.steering_torque,3));
   setText('whl-l',   fmt(v.wheel_left_mps,3));
   setText('whl-r',   fmt(v.wheel_right_mps,3));
   const wdiff = Math.abs(v.wheel_left_mps-v.wheel_right_mps);

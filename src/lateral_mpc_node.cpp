@@ -18,7 +18,7 @@
  *   enable_path_following (std_msgs/Bool)              — rising edge starts, any msg stops
  *
  * Publications:
- *   cmd_vel                       (geometry_msgs/Twist)   — linear.x=accel, angular.z=torque
+ *   cmd_vel                       (car_control/DriveCommand) — accel [-1,1], torque [-1,1]
  *   lateral_mpc/cte_m             (std_msgs/Float64)
  *   lateral_mpc/heading_error_deg (std_msgs/Float64)
  *   lateral_mpc/desired_delta_deg (std_msgs/Float64)      — curvature-based feedforward [deg fw]
@@ -35,6 +35,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include "car_control/msg/drive_command.hpp"
 #include "car_control/msg/vehicle_state.hpp"
 #include <nav_msgs/msg/path.hpp>
 #include <osqp.h>
@@ -49,7 +50,6 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
-#include <sstream>
 #include <vector>
 #include <deque>
 #include <cerrno>
@@ -58,15 +58,6 @@
 // ============================================================
 // sched_fo2 helpers (piecewise-linear interpolation)
 // ============================================================
-
-static std::vector<double> parseDoubleArray(const std::string& s)
-{
-    std::vector<double> out;
-    std::istringstream iss(s);
-    double d;
-    while (iss >> d) out.push_back(d);
-    return out;
-}
 
 // Piecewise-linear interpolation with clamping at endpoints.
 static double schedInterp(const std::vector<double>& xs,
@@ -92,7 +83,7 @@ static double schedInterp(const std::vector<double>& xs,
 static constexpr double CONTROL_HZ          = 20.0;
 static constexpr double DT                  = 1.0 / CONTROL_HZ;  // 0.05 s
 static constexpr double WHEELBASE           = 2.79;              // Kia Niro [m]
-static constexpr double STEERING_RATIO      = 15.33;             // sw-deg per road-wheel deg
+static constexpr double STEERING_RATIO      = 15.33;             // sw-deg per road-wheel deg (= 460/30; same ratio as in path_follower_node.cpp)
 static constexpr double MIN_SPEED           = 0.3;               // [m/s] stop threshold
 static constexpr double SOFT_START_DURATION = 3.0;               // ramp gains over first N s
 
@@ -376,18 +367,31 @@ public:
         declare_parameter("kp_speed",          0.3);
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
-        declare_parameter<std::string>("sched_fo2_model_path", "");
         declare_parameter("weight_delta", 0.0);  // delta reference tracking weight; 0=disabled
         declare_parameter<std::string>("reference_point", "rear_axle");
         declare_parameter("path_spline_knot_m", 5.0);
+        declare_parameter<bool>  ("use_sched_fo2", false);
+        declare_parameter<std::vector<double>>("sched_v_kmh", std::vector<double>{});
+        declare_parameter<std::vector<double>>("sched_tau_r", std::vector<double>{});
+        declare_parameter<std::vector<double>>("sched_kss",   std::vector<double>{});
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
         reference_point_ = loadReferencePoint();
 
-        // ---- Load sched_fo2 model (if path provided) ---------------------------
-        std::string sfo2_path = get_parameter("sched_fo2_model_path").as_string();
-        if (!sfo2_path.empty()) {
-            loadSchedFo2(sfo2_path);
+        // ---- Actuator model ----------------------------------------------------
+        use_sched_fo2_ = get_parameter("use_sched_fo2").as_bool();
+        if (use_sched_fo2_) {
+            sched_v_kmh_ = get_parameter("sched_v_kmh").as_double_array();
+            sched_tau_r_ = get_parameter("sched_tau_r").as_double_array();
+            sched_kss_   = get_parameter("sched_kss").as_double_array();
+            RCLCPP_INFO(get_logger(),
+                "sched_fo2 actuator model: %zu breakpoints, tau_r %.2f..%.2f s",
+                sched_v_kmh_.size(),
+                sched_tau_r_.empty() ? 0.0 : sched_tau_r_.front(),
+                sched_tau_r_.empty() ? 0.0 : sched_tau_r_.back());
+        } else {
+            RCLCPP_INFO(get_logger(), "Fixed actuator model: tau_r=%.2f gain_r=%.1f",
+                get_parameter("tau_r").as_double(), get_parameter("gain_r").as_double());
         }
 
         // ---- Subscriptions -----------------------------------------------------
@@ -396,7 +400,7 @@ public:
             std::bind(&LateralMpcNode::gnssPoseCallback, this, std::placeholders::_1));
 
         vehicle_state_sub_ = create_subscription<car_control::msg::VehicleState>(
-            "vehicle/state", 10,
+            "vehicle/state", rclcpp::SensorDataQoS(),
             std::bind(&LateralMpcNode::vehicleStateCallback, this, std::placeholders::_1));
 
         enable_sub_ = create_subscription<std_msgs::msg::Bool>(
@@ -404,7 +408,7 @@ public:
             std::bind(&LateralMpcNode::enableCallback, this, std::placeholders::_1));
 
         // ---- Publishers --------------------------------------------------------
-        cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+        cmd_vel_pub_ = create_publisher<car_control::msg::DriveCommand>("cmd_vel", 10);
 
         auto latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
         status_pub_   = create_publisher<std_msgs::msg::Bool>(
@@ -1111,55 +1115,6 @@ private:
     }
 
     // =========================================================================
-    // sched_fo2 loader
-    // =========================================================================
-
-    void loadSchedFo2(const std::string& path)
-    {
-        std::ifstream f(path);
-        if (!f.is_open()) {
-            RCLCPP_ERROR(get_logger(), "Cannot open sched_fo2 model: %s", path.c_str());
-            return;
-        }
-        bool found_use = false;
-        std::string line;
-        while (std::getline(f, line)) {
-            auto pos = line.find('#');
-            if (pos != std::string::npos) line = line.substr(0, pos);
-            pos = line.find(':');
-            if (pos == std::string::npos) continue;
-            std::string key = line.substr(0, pos);
-            std::string val = line.substr(pos + 1);
-            auto trim = [](std::string& s) {
-                size_t i = 0;
-                while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
-                s = s.substr(i);
-                while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
-            };
-            trim(key); trim(val);
-            if (key == "use_sched_fo2") {
-                use_sched_fo2_ = std::stoi(val) != 0;
-                found_use = true;
-            } else if (key == "sched_v_kmh") {
-                sched_v_kmh_ = parseDoubleArray(val);
-            } else if (key == "sched_tau_r") {
-                sched_tau_r_ = parseDoubleArray(val);
-            } else if (key == "sched_kss") {
-                sched_kss_ = parseDoubleArray(val);
-            }
-        }
-        if (!found_use) use_sched_fo2_ = !sched_v_kmh_.empty();
-        if (use_sched_fo2_) {
-            RCLCPP_INFO(get_logger(),
-                "sched_fo2 actuator model loaded from %s  (%zu breakpoints, tau_r %.2f..%.2f s)",
-                path.c_str(), sched_v_kmh_.size(),
-                sched_tau_r_.empty() ? 0.0 : sched_tau_r_.front(),
-                sched_tau_r_.empty() ? 0.0 : sched_tau_r_.back());
-        } else {
-            RCLCPP_WARN(get_logger(),
-                "sched_fo2 file loaded but use_sched_fo2=0 — using legacy 2-state model.");
-        }
-    }
 
     // =========================================================================
     // Publish helpers
@@ -1167,9 +1122,9 @@ private:
 
     void publishCmd(double accel_cmd, double torque_cmd)
     {
-        geometry_msgs::msg::Twist cmd;
-        cmd.linear.x  = accel_cmd;   // accel [-1, 1]
-        cmd.angular.z = torque_cmd;  // steering torque [-1, 1]
+        car_control::msg::DriveCommand cmd;
+        cmd.accel  = static_cast<float>(accel_cmd);
+        cmd.torque = static_cast<float>(torque_cmd);
         cmd_vel_pub_->publish(cmd);
     }
 
@@ -1262,7 +1217,7 @@ private:
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr   vehicle_state_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              enable_sub_;
 
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr   cmd_vel_pub_;
+    rclcpp::Publisher<car_control::msg::DriveCommand>::SharedPtr  cmd_vel_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr          path_vis_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr          status_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_cte_;

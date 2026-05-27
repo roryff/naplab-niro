@@ -1,0 +1,33 @@
+# Shared settings applied to all CameraNode instances.
+/**:
+  ros__parameters:
+    port: 10030
+    multicast_iface: 'enP2p1s0'
+    encode_bitrate_bps: 20000000   # H.264 re-encode bitrate [bps] (20 Mbps)
+    frame_timeout_ms: 500.0         # restart pipeline after this many ms with no frames
+    restart_backoff_ms: 100.0       # cooldown between pipeline restart attempts [ms]
+
+# Per-camera settings: multicast source IP, publish topic, TF frame.
+/camera_front:
+  ros__parameters:
+    multicast_ip: '239.10.0.1'
+    topic: 'cameras/front/image_compressed'
+    frame_id: 'camera_front'
+
+/camera_right:
+  ros__parameters:
+    multicast_ip: '239.10.0.2'
+    topic: 'cameras/right/image_compressed'
+    frame_id: 'camera_right'
+
+/camera_rear:
+  ros__parameters:
+    multicast_ip: '239.10.0.3'
+    topic: 'cameras/rear/image_compressed'
+    frame_id: 'camera_rear'
+
+/camera_left:
+  ros__parameters:
+    multicast_ip: '239.10.0.4'
+    topic: 'cameras/left/image_compressed'
+    frame_id: 'camera_left'

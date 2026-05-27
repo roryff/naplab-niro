@@ -104,7 +104,7 @@ public:
         // at a fixed 50 Hz so the receiver sees isochronous data (needed to auto-
         // detect the sampling rate for scale factor estimation).
         vehicle_state_sub_ = this->create_subscription<car_control::msg::VehicleState>(
-            "/vehicle/state", 10,
+            "/vehicle/state", rclcpp::SensorDataQoS(),
             std::bind(&GNSSNode::vehicle_state_callback, this, std::placeholders::_1));
 
         // Start sender thread (fixed 50 Hz ESF-MEAS output)
