@@ -224,18 +224,22 @@ def _start_recording() -> dict:
     with _rec_lock:
         if _rec_active:
             return {"ok": False, "error": "already recording"}
-        # Walk up from __file__ to find the package root (contains package.xml),
-        # so recordings always land in the source tree regardless of whether the
-        # script is running from the install tree or directly.
-        _here = pathlib.Path(__file__).resolve()
-        _pkg_root = _here.parent
-        while _pkg_root != _pkg_root.parent:
-            if (_pkg_root / 'package.xml').exists():
-                break
-            _pkg_root = _pkg_root.parent
-        else:
-            _pkg_root = _here.parent.parent  # fallback
-        paths_dir = _pkg_root / 'paths'
+        # Always save recordings to the source tree paths directory so they
+        # persist across rebuilds and are independent of the install tree layout.
+        # When running from install/car_control/lib/car_control/, parents[4] is
+        # the workspace root; src/car_control/paths is the target.
+        _ws_root = pathlib.Path(__file__).resolve().parents[4]
+        _src_pkg_root = _ws_root / 'src' / 'car_control'
+        if not _src_pkg_root.exists():
+            # Fallback: walk up from __file__ looking for package.xml
+            _src_pkg_root = pathlib.Path(__file__).resolve().parent
+            while _src_pkg_root != _src_pkg_root.parent:
+                if (_src_pkg_root / 'package.xml').exists():
+                    break
+                _src_pkg_root = _src_pkg_root.parent
+            else:
+                _src_pkg_root = pathlib.Path(__file__).resolve().parent.parent
+        paths_dir = _src_pkg_root / 'paths'
         paths_dir.mkdir(parents=True, exist_ok=True)
         ts       = time.strftime('%Y%m%d_%H%M%S')
         filename = paths_dir / f'recording_{ts}.csv'
