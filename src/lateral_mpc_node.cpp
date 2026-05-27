@@ -374,6 +374,11 @@ public:
         declare_parameter<std::vector<double>>("sched_v_kmh", std::vector<double>{});
         declare_parameter<std::vector<double>>("sched_tau_r", std::vector<double>{});
         declare_parameter<std::vector<double>>("sched_kss",   std::vector<double>{});
+        declare_parameter("max_lat_accel_mps2", 2.0);
+        declare_parameter("corner_lookahead_s", 4.0);
+        declare_parameter("max_decel_mps2",     1.5);
+        declare_parameter("max_accel_mps2",     0.8);
+        declare_parameter("speed_margin",       0.15);  // fraction of torque_limit reserved for tracking
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
         reference_point_ = loadReferencePoint();
@@ -545,6 +550,7 @@ private:
             u_prev_          = 0.0;
             u_prev_p_        = 0.0;
             u_prev_m_        = 0.0;
+            v_target_prev_   = car_speed_mps_;   // ramp from current speed, not zero
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
             RCLCPP_INFO(get_logger(), "Path following STARTED.");
@@ -629,11 +635,21 @@ private:
         torque_cmd = std::clamp(torque_cmd, -1.0, 1.0);
         u_prev_    = torque_cmd;
 
-        // --- Speed P-controller ----------------------------------------------
-        double desired_speed = (state_ == State::STOPPING) ? 0.0
-            : get_parameter("desired_speed_mps").as_double();
-        double kp_speed = get_parameter("kp_speed").as_double();
-        double accel_cmd = std::clamp(kp_speed * (desired_speed - car_speed), -1.0, 1.0);
+        // --- Speed target: corner-limited + rate-limited startup ramp --------
+        double v_target = 0.0;
+        if (state_ == State::STOPPING) {
+            v_target       = 0.0;
+            v_target_prev_ = 0.0;
+        } else {
+            double v_corner = computeTargetSpeed(s_front, car_speed);
+            // Rate-limit upward changes only; deceleration is unrestricted for safety
+            v_target       = std::min(v_corner,
+                                      v_target_prev_ + get_parameter("max_accel_mps2").as_double()
+                                                        * DT);
+            v_target_prev_ = v_target;
+        }
+        double accel_cmd = std::clamp(
+            get_parameter("kp_speed").as_double() * (v_target - car_speed), -1.0, 1.0);
 
         // --- Publish ---------------------------------------------------------
         publishCmd(accel_cmd, torque_cmd);
@@ -651,7 +667,7 @@ private:
         pub_heading_error_->publish(f64(dpsi));   // [rad] – dashboard calls math.degrees()
         {
             geometry_msgs::msg::Twist pf_cmd;
-            pf_cmd.linear.x  = desired_speed;
+            pf_cmd.linear.x  = v_target;           // corner-limited target speed [m/s]
             pf_cmd.angular.z = desired_delta_rad;  // front-axle [rad]
             pub_pf_cmd_vel_->publish(pf_cmd);
         }
@@ -1117,6 +1133,78 @@ private:
     // =========================================================================
 
     // =========================================================================
+    // Corner-aware speed planning
+    // =========================================================================
+
+    /**
+     * Invert the K_ss speed schedule: return the maximum speed [m/s] at which
+     * the sched_fo2 actuator can hold the steady-state angle required for
+     * curvature kappa, leaving (speed_margin × torque_limit) for path tracking.
+     *
+     * K_ss is monotonically decreasing with speed, so the inversion is a
+     * simple linear scan + interpolation.
+     */
+    double maxSpeedFromModel(double kappa) const
+    {
+        if (kappa < 1e-6) return std::numeric_limits<double>::max();
+        const double tlim   = get_parameter("torque_limit").as_double();
+        const double margin = get_parameter("speed_margin").as_double();
+        // K_ss threshold [sw-deg/unit] to hold delta = κ × L with (1-margin) of torque
+        const double req_kss = kappa * WHEELBASE * STEERING_RATIO * (180.0 / M_PI)
+                                / (tlim * (1.0 - margin));
+
+        const auto& vs = sched_v_kmh_;  // increasing
+        const auto& ks = sched_kss_;    // decreasing
+
+        if (req_kss >= ks.front()) return 0.0;        // infeasible even at minimum speed
+        if (req_kss <= ks.back())  return std::numeric_limits<double>::max();  // feasible at all speeds
+
+        for (size_t i = 1; i < ks.size(); ++i) {
+            if (req_kss >= ks[i]) {
+                double t = (ks[i-1] - req_kss) / (ks[i-1] - ks[i]);
+                return (vs[i-1] + t * (vs[i] - vs[i-1])) / 3.6;  // km/h → m/s
+            }
+        }
+        return std::numeric_limits<double>::max();
+    }
+
+    /** Scan ahead along the path and return the current allowable speed [m/s].
+     *
+     * Two limits are applied at each lookahead point, whichever is tighter:
+     *   v_lat   = sqrt(max_lat_accel / |κ|)   — kinematic comfort limit
+     *   v_model = invert K_ss schedule         — actuator feasibility (sched_fo2 only)
+     * Both are then back-projected: v_now = sqrt(v_corner² + 2·a_decel·d)
+     */
+    double computeTargetSpeed(double s_front, double car_speed) const
+    {
+        const double desired     = get_parameter("desired_speed_mps").as_double();
+        const double a_lat       = get_parameter("max_lat_accel_mps2").as_double();
+        const double a_decel     = get_parameter("max_decel_mps2").as_double();
+        const double lookahead_s = get_parameter("corner_lookahead_s").as_double();
+
+        const double scan_end = s_front + std::max(car_speed * lookahead_s, 20.0);
+        constexpr double step = 0.5;
+
+        double v_limit = desired;
+        for (double s = s_front + step;
+             s < std::min(scan_end, path_.totalLength());
+             s += step)
+        {
+            double kappa = std::abs(path_.curvature(s));
+            if (kappa < 1e-4) continue;
+
+            double v_corner = std::min(std::sqrt(a_lat / kappa), desired);
+            if (use_sched_fo2_)
+                v_corner = std::min(v_corner, maxSpeedFromModel(kappa));
+
+            double dist = s - s_front;
+            double v_now = std::sqrt(v_corner * v_corner + 2.0 * a_decel * dist);
+            v_limit = std::min(v_limit, v_now);
+        }
+        return std::max(v_limit, 0.0);
+    }
+
+    // =========================================================================
     // Publish helpers
     // =========================================================================
 
@@ -1192,10 +1280,11 @@ private:
     bool   auto_enable_fired_  = false;
 
     // MPC state
-    double u_prev_   = 0.0;
-    double u_prev_p_ = 0.0;  // positive component of u_prev_ (u_prev_ = u_prev_p_ - u_prev_m_)
-    double u_prev_m_ = 0.0;  // negative magnitude component
-    int    N_        = 40;
+    double u_prev_        = 0.0;
+    double u_prev_p_      = 0.0;  // positive component of u_prev_ (u_prev_ = u_prev_p_ - u_prev_m_)
+    double u_prev_m_      = 0.0;  // negative magnitude component
+    double v_target_prev_ = 0.0;  // persists corner-limited target speed between cycles
+    int    N_             = 40;
 
     // sched_fo2 actuator model (loaded from sched_fo2_model_path if provided)
     bool use_sched_fo2_ = false;

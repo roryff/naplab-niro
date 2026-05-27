@@ -16,6 +16,17 @@ lateral_mpc_node:
     torque_limit: 1.0
     split_l1:     0.05   # L1 penalty on u_p+u_m to enforce complementarity
 
+    # ── Corner-aware speed control ────────────────────────────────────────────
+    # Scans ahead up to corner_lookahead_s × speed (min 20 m), computes the max
+    # safe speed at each curvature point (v = sqrt(max_lat_accel / κ)), and
+    # back-projects to find when to start braking. Upward changes rate-limited
+    # by max_accel_mps2 for smooth startup.
+    max_lat_accel_mps2: 2.0   # lateral acceleration limit [m/s²]
+    corner_lookahead_s: 4.0   # lookahead window [s × speed, min 20 m]
+    max_decel_mps2:     1.5   # deceleration used for back-projection [m/s²]
+    max_accel_mps2:     0.8   # max acceleration rate for smooth startup [m/s²]
+    speed_margin:       0.15  # torque headroom fraction for model-based speed limit
+
     # ── Actuator model ────────────────────────────────────────────────────────
     # use_sched_fo2: true  →  speed-scheduled SchedFO2 model (breakpoints below)
     # use_sched_fo2: false →  fixed integrator with tau_r / gain_r
