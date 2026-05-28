@@ -12,11 +12,6 @@ lateral_mpc_node:
     weight_delta:  0.0   # bag3 showed this increased saturation without improving tracking
     reference_point: "rear_axle"
     path_spline_knot_m: 5.0   # B-spline knot spacing for path smoothing [m]; 0 = disabled
-    # Asymmetric rate limits for u+/u- split (magnitude-based, not signed)
-    rate_up:   1.033   # rise: torque magnitude increase [norm/s]
-    rate_down: 1.833   # fall: torque magnitude decrease [norm/s]
-    torque_limit: 1.0
-    split_l1:  0.05    # L1 penalty on u_p+u_m to enforce complementarity
     # Sched_fo2 actuator model path (empty = use fixed tau_r/gain_r above)#
 #    sched_fo2_model_path: "/workspaces/isaac_ros-dev/install/car_control/share/car_control/config/sched_fo2_model.yaml"
     sched_fo2_model_path: ""
