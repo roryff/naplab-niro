@@ -879,7 +879,10 @@ private:
      */
     void vehicle_state_callback(const car_control::msg::VehicleState::SharedPtr msg)
     {
-        float speed_mps = (msg->rear_wheel_speed_left + msg->rear_wheel_speed_right) / 2.0f;
+        // Wheel speed magnitudes are unsigned; apply sign from v_ego (signed, negative in reverse).
+        float wheel_avg = (msg->rear_wheel_speed_left + msg->rear_wheel_speed_right) / 2.0f;
+        float sign = (msg->v_ego < 0.0f) ? -1.0f : 1.0f;
+        float speed_mps = sign * wheel_avg;
         int32_t speed_mm_s = static_cast<int32_t>(speed_mps * 1000.0f);
         // Clamp to 24-bit signed range
         speed_mm_s = std::max(-8388608, std::min(8388607, speed_mm_s));
