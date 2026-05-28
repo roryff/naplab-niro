@@ -2,11 +2,11 @@ lateral_mpc_node:
   ros__parameters:
     # path_csv_file and desired_speed_mps are supplied at launch time
     auto_enable: false
-    horizon: 80
+    horizon: 64   # max enforced by code; 3.2s / ~8.6m lookahead at 2.7 m/s
     # Cost weights
-    weight_cte:    20.0
-    weight_psi:    3.0
-    weight_torque: 0.01
+    weight_cte:    50.0   # was 20 — more aggressive CTE pull
+    weight_psi:    15.0   # was 3  — stronger heading damping, kills 6s oscillation
+    weight_torque: 0.005  # was 0.01 — less torque penalty so controller acts faster
     weight_delta:  0.0   # bag3 showed this increased saturation without improving tracking
     reference_point: "rear_axle"
     path_spline_knot_m: 5.0   # B-spline knot spacing for path smoothing [m]; 0 = disabled
@@ -27,3 +27,13 @@ lateral_mpc_node:
     sched_v_kmh: [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 36.0, 40.0, 45.0, 50.0]
     sched_tau_r:  [2.953, 1.386, 0.722, 0.627, 0.437, 0.390, 0.342, 0.295, 0.247, 0.200]
     sched_kss:    [501.9, 314.9, 187.4, 143.2, 105.5, 84.6, 71.2, 63.3, 53.9, 44.1]
+
+    # ── Curvature-aware speed profile ─────────────────────────────────────────
+    # Requires use_sched_fo2: true.  Builds a per-waypoint v_ref by inverting
+    # the K_ss table: finds the max speed where the steering model can achieve
+    # the required angle for each path curvature.  Backward/forward smoothing
+    # passes then enforce braking and acceleration limits.
+    speed_profile_decel_mps2:  1.5    # max deceleration for backward pass [m/s²]
+    speed_profile_accel_mps2:  0.5    # max acceleration for forward pass  [m/s²]
+    curvature_speed_margin:    0.75  # use 85% of peak K_ss (safety margin)
+    v_ref_min_mps:             0.5    # speed floor in profile [m/s]

@@ -99,6 +99,7 @@ public:
     {
         wpts_.clear();
         s_.clear();
+        v_ref_.clear();
     }
 
     bool isEmpty() const { return wpts_.empty(); }
@@ -198,6 +199,99 @@ public:
         while (dh >  M_PI) dh -= 2.0 * M_PI;
         while (dh < -M_PI) dh += 2.0 * M_PI;
         return dh / (2.0 * ds);
+    }
+
+    bool hasSpeedProfile() const { return v_ref_.size() == s_.size() && !v_ref_.empty(); }
+
+    double vref(double s) const
+    {
+        if (v_ref_.empty()) return 0.0;
+        if (s <= 0.0)       return v_ref_.front();
+        if (s >= s_.back()) return v_ref_.back();
+        auto it  = std::lower_bound(s_.begin(), s_.end(), s);
+        size_t i = std::distance(s_.begin(), it);
+        if (i == 0) return v_ref_[0];
+        i = std::min(i, v_ref_.size() - 1);
+        double t = (s_[i] - s_[i-1] > 1e-12) ? (s - s_[i-1]) / (s_[i] - s_[i-1]) : 0.0;
+        return v_ref_[i-1] + std::clamp(t, 0.0, 1.0) * (v_ref_[i] - v_ref_[i-1]);
+    }
+
+    // Build a per-waypoint speed reference by inverting the sched_fo2 K_ss table.
+    // sched_kss is monotone-decreasing: high gain at low speed, low gain at high speed.
+    // For each waypoint, finds the max speed where the steering model can still achieve
+    // the required angle, then applies backward/forward kinematic smoothing passes.
+    void buildSpeedProfile(
+        const std::vector<double>& sched_v_kmh,
+        const std::vector<double>& sched_kss,
+        double torque_limit,
+        double desired_speed_mps,
+        double decel_mps2,
+        double accel_mps2,
+        double margin_factor,
+        double v_min_mps)
+    {
+        const int n = static_cast<int>(wpts_.size());
+        v_ref_.resize(n);
+
+        // Pass 1: raw steering-model speed limit per waypoint
+        for (int i = 0; i < n; i++) {
+            double kappa     = curvature(s_[i]);
+            double delta_req = std::abs(kappa) * WHEELBASE;
+            // Required K_ss so delta_max(v) >= delta_req / margin_factor
+            double kss_req   = delta_req * STEERING_RATIO * (180.0 / M_PI)
+                               / (torque_limit * margin_factor);
+            double v_limit;
+            if (sched_kss.empty() || kss_req <= 0.0) {
+                v_limit = desired_speed_mps;
+            } else if (kss_req <= sched_kss.back()) {
+                // Even at the highest scheduled speed the model can handle this curvature
+                v_limit = sched_v_kmh.back() / 3.6;
+            } else if (kss_req >= sched_kss.front()) {
+                // Even the lowest scheduled speed cannot handle it — use floor
+                v_limit = v_min_mps;
+            } else {
+                // Walk table (monotone-decreasing K_ss) to find the crossing segment
+                v_limit = v_min_mps;
+                for (size_t j = 0; j + 1 < sched_kss.size(); j++) {
+                    if (sched_kss[j] >= kss_req && kss_req > sched_kss[j + 1]) {
+                        double t = (kss_req - sched_kss[j])
+                                   / (sched_kss[j + 1] - sched_kss[j]);
+                        v_limit = (sched_v_kmh[j]
+                                   + t * (sched_v_kmh[j + 1] - sched_v_kmh[j])) / 3.6;
+                        break;
+                    }
+                }
+            }
+            v_ref_[i] = std::clamp(v_limit, v_min_mps, desired_speed_mps);
+        }
+
+        // Pass 2: backward pass — braking constraint
+        for (int i = n - 2; i >= 0; i--) {
+            double ds      = s_[i + 1] - s_[i];
+            double v_brake = std::sqrt(v_ref_[i + 1] * v_ref_[i + 1] + 2.0 * decel_mps2 * ds);
+            v_ref_[i] = std::min(v_ref_[i], v_brake);
+        }
+
+        // Pass 3: forward pass — acceleration constraint
+        for (int i = 1; i < n; i++) {
+            double ds      = s_[i] - s_[i - 1];
+            double v_accel = std::sqrt(v_ref_[i - 1] * v_ref_[i - 1] + 2.0 * accel_mps2 * ds);
+            v_ref_[i] = std::min(v_ref_[i], v_accel);
+        }
+
+        for (auto& vv : v_ref_) vv = std::max(vv, v_min_mps);
+    }
+
+    // For diagnostics only — returns (max_abs_kappa, min_vref, max_vref) over all waypoints.
+    std::tuple<double,double,double> speedProfileStats() const
+    {
+        if (v_ref_.empty() || s_.empty()) return {0.0, 0.0, 0.0};
+        double kappa_max = 0.0;
+        for (const double s : s_)
+            kappa_max = std::max(kappa_max, std::abs(curvature(s)));
+        double v_min = *std::min_element(v_ref_.begin(), v_ref_.end());
+        double v_max = *std::max_element(v_ref_.begin(), v_ref_.end());
+        return {kappa_max, v_min, v_max};
     }
 
     const std::vector<std::pair<double,double>>& waypoints() const { return wpts_; }
@@ -310,6 +404,7 @@ public:
 private:
     std::vector<std::pair<double,double>> wpts_;
     std::vector<double>                   s_;
+    std::vector<double>                   v_ref_;
 
     std::pair<double,double> interp(double s) const
     {
@@ -373,6 +468,10 @@ public:
         declare_parameter<std::vector<double>>("sched_v_kmh", std::vector<double>{});
         declare_parameter<std::vector<double>>("sched_tau_r", std::vector<double>{});
         declare_parameter<std::vector<double>>("sched_kss",   std::vector<double>{});
+        declare_parameter("speed_profile_decel_mps2", 1.5);
+        declare_parameter("speed_profile_accel_mps2", 0.5);
+        declare_parameter("curvature_speed_margin",   0.85);
+        declare_parameter("v_ref_min_mps",            0.5);
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
         reference_point_ = loadReferencePoint();
@@ -421,6 +520,7 @@ public:
         pub_actual_delta_  = create_publisher<std_msgs::msg::Float64>("lateral_mpc/actual_delta_deg",  10);
         pub_torque_cmd_    = create_publisher<std_msgs::msg::Float64>("lateral_mpc/torque_cmd",        10);
         pub_progress_      = create_publisher<std_msgs::msg::Float64>("lateral_mpc/progress_m",        10);
+        pub_vref_          = create_publisher<std_msgs::msg::Float64>("lateral_mpc/vref_mps",          10);
         pub_lateral_error_ = create_publisher<std_msgs::msg::Float64>("lateral_error",                 10);
         pub_heading_error_ = create_publisher<std_msgs::msg::Float64>("heading_error",                 10);
         pub_pf_cmd_vel_    = create_publisher<geometry_msgs::msg::Twist>("path_follower/cmd_vel",       10);
@@ -639,7 +739,9 @@ private:
 
         // --- Speed P-controller ----------------------------------------------
         double desired_speed = (state_ == State::STOPPING) ? 0.0
-            : get_parameter("desired_speed_mps").as_double();
+            : (path_.hasSpeedProfile()
+                  ? path_.vref(s_ref)
+                  : get_parameter("desired_speed_mps").as_double());
         double kp_speed = get_parameter("kp_speed").as_double();
         double accel_cmd = std::clamp(kp_speed * (desired_speed - car_speed), -1.0, 1.0);
 
@@ -653,6 +755,7 @@ private:
         pub_actual_delta_ ->publish(f64(car_delta * 180.0 / M_PI));
         pub_torque_cmd_   ->publish(f64(torque_cmd));
         pub_progress_     ->publish(f64(s_rear));
+        pub_vref_         ->publish(f64(desired_speed));
 
         // Dashboard-compatible topics (mirror cascade node interface)
         pub_lateral_error_->publish(f64(cte));
@@ -720,7 +823,7 @@ private:
         const double rate_sinking = get_parameter("rate_sinking").as_double();
         const double tlim        = get_parameter("torque_limit").as_double();
 
-        const double v_eff = std::max(0.5, v);  // guard against division by zero at low speed
+        const double v_fallback = std::max(0.5, v);  // used when no speed profile is available
         const double v_kmh = v * 3.6;
 
         // ---- Actuator model coefficients ----------------------------------------
@@ -773,21 +876,37 @@ private:
         std::vector<double> G_psi  (n, 0.0);
         std::vector<double> G_cte  (n, 0.0);
 
+        // Running arc-length accumulator — advances by v_k*dt each step so the MPC
+        // looks ahead using the speed profile rather than a constant measured speed.
+        double s_k = s_ref;
+
         for (int k = 0; k < n; k++) {
-            // Path curvature feedforward at predicted vehicle position for step k
-            double s_k   = std::min(s_ref + k * dt * v_eff, path_.totalLength());
-            double kappa = path_.curvature(s_k);
+            // Per-step speed: from speed profile (curvature-aware) or constant fallback
+            const double v_k = path_.hasSpeedProfile()
+                ? std::max(get_parameter("v_ref_min_mps").as_double(), path_.vref(s_k))
+                : v_fallback;
+
+            // Curvature feedforward at the predicted position for this step
+            double kappa = path_.curvature(std::min(s_k, path_.totalLength()));
+
+            // Per-step actuator coefficients — recomputed at v_k for sched_fo2
+            double ad_k = ad, bd_k = bd;
+            if (use_sched_fo2_) {
+                const double tau_k     = schedInterp(sched_v_kmh_, sched_tau_r_, v_k * 3.6, 0.05);
+                const double kss_k     = schedInterp(sched_v_kmh_, sched_kss_,   v_k * 3.6, 1.0);
+                const double kss_k_rad = kss_k * (M_PI / 180.0) / STEERING_RATIO;
+                ad_k = std::exp(-dt / tau_k);
+                bd_k = kss_k_rad * (1.0 - ad_k);
+            }
 
             // ---- Actuator model: compute delta_{k+1} ----------------------------
             double c_delta_new;
             std::vector<double> G_delta_new(n, 0.0);
             if (use_sched_fo2_) {
-                // sched_fo2 model: delta[k+1] = ad*delta[k] + bd*u_ratelimit[k]
-                // where u_ratelimit[k] is the actual torque after rate limiting (not raw u[k])
-                // The rate limiting is enforced by OSQP constraints, so we model with the constrained torque.
-                c_delta_new = ad * c_delta + bd * c_torque;
+                // sched_fo2 model: delta[k+1] = ad_k*delta[k] + bd_k*u_ratelimit[k]
+                c_delta_new = ad_k * c_delta + bd_k * c_torque;
                 for (int j = 0; j < n; j++)
-                    G_delta_new[j] = ad * G_delta[j] + bd * G_torque[j];
+                    G_delta_new[j] = ad_k * G_delta[j] + bd_k * G_torque[j];
 
                 // u_k = u_plus_k − u_minus_k; sensitivity to original u_j = δ_{j,k}
                 double c_torque_new = u_prev_;
@@ -809,19 +928,17 @@ private:
                 G_rate = G_rate_new;
             }
 
-            // dPsi_{k+1} = dPsi_k - (v * delta_k / L - kappa_k * v) * dt
-            // Positive steer left increases car heading, decreasing dPsi = path_heading - car_heading
-            double c_psi_new = c_psi - (v_eff * c_delta / WHEELBASE - kappa * v_eff) * dt;
+            // dPsi_{k+1} = dPsi_k - (v_k * delta_k / L - kappa_k * v_k) * dt
+            double c_psi_new = c_psi - (v_k * c_delta / WHEELBASE - kappa * v_k) * dt;
             std::vector<double> G_psi_new(n, 0.0);
             for (int j = 0; j < n; j++)
-                G_psi_new[j] = G_psi[j] - v_eff * dt / WHEELBASE * G_delta[j];
+                G_psi_new[j] = G_psi[j] - v_k * dt / WHEELBASE * G_delta[j];
 
-            // CTE_{k+1} = CTE_k + v * dPsi_k * dt
-            // Note: uses dPsi_k (before update)
-            double c_cte_new = c_cte + v_eff * c_psi * dt;
+            // CTE_{k+1} = CTE_k + v_k * dPsi_k * dt
+            double c_cte_new = c_cte + v_k * c_psi * dt;
             std::vector<double> G_cte_new(n, 0.0);
             for (int j = 0; j < n; j++)
-                G_cte_new[j] = G_cte[j] + v_eff * dt * G_psi[j];
+                G_cte_new[j] = G_cte[j] + v_k * dt * G_psi[j];
 
             // Advance state
             c_delta = c_delta_new;  G_delta = G_delta_new;
@@ -851,10 +968,13 @@ private:
                 q_vec[2*j+1] += static_cast<OSQPFloat>(-dq);
             }
 
+            // Advance running arc-length for next step
+            s_k = std::min(s_k + dt * v_k, path_.totalLength());
+
             // Delta reference tracking cost: w_d * (delta_{k+1} - kappa_{k+1}*L)^2
             // Guides MPC to reach the curvature-required steer angle, preventing pre-steer.
             if (w_d > 0.0) {
-                double s_next = std::min(s_ref + (k + 1) * dt * v_eff, path_.totalLength());
+                double s_next = s_k;  // already advanced to step k+1 position
                 double delta_ref = path_.curvature(s_next) * WHEELBASE;
                 double d = c_delta - delta_ref;
                 for (int a = 0; a < n; a++) {
@@ -1156,12 +1276,32 @@ private:
             RCLCPP_INFO(get_logger(),
                 "Loaded %s: %d waypoints, %.1f m total (B-spline smoothed, knot spacing %.2f m).",
                 path_label, waypoint_count, path_.totalLength(), knot_m);
-            return;
+        } else {
+            RCLCPP_INFO(get_logger(),
+                "Loaded %s: %d waypoints, %.1f m total (path smoothing disabled).",
+                path_label, waypoint_count, path_.totalLength());
         }
+        maybeRebuildSpeedProfile();
+    }
 
+    void maybeRebuildSpeedProfile()
+    {
+        if (!use_sched_fo2_ || sched_v_kmh_.empty() || sched_kss_.empty()) return;
+        path_.buildSpeedProfile(
+            sched_v_kmh_,
+            sched_kss_,
+            get_parameter("torque_limit").as_double(),
+            get_parameter("desired_speed_mps").as_double(),
+            get_parameter("speed_profile_decel_mps2").as_double(),
+            get_parameter("speed_profile_accel_mps2").as_double(),
+            get_parameter("curvature_speed_margin").as_double(),
+            get_parameter("v_ref_min_mps").as_double());
+        auto [kappa_max, v_min, v_max] = path_.speedProfileStats();
         RCLCPP_INFO(get_logger(),
-            "Loaded %s: %d waypoints, %.1f m total (path smoothing disabled).",
-            path_label, waypoint_count, path_.totalLength());
+            "Speed profile built: %.2f–%.2f m/s (min–max) over %.1f m. "
+            "Max |kappa|=%.4f rad/m (R_min=%.1f m).",
+            v_min, v_max, path_.totalLength(),
+            kappa_max, kappa_max > 1e-6 ? 1.0 / kappa_max : 9999.0);
     }
 
     // =========================================================================
@@ -1277,6 +1417,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_actual_delta_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_torque_cmd_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_progress_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_vref_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_lateral_error_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_heading_error_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr    pub_pf_cmd_vel_;
