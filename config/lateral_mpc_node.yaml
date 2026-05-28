@@ -2,7 +2,7 @@ lateral_mpc_node:
   ros__parameters:
     # path_csv_file and desired_speed_mps are supplied at launch time
     auto_enable: false
-    horizon: 40
+    horizon: 80
     # Cost weights
     weight_cte:    20.0
     weight_psi:    3.0
@@ -10,9 +10,10 @@ lateral_mpc_node:
     weight_delta:  0.0   # bag3 showed this increased saturation without improving tracking
     reference_point: "rear_axle"
     path_spline_knot_m: 5.0   # B-spline knot spacing for path smoothing [m]; 0 = disabled
-    rate_down:    1.833  # fall: torque magnitude decrease [norm/s]
+    rate_rising:  1.033   # |u| increasing (0→±1) [norm/s]
+    rate_sinking: 1.833   # |u| decreasing (±1→0) [norm/s]
     torque_limit: 1.0
-    rate_up:      1.033  # rise: torque magnitude increase [norm/s]
+    weight_complementarity: 2.0  # L1 penalty discouraging u_plus and u_minus both nonzero
 
     # ── Actuator model ────────────────────────────────────────────────────────
     # use_sched_fo2: true  →  speed-scheduled SchedFO2 model (breakpoints below)

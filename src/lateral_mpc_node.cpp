@@ -359,8 +359,9 @@ public:
         declare_parameter("weight_torque",     0.1);
         declare_parameter("tau_r",             0.78);  // actuator time constant [s]
         declare_parameter("gain_r",            36.0);  // sw-deg/s per unit torque
-        declare_parameter("rate_up",           4.3/3.0);
-        declare_parameter("rate_down",         4.3/3.0);
+        declare_parameter("rate_rising",  1.033);   // |u| increasing (0→±1) [norm/s]
+        declare_parameter("rate_sinking", 1.833);   // |u| decreasing (±1→0) [norm/s]
+        declare_parameter("weight_complementarity", 1.0);  // L1 penalty on u_plus + u_minus
         declare_parameter("torque_limit",      1.0);
         declare_parameter("kp_speed",          0.3);
         declare_parameter<std::string>("path_csv_file", "");
@@ -547,6 +548,8 @@ private:
             hint_front_      = 0;
             hint_rear_       = 0;
             u_prev_          = 0.0;
+            u_prev_plus_     = 0.0;
+            u_prev_minus_    = 0.0;
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
             RCLCPP_INFO(get_logger(), "Path following STARTED.");
@@ -625,8 +628,11 @@ private:
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
         if (state_ == State::FOLLOWING) {
+            double out_plus = 0.0, out_minus = 0.0;
             torque_cmd = ramp * solveMpc(cte, dpsi, car_delta, car_delta_rate,
-                                         car_speed, s_ref);
+                                         car_speed, s_ref, out_plus, out_minus);
+            u_prev_plus_  = ramp * out_plus;
+            u_prev_minus_ = ramp * out_minus;
         }
         torque_cmd = std::clamp(torque_cmd, -1.0, 1.0);
         u_prev_    = torque_cmd;
@@ -671,10 +677,17 @@ private:
     // =========================================================================
     // Unified lateral MPC
     //
-    // Decision variables: U = [u_0, ..., u_{N-1}]  (steering torques)
+    // Decision variables: U = [u_plus_0, u_minus_0, ..., u_plus_{N-1}, u_minus_{N-1}]
+    //   u_k = u_plus_k − u_minus_k  (both ≥ 0, at most one nonzero at a time)
     //
     // Cost:  Σ_{k=0}^{N-1} [ w_cte * CTE_{k+1}²  +  w_psi * dPsi_{k+1}²
-    //                       + w_torque * u_k² ]
+    //                       + w_torque * (u_plus_k − u_minus_k)²
+    //                       + w_comp  * (u_plus_k + u_minus_k) ]
+    //   w_comp is the L1 complementarity penalty — discourages both being nonzero.
+    //
+    // Rate constraints (asymmetric, on each component separately):
+    //   |u| increasing (0→±1): rate_rising  [norm/s]
+    //   |u| decreasing (±1→0): rate_sinking [norm/s]
     //
     // Dynamics (linearised, front-axle rad units):
     //   dRate_{k+1} = a_rate * dRate_k + b_rate * u_k
@@ -682,23 +695,30 @@ private:
     //   dPsi_{k+1}  = dPsi_k  − (v * delta_k / L - kappa_k * v) * dt
     //   CTE_{k+1}   = CTE_k   + v * dPsi_k * dt
     //
-    // Propagation: each state = constant + G·U  (linear in U)
+    // Propagation: each state = constant + G·U_orig  (linear in original u_k)
+    //   G vectors remain n-dimensional; expanded on-the-fly for the 2n QP variables.
     // =========================================================================
 
     double solveMpc(double cte0, double dpsi0, double delta0, double drate0,
-                    double v,    double s_ref)
+                    double v,    double s_ref,
+                    double& out_u_plus, double& out_u_minus)
     {
-        const int n = N_;
-        if (n < 1) return u_prev_;
+        const int n  = N_;
+        const int nv = 2 * n;  // decision variables: u_plus and u_minus for each step
+        if (n < 1) {
+            out_u_plus = u_prev_plus_; out_u_minus = u_prev_minus_;
+            return u_prev_;
+        }
 
-        const double dt        = DT;
-        const double w_cte     = get_parameter("weight_cte").as_double();
-        const double w_psi     = get_parameter("weight_psi").as_double();
-        const double w_t       = get_parameter("weight_torque").as_double();
-        const double w_d       = get_parameter("weight_delta").as_double();
-        const double rate_up   = get_parameter("rate_up").as_double();
-        const double rate_down = get_parameter("rate_down").as_double();
-        const double tlim      = get_parameter("torque_limit").as_double();
+        const double dt          = DT;
+        const double w_cte       = get_parameter("weight_cte").as_double();
+        const double w_psi       = get_parameter("weight_psi").as_double();
+        const double w_t         = get_parameter("weight_torque").as_double();
+        const double w_d         = get_parameter("weight_delta").as_double();
+        const double w_comp      = get_parameter("weight_complementarity").as_double();
+        const double rate_rising  = get_parameter("rate_rising").as_double();
+        const double rate_sinking = get_parameter("rate_sinking").as_double();
+        const double tlim        = get_parameter("torque_limit").as_double();
 
         const double v_eff = std::max(0.5, v);  // guard against division by zero at low speed
         const double v_kmh = v * 3.6;
@@ -727,15 +747,16 @@ private:
         }
 
         // ---- Build QP cost matrices (upper-triangular P, gradient q) --------
-        const int P_nz = n * (n + 1) / 2;
+        // nv = 2*n variables: [u_plus_0, u_minus_0, ..., u_plus_{n-1}, u_minus_{n-1}]
+        const int P_nz = nv * (nv + 1) / 2;
         std::vector<OSQPFloat> P_x(P_nz, 0.0);
         std::vector<OSQPInt>   P_i(P_nz, 0);
-        std::vector<OSQPInt>   P_p(n + 1, 0);
-        for (int j = 0; j < n; j++) P_p[j + 1] = P_p[j] + (j + 1);
-        std::vector<OSQPFloat> q_vec(n, 0.0);
+        std::vector<OSQPInt>   P_p(nv + 1, 0);
+        for (int j = 0; j < nv; j++) P_p[j + 1] = P_p[j] + (j + 1);
+        std::vector<OSQPFloat> q_vec(nv, 0.0);
 
         // P_i: row indices for upper-triangular column-major storage
-        for (int j = 0; j < n; j++)
+        for (int j = 0; j < nv; j++)
             for (int i = 0; i <= j; i++)
                 P_i[P_p[j] + i] = i;
 
@@ -746,8 +767,8 @@ private:
         double c_psi   = dpsi0;
         double c_cte   = cte0;
 
-        std::vector<double> G_rate (n, 0.0);  // only used by legacy 2-state model
-        std::vector<double> G_torque(n, 0.0); // actual rate-limited torque (for sched_fo2)
+        std::vector<double> G_rate  (n, 0.0);  // only used by legacy 2-state model
+        std::vector<double> G_torque(n, 0.0);  // sched_fo2: sensitivity of u_k to each u_j (original)
         std::vector<double> G_delta(n, 0.0);
         std::vector<double> G_psi  (n, 0.0);
         std::vector<double> G_cte  (n, 0.0);
@@ -767,13 +788,11 @@ private:
                 c_delta_new = ad * c_delta + bd * c_torque;
                 for (int j = 0; j < n; j++)
                     G_delta_new[j] = ad * G_delta[j] + bd * G_torque[j];
-                
-                // Update torque state to current decision variable u[k]
-                // (OSQP rate constraints ensure this respects rate limits)
-                double c_torque_new = u_prev_;  // Overwritten in next step
+
+                // u_k = u_plus_k − u_minus_k; sensitivity to original u_j = δ_{j,k}
+                double c_torque_new = u_prev_;
                 std::vector<double> G_torque_new(n, 0.0);
-                for (int j = 0; j < n; j++)
-                    G_torque_new[j] = (j == k ? 1.0 : 0.0);
+                G_torque_new[k] = 1.0;
                 c_torque = c_torque_new;
                 G_torque = G_torque_new;
             } else {
@@ -809,20 +828,27 @@ private:
             c_psi   = c_psi_new;    G_psi   = G_psi_new;
             c_cte   = c_cte_new;    G_cte   = G_cte_new;
 
-            // Accumulate cost from CTE_{k+1} and dPsi_{k+1}
-            // ∂²J/∂U_i ∂U_j += 2*w_cte*G_cte[i]*G_cte[j] + 2*w_psi*G_psi[i]*G_psi[j]
-            for (int i = 0; i < n; i++) {
-                for (int j = i; j < n; j++) {
-                    P_x[P_p[j] + i] += static_cast<OSQPFloat>(
-                        2.0 * w_cte * G_cte[i] * G_cte[j] +
-                        2.0 * w_psi * G_psi[i] * G_psi[j]);
+            // Accumulate tracking cost from CTE_{k+1} and dPsi_{k+1}.
+            // G vectors are n-dimensional (sensitivity to original signed u_j).
+            // Expand to 2n QP variables on-the-fly:  G_full[2j]=G[j], G_full[2j+1]=-G[j]
+            // Upper-triangular pairs (a,b) in original space → 4 pairs in 2n space:
+            //   (+a,+b): val,  (+a,-b): -val,  (-a,+b): -val (b>a only),  (-a,-b): val
+            for (int a = 0; a < n; a++) {
+                for (int b = a; b < n; b++) {
+                    double val = static_cast<OSQPFloat>(
+                        2.0 * w_cte * G_cte[a] * G_cte[b] +
+                        2.0 * w_psi * G_psi[a] * G_psi[b]);
+                    P_x[P_p[2*b]   + 2*a  ] += val;   // (+a, +b)
+                    P_x[P_p[2*b+1] + 2*a  ] -= val;   // (+a, -b)
+                    if (b > a) P_x[P_p[2*b] + 2*a+1] -= val;  // (-a, +b)
+                    P_x[P_p[2*b+1] + 2*a+1] += val;   // (-a, -b)
                 }
             }
-            // ∂J/∂U_j += 2*w_cte*c_cte*G_cte[j] + 2*w_psi*c_psi*G_psi[j]
             for (int j = 0; j < n; j++) {
-                q_vec[j] += static_cast<OSQPFloat>(
-                    2.0 * w_cte * c_cte * G_cte[j] +
-                    2.0 * w_psi * c_psi * G_psi[j]);
+                double dq = 2.0 * w_cte * c_cte * G_cte[j]
+                          + 2.0 * w_psi * c_psi * G_psi[j];
+                q_vec[2*j]   += static_cast<OSQPFloat>( dq);
+                q_vec[2*j+1] += static_cast<OSQPFloat>(-dq);
             }
 
             // Delta reference tracking cost: w_d * (delta_{k+1} - kappa_{k+1}*L)^2
@@ -831,66 +857,102 @@ private:
                 double s_next = std::min(s_ref + (k + 1) * dt * v_eff, path_.totalLength());
                 double delta_ref = path_.curvature(s_next) * WHEELBASE;
                 double d = c_delta - delta_ref;
-                for (int i = 0; i < n; i++)
-                    for (int j = i; j < n; j++)
-                        P_x[P_p[j] + i] += static_cast<OSQPFloat>(2.0 * w_d * G_delta[i] * G_delta[j]);
-                for (int j = 0; j < n; j++)
-                    q_vec[j] += static_cast<OSQPFloat>(2.0 * w_d * d * G_delta[j]);
+                for (int a = 0; a < n; a++) {
+                    for (int b = a; b < n; b++) {
+                        double dval = static_cast<OSQPFloat>(2.0 * w_d * G_delta[a] * G_delta[b]);
+                        P_x[P_p[2*b]   + 2*a  ] += dval;
+                        P_x[P_p[2*b+1] + 2*a  ] -= dval;
+                        if (b > a) P_x[P_p[2*b] + 2*a+1] -= dval;
+                        P_x[P_p[2*b+1] + 2*a+1] += dval;
+                    }
+                }
+                for (int j = 0; j < n; j++) {
+                    double dq = 2.0 * w_d * d * G_delta[j];
+                    q_vec[2*j]   += static_cast<OSQPFloat>( dq);
+                    q_vec[2*j+1] += static_cast<OSQPFloat>(-dq);
+                }
             }
 
-            // Torque regularisation for u_k: ∂²J/∂U_k² += 2*w_t
-            P_x[P_p[k] + k] += static_cast<OSQPFloat>(2.0 * w_t);
+            // Torque regularisation: w_t*(u_plus_k - u_minus_k)^2
+            // → diagonal 2*w_t at (2k,2k) and (2k+1,2k+1), cross -2*w_t at (2k,2k+1)
+            P_x[P_p[2*k]   + 2*k  ] += static_cast<OSQPFloat>(2.0 * w_t);
+            P_x[P_p[2*k+1] + 2*k+1] += static_cast<OSQPFloat>(2.0 * w_t);
+            P_x[P_p[2*k+1] + 2*k  ] -= static_cast<OSQPFloat>(2.0 * w_t);  // upper-tri cross term
+
+            // Complementarity L1 penalty: w_comp*(u_plus_k + u_minus_k)
+            q_vec[2*k]   += static_cast<OSQPFloat>(w_comp);
+            q_vec[2*k+1] += static_cast<OSQPFloat>(w_comp);
         }
 
-        // ---- Build constraint matrix A (signed torque slew + magnitude) ------
-        // The a_k magnitude relaxation allowed sign flips at full magnitude in bag5,
-        // which does not match the actuator. Keep the stable signed slew model.
-        //   Rows 4k+0: U_{k-1} - U_k ≤ rate_up*dt   (u_prev for k=0)
-        //   Rows 4k+1: U_k - U_{k-1} ≤ rate_down*dt
-        //   Rows 4k+2: U_k ≤ tlim
-        //   Rows 4k+3: -U_k ≤ tlim
-        const int m = 4 * n;
+        // ---- Build constraint matrix A (asymmetric absolute-value slew + bounds) ----
+        // 6 constraints per step k, rows 6k+r:
+        //   r=0: u_plus_k  − u_plus_{k-1}  ≤ rate_rising*dt   (|u| increasing)
+        //   r=1: u_plus_{k-1}  − u_plus_k  ≤ rate_sinking*dt  (|u| decreasing)
+        //   r=2: u_minus_k − u_minus_{k-1} ≤ rate_rising*dt
+        //   r=3: u_minus_{k-1} − u_minus_k ≤ rate_sinking*dt
+        //   r=4: 0 ≤ u_plus_k  ≤ tlim
+        //   r=5: 0 ≤ u_minus_k ≤ tlim
+        const int m = 6 * n;
         std::vector<OSQPFloat> A_x;
         std::vector<OSQPInt>   A_i;
-        std::vector<OSQPInt>   A_p(n + 1, 0);
+        std::vector<OSQPInt>   A_p(nv + 1, 0);
         std::vector<OSQPFloat> l_c(m, static_cast<OSQPFloat>(-OSQP_INFTY));
-        std::vector<OSQPFloat> u_c(m,  static_cast<OSQPFloat>( OSQP_INFTY));
+        std::vector<OSQPFloat> u_c(m, static_cast<OSQPFloat>( OSQP_INFTY));
 
-        u_c[0] = static_cast<OSQPFloat>( u_prev_ + rate_up   * dt);
-        u_c[1] = static_cast<OSQPFloat>(-u_prev_ + rate_down * dt);
-        u_c[2] = static_cast<OSQPFloat>(tlim);
-        u_c[3] = static_cast<OSQPFloat>(tlim);
+        // k=0: rate constraints against u_prev_plus_/minus_
+        u_c[0] = static_cast<OSQPFloat>( u_prev_plus_  + rate_rising  * dt);
+        u_c[1] = static_cast<OSQPFloat>(-u_prev_plus_  + rate_sinking * dt);
+        u_c[2] = static_cast<OSQPFloat>( u_prev_minus_ + rate_rising  * dt);
+        u_c[3] = static_cast<OSQPFloat>(-u_prev_minus_ + rate_sinking * dt);
+        l_c[4] = 0.0f;  u_c[4] = static_cast<OSQPFloat>(tlim);
+        l_c[5] = 0.0f;  u_c[5] = static_cast<OSQPFloat>(tlim);
         for (int k = 1; k < n; k++) {
-            u_c[4*k]   = static_cast<OSQPFloat>(rate_up   * dt);
-            u_c[4*k+1] = static_cast<OSQPFloat>(rate_down * dt);
-            u_c[4*k+2] = static_cast<OSQPFloat>(tlim);
-            u_c[4*k+3] = static_cast<OSQPFloat>(tlim);
+            u_c[6*k+0] = static_cast<OSQPFloat>(rate_rising  * dt);
+            u_c[6*k+1] = static_cast<OSQPFloat>(rate_sinking * dt);
+            u_c[6*k+2] = static_cast<OSQPFloat>(rate_rising  * dt);
+            u_c[6*k+3] = static_cast<OSQPFloat>(rate_sinking * dt);
+            l_c[6*k+4] = 0.0f;  u_c[6*k+4] = static_cast<OSQPFloat>(tlim);
+            l_c[6*k+5] = 0.0f;  u_c[6*k+5] = static_cast<OSQPFloat>(tlim);
         }
 
+        // CSC column-by-column: column 2k = u_plus_k, column 2k+1 = u_minus_k
+        // Row indices within each column must be in ascending order.
         int nz = 0;
-        for (int j = 0; j < n; j++) {
-            A_p[j] = nz;
-            A_x.push_back( 1.0f); A_i.push_back(4*j);
-            A_x.push_back(-1.0f); A_i.push_back(4*j+1);
-            A_x.push_back( 1.0f); A_i.push_back(4*j+2);
-            A_x.push_back(-1.0f); A_i.push_back(4*j+3);
-            nz += 4;
-            if (j + 1 < n) {
-                A_x.push_back(-1.0f); A_i.push_back(4*(j+1));
-                A_x.push_back( 1.0f); A_i.push_back(4*(j+1)+1);
+        for (int k = 0; k < n; k++) {
+            // Column 2k (u_plus_k): rows 6k, 6k+1, 6k+4; if k+1<n: 6(k+1), 6(k+1)+1
+            A_p[2*k] = nz;
+            A_x.push_back( 1.0f); A_i.push_back(6*k+0);  // rising: +u_plus_k
+            A_x.push_back(-1.0f); A_i.push_back(6*k+1);  // sinking: -u_plus_k
+            A_x.push_back( 1.0f); A_i.push_back(6*k+4);  // bound: +u_plus_k
+            nz += 3;
+            if (k + 1 < n) {
+                A_x.push_back(-1.0f); A_i.push_back(6*(k+1)+0);  // next rising prev: -u_plus_k
+                A_x.push_back( 1.0f); A_i.push_back(6*(k+1)+1);  // next sinking prev: +u_plus_k
+                nz += 2;
+            }
+
+            // Column 2k+1 (u_minus_k): rows 6k+2, 6k+3, 6k+5; if k+1<n: 6(k+1)+2, 6(k+1)+3
+            A_p[2*k+1] = nz;
+            A_x.push_back( 1.0f); A_i.push_back(6*k+2);  // rising: +u_minus_k
+            A_x.push_back(-1.0f); A_i.push_back(6*k+3);  // sinking: -u_minus_k
+            A_x.push_back( 1.0f); A_i.push_back(6*k+5);  // bound: +u_minus_k
+            nz += 3;
+            if (k + 1 < n) {
+                A_x.push_back(-1.0f); A_i.push_back(6*(k+1)+2);
+                A_x.push_back( 1.0f); A_i.push_back(6*(k+1)+3);
                 nz += 2;
             }
         }
-        A_p[n] = nz;
+        A_p[nv] = nz;
 
         // ---- OSQP setup & solve ---------------------------------------------
         OSQPCscMatrix P_csc;
-        P_csc.m = n; P_csc.n = n; P_csc.nzmax = P_nz; P_csc.nz = -1;
+        P_csc.m = nv; P_csc.n = nv; P_csc.nzmax = P_nz; P_csc.nz = -1;
         P_csc.x = P_x.data(); P_csc.i = P_i.data(); P_csc.p = P_p.data();
         P_csc.owned = 0;
 
         OSQPCscMatrix A_csc;
-        A_csc.m = m; A_csc.n = n;
+        A_csc.m = m; A_csc.n = nv;
         A_csc.nzmax = static_cast<OSQPInt>(A_x.size()); A_csc.nz = -1;
         A_csc.x = A_x.data(); A_csc.i = A_i.data(); A_csc.p = A_p.data();
         A_csc.owned = 0;
@@ -904,10 +966,11 @@ private:
             osqp_solver_ = nullptr;
         }
         OSQPInt err = osqp_setup(&osqp_solver_, &P_csc, q_vec.data(),
-                                 &A_csc, l_c.data(), u_c.data(), m, n, &settings);
+                                 &A_csc, l_c.data(), u_c.data(), m, nv, &settings);
         if (err != 0) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                 "OSQP setup failed (err=%d); holding previous torque.", static_cast<int>(err));
+            out_u_plus = u_prev_plus_; out_u_minus = u_prev_minus_;
             return u_prev_;
         }
 
@@ -926,11 +989,15 @@ private:
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                 "OSQP solve failed (status=%d); holding previous torque.",
                 static_cast<int>(status_val));
+            out_u_plus = u_prev_plus_; out_u_minus = u_prev_minus_;
             return u_prev_;
         }
 
-        double u0 = osqp_solver_->solution->x[0];
-        return std::clamp(u0, -tlim, tlim);
+        double u_plus0  = std::max(0.0, static_cast<double>(osqp_solver_->solution->x[0]));
+        double u_minus0 = std::max(0.0, static_cast<double>(osqp_solver_->solution->x[1]));
+        out_u_plus  = u_plus0;
+        out_u_minus = u_minus0;
+        return std::clamp(u_plus0 - u_minus0, -tlim, tlim);
     }
 
     // =========================================================================
@@ -992,9 +1059,11 @@ private:
             {
                 std::lock_guard<std::mutex> lock(data_mutex_);
                 path_.clear();
-                hint_front_ = 0;
-                hint_rear_  = 0;
-                u_prev_     = 0.0;
+                hint_front_   = 0;
+                hint_rear_    = 0;
+                u_prev_       = 0.0;
+                u_prev_plus_  = 0.0;
+                u_prev_minus_ = 0.0;
             }
             publishPathVisualization();
             RCLCPP_INFO(get_logger(), "Path unloaded.");
@@ -1010,9 +1079,11 @@ private:
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             loadPathFromCSV(path);
-            hint_front_ = 0;
-            hint_rear_  = 0;
-            u_prev_     = 0.0;
+            hint_front_   = 0;
+            hint_rear_    = 0;
+            u_prev_       = 0.0;
+            u_prev_plus_  = 0.0;
+            u_prev_minus_ = 0.0;
         }
         publishPathVisualization();
         if (was_following) {
@@ -1171,8 +1242,10 @@ private:
     bool   auto_enable_fired_  = false;
 
     // MPC state
-    double u_prev_ = 0.0;
-    int    N_      = 40;
+    double u_prev_       = 0.0;  // effective torque sent last step (ramped)
+    double u_prev_plus_  = 0.0;  // positive component of u_prev_
+    double u_prev_minus_ = 0.0;  // negative magnitude component of u_prev_
+    int    N_            = 40;
 
     // sched_fo2 actuator model (loaded from sched_fo2_model_path if provided)
     bool use_sched_fo2_ = false;
