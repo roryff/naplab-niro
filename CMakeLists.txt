@@ -14,6 +14,9 @@ find_package(sensor_msgs REQUIRED)
 find_package(foxglove_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -63,12 +66,15 @@ include_directories(include)
 
 # Add executables
 add_executable(gnss_node src/gnss_node.cpp)
-ament_target_dependencies(gnss_node 
+ament_target_dependencies(gnss_node
   rclcpp
   std_msgs
-  sensor_msgs 
+  sensor_msgs
   geometry_msgs
   nav_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 add_executable(comma_node src/comma_node.cpp)

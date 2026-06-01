@@ -3,7 +3,10 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include "car_control/msg/vehicle_state.hpp"
 #include "car_control/msg/esf_status.hpp"
 #include "car_control/msg/esf_sensor.hpp"
@@ -55,7 +58,9 @@ class GNSSNode : public rclcpp::Node
 public:
     GNSSNode() : Node("gnss_node"), running_(true), socket_fd_(-1), origin_set_(false),
                  fusion_mode_(0xFF), alignment_status_(0), calibration_complete_(false),
-                 fusion_disabled_warned_(false)
+                 fusion_disabled_warned_(false),
+                 tf_broadcaster_(std::make_shared<tf2_ros::TransformBroadcaster>(this)),
+                 static_tf_broadcaster_(std::make_shared<tf2_ros::StaticTransformBroadcaster>(this))
     {
         // Declare parameters
         this->declare_parameter("host", "tppg2.lan");
@@ -91,9 +96,10 @@ public:
             origin_lon_ = this->get_parameter("origin_lon").as_double();
             origin_alt_ = this->get_parameter("origin_alt").as_double();
             origin_set_ = true;
-            RCLCPP_INFO(this->get_logger(), 
-                "Manual origin set: lat=%.7f, lon=%.7f, alt=%.2f",
-                origin_lat_, origin_lon_, origin_alt_);
+            geo::latlon_to_utm32(origin_lat_, origin_lon_, origin_east_, origin_north_);
+            RCLCPP_INFO(this->get_logger(),
+                "Manual origin set: lat=%.7f, lon=%.7f, alt=%.2f -> UTM32 E=%.2f N=%.2f",
+                origin_lat_, origin_lon_, origin_alt_, origin_east_, origin_north_);
         }
         
         // Subscribe to vehicle wheel speed data to feed odometer input to u-blox.
@@ -114,7 +120,23 @@ public:
         stale_check_timer_ = this->create_wall_timer(
             std::chrono::seconds(2),
             std::bind(&GNSSNode::stale_check_callback, this));
-        
+
+        // Publish static identity transform: map → utm32
+        // Both frames use the same absolute UTM32 coordinate system; path nodes use "map"
+        // while gnss/pose uses "utm32". This connects them in the TF tree.
+        geometry_msgs::msg::TransformStamped map_to_utm32;
+        map_to_utm32.header.stamp = this->now();
+        map_to_utm32.header.frame_id = "map";
+        map_to_utm32.child_frame_id = "utm32";
+        map_to_utm32.transform.translation.x = 0.0;
+        map_to_utm32.transform.translation.y = 0.0;
+        map_to_utm32.transform.translation.z = 0.0;
+        map_to_utm32.transform.rotation.x = 0.0;
+        map_to_utm32.transform.rotation.y = 0.0;
+        map_to_utm32.transform.rotation.z = 0.0;
+        map_to_utm32.transform.rotation.w = 1.0;
+        static_tf_broadcaster_->sendTransform(map_to_utm32);
+
         RCLCPP_INFO(this->get_logger(), "GNSS Node initialized - ADR mode only");
     }
     
@@ -438,8 +460,12 @@ private:
         if (!origin_set_) {
             origin_alt_ = navsat_msg.altitude;
             origin_set_ = true;
-            RCLCPP_INFO(this->get_logger(), "Altitude origin set to first fix: alt=%.2f m",
-                origin_alt_);
+            double e0, n0;
+            geo::latlon_to_utm32(navsat_msg.latitude, navsat_msg.longitude, e0, n0);
+            origin_east_  = e0;
+            origin_north_ = n0;
+            RCLCPP_INFO(this->get_logger(),
+                "Auto origin set: alt=%.2f m  UTM32 E=%.2f N=%.2f", origin_alt_, e0, n0);
         }
 
         double east, north;
@@ -471,6 +497,18 @@ private:
         pose_msg.pose.orientation.z = std::sin(enu_yaw / 2.0);
 
         pose_publisher_->publish(pose_msg);
+
+        // Broadcast utm32 → base_link so Foxglove 3D can render path and vehicle together
+        geometry_msgs::msg::TransformStamped tf_msg;
+        tf_msg.header.stamp = pose_msg.header.stamp;
+        tf_msg.header.frame_id = "utm32";
+        tf_msg.child_frame_id = "base_link";
+        tf_msg.transform.translation.x = pose_msg.pose.position.x - origin_east_;
+        tf_msg.transform.translation.y = pose_msg.pose.position.y - origin_north_;
+        tf_msg.transform.translation.z = pose_msg.pose.position.z;
+        tf_msg.transform.rotation = pose_msg.pose.orientation;
+        tf_broadcaster_->sendTransform(tf_msg);
+
         auto velocity_msg = geometry_msgs::msg::TwistStamped();
         velocity_msg.header = navsat_msg.header;
         velocity_msg.twist.linear.x = pvt.velN * 1e-3; // mm/s to m/s (North)
@@ -933,6 +971,10 @@ private:
     rclcpp::Publisher<car_control::msg::EsfStatus>::SharedPtr esf_status_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr gyro_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr accel_pub_;
+
+    // TF broadcasters
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     
     // Reader / sender threads
     std::thread reader_thread_;
@@ -949,6 +991,8 @@ private:
     double origin_lat_;
     double origin_lon_;
     double origin_alt_;
+    double origin_east_   = 0.0;   // UTM32 easting of map frame origin [m]
+    double origin_north_  = 0.0;   // UTM32 northing of map frame origin [m]
     
     // Vehicle state subscriber (feeds odometer data to u-blox)
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr vehicle_state_sub_;

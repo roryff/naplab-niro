@@ -2,10 +2,15 @@ lateral_mpc_node:
   ros__parameters:
     # path_csv_file and desired_speed_mps are supplied at launch time
     auto_enable: false
+    # Map frame origin — must match gnss_node.yaml origin_lat/lon.
+    # All published coordinates are shifted by -UTM32(origin) to keep values
+    # near zero for WebGL float32 precision in Foxglove 3D.
+    origin_lat: 63.4391
+    origin_lon: 10.4128
     horizon: 64   # max enforced by code; 3.2s / ~8.6m lookahead at 2.7 m/s
     # Cost weights
-    weight_cte:    50.0   # was 20 — more aggressive CTE pull
-    weight_psi:    15.0   # was 3  — stronger heading damping, kills 6s oscillation
+    weight_cte:    100.0   # was 20 — more aggressive CTE pull
+    weight_psi:    30.0   # was 3  — stronger heading damping, kills 6s oscillation
     weight_torque: 0.005  # was 0.01 — less torque penalty so controller acts faster
     weight_delta:  0.0   # bag3 showed this increased saturation without improving tracking
     reference_point: "rear_axle"
@@ -33,7 +38,23 @@ lateral_mpc_node:
     # the K_ss table: finds the max speed where the steering model can achieve
     # the required angle for each path curvature.  Backward/forward smoothing
     # passes then enforce braking and acceleration limits.
-    speed_profile_decel_mps2:  1.5    # max deceleration for backward pass [m/s²]
+    speed_profile_decel_mps2:  0.5   # max deceleration for backward pass [m/s²]
     speed_profile_accel_mps2:  0.5    # max acceleration for forward pass  [m/s²]
     curvature_speed_margin:    0.75  # use 85% of peak K_ss (safety margin)
     v_ref_min_mps:             0.5    # speed floor in profile [m/s]
+
+    # ── Runtime speed adjustments ─────────────────────────────────────────────
+    # speed_lookahead_s: preview window for speed reference. The controller reads
+    #   the minimum vref over [s_ref, s_ref + v*t], shifting the braking signal
+    #   earlier so the P-controller has time to decelerate before corners.
+    speed_lookahead_s:       1.5    # lookahead time [s]; scales to ~9 m at 6 m/s
+
+    # CTE penalty: v_desired *= max(0, 1 - k * max(0, |cte| - deadband))
+    # Reduces speed when off-path so lateral controller can recover without
+    # losing corner feasibility. Set k=0 to disable.
+    cte_speed_k:             0.0    # penalty gain [1/m]; 0 = disabled
+    cte_deadband_m:          0.3    # CTE deadband [m] — no penalty below this
+
+    # Heading error penalty: same structure as CTE penalty.
+    heading_speed_k:         0.0    # penalty gain [1/deg]; 0 = disabled
+    heading_deadband_deg:    5.0    # heading error deadband [deg]

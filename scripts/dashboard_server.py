@@ -49,6 +49,48 @@ except ImportError:
 
 _HTML_PATH = pathlib.Path(__file__).parent / "dashboard.html"
 
+
+# ---------------------------------------------------------------------------
+# UTM zone 32N (EPSG:25832) conversion — mirrors geo_utils.hpp exactly
+# ---------------------------------------------------------------------------
+def _latlon_to_utm32(lat_deg: float, lon_deg: float):
+    """Return (easting, northing) in metres for UTM zone 32N / EPSG:25832."""
+    a   = 6378137.0
+    f   = 1.0 / 298.257222101
+    e2  = 2.0 * f - f * f
+    ep2 = e2 / (1.0 - e2)
+    k0  = 0.9996
+    lon0 = 9.0 * math.pi / 180.0
+    E0  = 500000.0
+
+    phi  = math.radians(lat_deg)
+    lam  = math.radians(lon_deg)
+    dlam = lam - lon0
+
+    sin_phi = math.sin(phi)
+    cos_phi = math.cos(phi)
+    tan_phi = math.tan(phi)
+
+    N = a / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
+    T = tan_phi * tan_phi
+    C = ep2 * cos_phi * cos_phi
+    A = cos_phi * dlam
+
+    e4 = e2 * e2;  e6 = e4 * e2
+    M = a * (
+        (1.0 - e2/4.0 - 3.0*e4/64.0  - 5.0*e6/256.0)  * phi
+      - (3.0*e2/8.0  + 3.0*e4/32.0  + 45.0*e6/1024.0) * math.sin(2.0*phi)
+      + (15.0*e4/256.0 + 45.0*e6/1024.0)               * math.sin(4.0*phi)
+      - (35.0*e6/3072.0)                                * math.sin(6.0*phi))
+
+    A2=A*A; A3=A2*A; A4=A2*A2; A5=A4*A; A6=A4*A2
+    easting = k0*N*(A + (1.0-T+C)*A3/6.0
+              + (5.0-18.0*T+T*T+72.0*C-58.0*ep2)*A5/120.0) + E0
+    northing = k0*(M + N*tan_phi*(A2/2.0
+               + (5.0-T+9.0*C+4.0*C*C)*A4/24.0
+               + (61.0-58.0*T+T*T+600.0*C-330.0*ep2)*A6/720.0))
+    return easting, northing
+
 # ---------------------------------------------------------------------------
 # WMTS tile proxy  (Norge i bilder satellite imagery)
 # ---------------------------------------------------------------------------
@@ -364,6 +406,18 @@ class DashboardNode(Node):
     def __init__(self):
         super().__init__("dashboard_node")
 
+        # Map frame origin — must match gnss_node.yaml / lateral_mpc_node.yaml.
+        # path_visualization waypoints are published in local (origin-subtracted) coords;
+        # gnss/odometry is in absolute UTM32.  We add the origin back when storing
+        # path waypoints so the dashboard overlay is consistent.
+        self.declare_parameter("origin_lat", 63.4391)
+        self.declare_parameter("origin_lon", 10.4128)
+        lat = self.get_parameter("origin_lat").value
+        lon = self.get_parameter("origin_lon").value
+        self._map_origin_x, self._map_origin_y = _latlon_to_utm32(lat, lon)
+        self.get_logger().info(
+            f"Map origin: lat={lat} lon={lon} -> UTM32 E={self._map_origin_x:.2f} N={self._map_origin_y:.2f}")
+
         latched_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -533,12 +587,13 @@ class DashboardNode(Node):
         poses  = msg.poses
         n      = len(poses)
         stride = max(1, n // 500)
-        wpts = [{"x": round(p.pose.position.x, 2), "y": round(p.pose.position.y, 2)}
+        ox, oy = self._map_origin_x, self._map_origin_y
+        wpts = [{"x": round(p.pose.position.x + ox, 2), "y": round(p.pose.position.y + oy, 2)}
                 for p in poses[::stride]]
         if n > 0 and (n - 1) % stride != 0:
             last = poses[-1]
-            wpts.append({"x": round(last.pose.position.x, 2),
-                         "y": round(last.pose.position.y, 2)})
+            wpts.append({"x": round(last.pose.position.x + ox, 2),
+                         "y": round(last.pose.position.y + oy, 2)})
 
         length_m = sum(
             math.hypot(wpts[i]["x"] - wpts[i-1]["x"], wpts[i]["y"] - wpts[i-1]["y"])

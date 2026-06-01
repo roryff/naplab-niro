@@ -44,6 +44,8 @@
 
 #include <Eigen/Dense>
 
+#include "car_control/geo_utils.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -461,6 +463,8 @@ public:
         declare_parameter("kp_speed",          0.3);
         declare_parameter<std::string>("path_csv_file", "");
         declare_parameter<bool>("auto_enable", false);
+        declare_parameter("origin_lat", 0.0);
+        declare_parameter("origin_lon", 0.0);
         declare_parameter("weight_delta", 0.0);  // delta reference tracking weight; 0=disabled
         declare_parameter<std::string>("reference_point", "rear_axle");
         declare_parameter("path_spline_knot_m", 5.0);
@@ -472,6 +476,11 @@ public:
         declare_parameter("speed_profile_accel_mps2", 0.5);
         declare_parameter("curvature_speed_margin",   0.85);
         declare_parameter("v_ref_min_mps",            0.5);
+        declare_parameter("speed_lookahead_s",        1.5);
+        declare_parameter("cte_speed_k",              0.0);
+        declare_parameter("cte_deadband_m",           0.3);
+        declare_parameter("heading_speed_k",          0.0);
+        declare_parameter("heading_deadband_deg",     5.0);
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
         reference_point_ = loadReferencePoint();
@@ -529,6 +538,18 @@ public:
         load_path_sub_ = create_subscription<std_msgs::msg::String>(
             "/lateral_mpc/load_path", rclcpp::QoS(1),
             std::bind(&LateralMpcNode::loadPathCallback, this, std::placeholders::_1));
+
+        // ---- Map frame origin (must match gnss_node origin_lat/lon) ---------------
+        {
+            double lat = get_parameter("origin_lat").as_double();
+            double lon = get_parameter("origin_lon").as_double();
+            if (lat != 0.0 || lon != 0.0) {
+                geo::latlon_to_utm32(lat, lon, map_origin_x_, map_origin_y_);
+                RCLCPP_INFO(get_logger(),
+                    "Map origin: lat=%.7f lon=%.7f -> UTM32 E=%.2f N=%.2f",
+                    lat, lon, map_origin_x_, map_origin_y_);
+            }
+        }
 
         // ---- Build path --------------------------------------------------------
         std::string csv_file = get_parameter("path_csv_file").as_string();
@@ -738,10 +759,36 @@ private:
         u_prev_    = torque_cmd;
 
         // --- Speed P-controller ----------------------------------------------
-        double desired_speed = (state_ == State::STOPPING) ? 0.0
-            : (path_.hasSpeedProfile()
-                  ? path_.vref(s_ref)
-                  : get_parameter("desired_speed_mps").as_double());
+        double desired_speed;
+        if (state_ == State::STOPPING) {
+            desired_speed = 0.0;
+        } else if (path_.hasSpeedProfile()) {
+            // Scan vref over [s_ref, s_ref + car_speed * lookahead_s] and take the
+            // minimum.  Time-based lookahead so the preview window scales with speed,
+            // giving a constant braking-time budget regardless of current velocity.
+            double lookahead_m = car_speed * get_parameter("speed_lookahead_s").as_double();
+            double s_end = std::min(s_ref + lookahead_m, path_.totalLength());
+            double v_lookahead = path_.vref(s_ref);
+            for (double ss = s_ref + 1.0; ss <= s_end; ss += 1.0)
+                v_lookahead = std::min(v_lookahead, path_.vref(ss));
+
+            // CTE penalty with deadband — reduces speed when off-path so the lateral
+            // controller has headroom to recover without losing corner feasibility.
+            double k_cte      = get_parameter("cte_speed_k").as_double();
+            double cte_excess = std::max(0.0, std::abs(cte) - get_parameter("cte_deadband_m").as_double());
+            double cte_factor = (k_cte > 0.0) ? std::max(0.0, 1.0 - k_cte * cte_excess) : 1.0;
+
+            // Heading error penalty with deadband.
+            double k_hdg     = get_parameter("heading_speed_k").as_double();
+            double hdg_excess = std::max(0.0, std::abs(dpsi * 180.0 / M_PI)
+                                         - get_parameter("heading_deadband_deg").as_double());
+            double hdg_factor = (k_hdg > 0.0) ? std::max(0.0, 1.0 - k_hdg * hdg_excess) : 1.0;
+
+            desired_speed = std::max(v_lookahead * cte_factor * hdg_factor,
+                                     get_parameter("v_ref_min_mps").as_double());
+        } else {
+            desired_speed = get_parameter("desired_speed_mps").as_double();
+        }
         double kp_speed = get_parameter("kp_speed").as_double();
         double accel_cmd = std::clamp(kp_speed * (desired_speed - car_speed), -1.0, 1.0);
 
@@ -1343,8 +1390,8 @@ private:
 
             geometry_msgs::msg::PoseStamped ps;
             ps.header = path_msg.header;
-            ps.pose.position.x = x;
-            ps.pose.position.y = y;
+            ps.pose.position.x = x - map_origin_x_;
+            ps.pose.position.y = y - map_origin_y_;
             ps.pose.position.z = 0.0;
 
             double h = path_.heading(s);
@@ -1392,6 +1439,11 @@ private:
     std::vector<double> sched_v_kmh_;
     std::vector<double> sched_tau_r_;
     std::vector<double> sched_kss_;
+
+    // Map frame origin — subtracted from all published coordinates so values stay
+    // near zero for WebGL float32 precision (set from origin_lat/lon params)
+    double map_origin_x_ = 0.0;
+    double map_origin_y_ = 0.0;
 
     // Path
     Path           path_;
