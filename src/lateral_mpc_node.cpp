@@ -103,6 +103,10 @@ public:
         wpts_.clear();
         s_.clear();
         v_ref_.clear();
+        knots_.clear();
+        cx_.resize(0);
+        cy_.resize(0);
+        spline_L_ = 0.0;
     }
 
     bool isEmpty() const { return wpts_.empty(); }
@@ -155,12 +159,27 @@ public:
         return best_s;
     }
 
+    bool hasSpline() const { return !knots_.empty() && cx_.size() > 0; }
+
     /** Position at arc-length s. */
-    std::pair<double,double> position(double s) const { return interp(s); }
+    std::pair<double,double> position(double s) const
+    {
+        if (hasSpline()) {
+            Eigen::RowVectorXd B, Bp, Bpp;
+            bsplineBasisAndDerivs(splineParam(s), B, Bp, Bpp);
+            return {B.dot(cx_), B.dot(cy_)};
+        }
+        return interp(s);
+    }
 
     /** Path tangent heading [rad] (ENU: East=0, CCW positive). */
     double heading(double s) const
     {
+        if (hasSpline()) {
+            Eigen::RowVectorXd B, Bp, Bpp;
+            bsplineBasisAndDerivs(splineParam(s), B, Bp, Bpp);
+            return std::atan2(Bp.dot(cy_), Bp.dot(cx_));
+        }
         constexpr double ds = 0.2;
         auto [x0, y0] = interp(std::max(0.0, s - ds));
         auto [x1, y1] = interp(std::min(totalLength(), s + ds));
@@ -195,6 +214,19 @@ public:
     /** Path curvature at arc-length s [rad/m]. */
     double curvature(double s) const
     {
+        if (hasSpline()) {
+            // Analytic κ = (x'·y'' - y'·x'') / (x'² + y'²)^{3/2}.
+            // Parameterisation-invariant — works even though the spline parameter
+            // is the original (pre-smoothing) arc length, not the chord length.
+            Eigen::RowVectorXd B, Bp, Bpp;
+            bsplineBasisAndDerivs(splineParam(s), B, Bp, Bpp);
+            const double dx  = Bp.dot(cx_),  dy  = Bp.dot(cy_);
+            const double ddx = Bpp.dot(cx_), ddy = Bpp.dot(cy_);
+            const double speed2 = dx*dx + dy*dy;
+            if (speed2 < 1e-12) return 0.0;
+            return (dx*ddy - dy*ddx) / std::pow(speed2, 1.5);
+        }
+        // Fallback: piecewise-linear path → noisy finite-difference κ.
         constexpr double ds = 0.5;
         double h0 = heading(std::max(0.0, s - ds));
         double h1 = heading(std::min(totalLength(), s + ds));
@@ -324,50 +356,13 @@ public:
             interior_knots.push_back(t);
 
         // Full knot vector: degree k=3 requires k+1 repeated knots at each end.
-        const int k = 3;
-        std::vector<double> knots;
-        for (int i = 0; i <= k; i++) knots.push_back(0.0);
-        for (double t : interior_knots) knots.push_back(t);
-        for (int i = 0; i <= k; i++) knots.push_back(L);
+        knots_.clear();
+        for (int i = 0; i <= K_; i++) knots_.push_back(0.0);
+        for (double t : interior_knots) knots_.push_back(t);
+        for (int i = 0; i <= K_; i++) knots_.push_back(L);
+        spline_L_ = L;
 
-        const int m = static_cast<int>(knots.size());
-        const int nc = m - k - 1;  // number of B-spline control points
-
-        // --- Cox–de Boor basis evaluation ---
-        // Returns row vector of B_{i,k}(t) for i = 0 … nc-1.
-        auto bsplineBasis = [&](double t) -> Eigen::RowVectorXd {
-            // Clamp to valid range
-            t = std::clamp(t, 0.0, L);
-            // For t == L, push into last span
-            if (t >= L) t = L - 1e-10;
-
-            Eigen::RowVectorXd B = Eigen::RowVectorXd::Zero(nc);
-
-            // Degree-0 basis: indicator for knot span
-            std::vector<double> d(m - 1, 0.0);
-            for (int i = 0; i < m - 1; i++) {
-                if (t >= knots[i] && t < knots[i+1])
-                    d[i] = 1.0;
-            }
-
-            // De Boor recursion from degree 1 to k
-            for (int deg = 1; deg <= k; deg++) {
-                std::vector<double> d2(m - 1 - deg, 0.0);
-                for (int i = 0; i < static_cast<int>(d2.size()); i++) {
-                    double left = 0.0, right = 0.0;
-                    double dl = knots[i + deg] - knots[i];
-                    double dr = knots[i + deg + 1] - knots[i + 1];
-                    if (dl > 1e-12) left  = (t - knots[i])           / dl * d[i];
-                    if (dr > 1e-12) right = (knots[i+deg+1] - t)     / dr * d[i+1];
-                    d2[i] = left + right;
-                }
-                d.resize(d2.size());
-                d = d2;
-            }
-
-            for (int i = 0; i < nc; i++) B(i) = d[i];
-            return B;
-        };
+        const int nc = static_cast<int>(knots_.size()) - K_ - 1;
 
         // --- Build least-squares system A (n x nc) ---
         Eigen::MatrixXd A(n, nc);
@@ -383,19 +378,25 @@ public:
         // Normal equations: (A^T A) c = A^T f
         Eigen::MatrixXd ATA = A.transpose() * A;
         Eigen::LLT<Eigen::MatrixXd> llt(ATA);
-        if (llt.info() != Eigen::Success) return;  // singular — skip smoothing
+        if (llt.info() != Eigen::Success) {
+            knots_.clear();              // singular — disable spline path
+            spline_L_ = 0.0;
+            return;
+        }
 
-        Eigen::VectorXd cx = llt.solve(A.transpose() * fx);
-        Eigen::VectorXd cy = llt.solve(A.transpose() * fy);
+        cx_ = llt.solve(A.transpose() * fx);
+        cy_ = llt.solve(A.transpose() * fy);
 
         // --- Resample spline at original arc-lengths ---
         for (int i = 0; i < n; i++) {
             Eigen::RowVectorXd B = bsplineBasis(s_[i]);
-            wpts_[i].first  = B.dot(cx);
-            wpts_[i].second = B.dot(cy);
+            wpts_[i].first  = B.dot(cx_);
+            wpts_[i].second = B.dot(cy_);
         }
 
-        // Rebuild arc-length table
+        // Rebuild arc-length table (chord length of smoothed polyline).  The
+        // spline coefficients remain parameterised by the *original* L; a
+        // small scale factor in splineParam() bridges the two.
         s_[0] = 0.0;
         for (int i = 1; i < n; i++) {
             double dx = wpts_[i].first  - wpts_[i-1].first;
@@ -408,6 +409,123 @@ private:
     std::vector<std::pair<double,double>> wpts_;
     std::vector<double>                   s_;
     std::vector<double>                   v_ref_;
+
+    // ── Cubic B-spline geometry (filled by smoothSpline) ──────────────────
+    // Persisting these lets the controller evaluate κ analytically instead
+    // of recovering it from finite differences on the discrete waypoints —
+    // which was the source of the high-frequency jitter on desired_delta.
+    static constexpr int K_ = 3;        // cubic
+    std::vector<double>  knots_;        // length nc + K + 1
+    Eigen::VectorXd      cx_, cy_;      // control points (length nc)
+    double               spline_L_ = 0.0;  // original arc-length the spline was fit on
+
+    // Map a chord-arc-length s on the resampled polyline back to the
+    // spline parameter (which was fit on the *pre-resample* arc length).
+    // The two differ by < 0.1 % in practice; the linear rescale removes it.
+    double splineParam(double s) const
+    {
+        if (s_.empty() || s_.back() <= 0.0) return 0.0;
+        const double ratio = spline_L_ / s_.back();
+        return std::clamp(s * ratio, 0.0, spline_L_);
+    }
+
+    // Cox-de Boor degree-K_ basis evaluation at parameter t.
+    Eigen::RowVectorXd bsplineBasis(double t) const
+    {
+        const int m  = static_cast<int>(knots_.size());
+        const int nc = m - K_ - 1;
+        t = std::clamp(t, 0.0, spline_L_);
+        if (t >= spline_L_) t = spline_L_ - 1e-10;
+
+        std::vector<double> d(m - 1, 0.0);
+        for (int i = 0; i < m - 1; i++)
+            if (t >= knots_[i] && t < knots_[i + 1]) d[i] = 1.0;
+
+        for (int deg = 1; deg <= K_; deg++) {
+            std::vector<double> d2(m - 1 - deg, 0.0);
+            for (int i = 0; i < static_cast<int>(d2.size()); i++) {
+                double dl = knots_[i + deg]     - knots_[i];
+                double dr = knots_[i + deg + 1] - knots_[i + 1];
+                double left  = (dl > 1e-12) ? (t - knots_[i])           / dl * d[i]   : 0.0;
+                double right = (dr > 1e-12) ? (knots_[i + deg + 1] - t) / dr * d[i+1] : 0.0;
+                d2[i] = left + right;
+            }
+            d.swap(d2);
+        }
+
+        Eigen::RowVectorXd B = Eigen::RowVectorXd::Zero(nc);
+        for (int i = 0; i < nc; i++) B(i) = d[i];
+        return B;
+    }
+
+    // Cox-de Boor with first and second derivatives at parameter t.
+    // Uses the standard recursion dN_{i,k}/dt =
+    //   k * [ N_{i,k-1}(t) / (knots[i+k] - knots[i])
+    //       - N_{i+1,k-1}(t) / (knots[i+k+1] - knots[i+1]) ].
+    void bsplineBasisAndDerivs(double t,
+                               Eigen::RowVectorXd& B,
+                               Eigen::RowVectorXd& Bp,
+                               Eigen::RowVectorXd& Bpp) const
+    {
+        const int m  = static_cast<int>(knots_.size());
+        const int nc = m - K_ - 1;
+        t = std::clamp(t, 0.0, spline_L_);
+        if (t >= spline_L_) t = spline_L_ - 1e-10;
+
+        // Build the degree-0 ladder, then climb to degrees 1, 2, K_ (=3).
+        std::vector<double> d0(m - 1, 0.0);
+        for (int i = 0; i < m - 1; i++)
+            if (t >= knots_[i] && t < knots_[i + 1]) d0[i] = 1.0;
+
+        auto climb = [&](const std::vector<double>& d_in, int deg_out) {
+            std::vector<double> d_out(m - 1 - deg_out, 0.0);
+            for (int i = 0; i < static_cast<int>(d_out.size()); i++) {
+                double dl = knots_[i + deg_out]     - knots_[i];
+                double dr = knots_[i + deg_out + 1] - knots_[i + 1];
+                double left  = (dl > 1e-12) ? (t - knots_[i])               / dl * d_in[i]   : 0.0;
+                double right = (dr > 1e-12) ? (knots_[i + deg_out + 1] - t) / dr * d_in[i+1] : 0.0;
+                d_out[i] = left + right;
+            }
+            return d_out;
+        };
+
+        std::vector<double> d1 = climb(d0, 1);            // degree-1 basis
+        std::vector<double> d2 = climb(d1, 2);            // degree-2 basis
+        std::vector<double> d3 = climb(d2, K_);           // degree-K_ basis  (= cubic)
+
+        B   = Eigen::RowVectorXd::Zero(nc);
+        Bp  = Eigen::RowVectorXd::Zero(nc);
+        Bpp = Eigen::RowVectorXd::Zero(nc);
+        for (int i = 0; i < nc; i++) B(i) = d3[i];
+
+        // First derivative (degree-(K_-1) combination)
+        for (int i = 0; i < nc; i++) {
+            double dl = knots_[i + K_]     - knots_[i];
+            double dr = knots_[i + K_ + 1] - knots_[i + 1];
+            double left  = (dl > 1e-12) ? d2[i]   / dl : 0.0;
+            double right = (dr > 1e-12) ? d2[i+1] / dr : 0.0;
+            Bp(i) = static_cast<double>(K_) * (left - right);
+        }
+
+        // Second derivative: apply the same recursion to the degree-(K_-1) basis,
+        // which lives in d2 with derivative built from d1.
+        const int n2 = static_cast<int>(d2.size());
+        std::vector<double> dp_deg2(n2, 0.0);
+        for (int i = 0; i < n2; i++) {
+            double dl = knots_[i + (K_ - 1)]     - knots_[i];
+            double dr = knots_[i + K_]           - knots_[i + 1];
+            double left  = (dl > 1e-12) ? d1[i]   / dl : 0.0;
+            double right = (dr > 1e-12) ? d1[i+1] / dr : 0.0;
+            dp_deg2[i] = static_cast<double>(K_ - 1) * (left - right);
+        }
+        for (int i = 0; i < nc; i++) {
+            double dl = knots_[i + K_]     - knots_[i];
+            double dr = knots_[i + K_ + 1] - knots_[i + 1];
+            double left  = (dl > 1e-12) ? dp_deg2[i]   / dl : 0.0;
+            double right = (dr > 1e-12) ? dp_deg2[i+1] / dr : 0.0;
+            Bpp(i) = static_cast<double>(K_) * (left - right);
+        }
+    }
 
     std::pair<double,double> interp(double s) const
     {
