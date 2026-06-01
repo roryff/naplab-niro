@@ -38,6 +38,7 @@
 #include <std_msgs/msg/string.hpp>
 #include "car_control/msg/drive_command.hpp"
 #include "car_control/msg/vehicle_state.hpp"
+#include "car_control/msg/mpc_status.hpp"
 #include <nav_msgs/msg/path.hpp>
 #include <osqp.h>
 #include <sys/mman.h>
@@ -481,6 +482,17 @@ public:
         declare_parameter("cte_deadband_m",           0.3);
         declare_parameter("heading_speed_k",          0.0);
         declare_parameter("heading_deadband_deg",     5.0);
+        // Offset-free MPC: lateral-disturbance estimator (P1)
+        declare_parameter("cte_integral_gain",   0.6);   // [1/s] leaky-integral gain on CTE
+        declare_parameter("cte_integral_limit",  0.5);   // [m/s] clamp on estimated drift (anti-windup)
+        // Curvature gate (P1b): |kappa| [rad/m] at which the disturbance estimate is fully
+        // faded out. w_hat models a straight-line drift (camber); in corners it injected a
+        // phantom drift, so estimate + apply it only on straights and fade it in corners.
+        declare_parameter("disturbance_curvature_gate", 0.02);  // ~R<50 m corners gate it off
+        // Understeer-corrected feedforward (P2): L_eff(v) = L + Kus*v^2
+        declare_parameter("understeer_gradient", 0.003); // [s^2/m]
+        // Terminal cost (P3): extra weight on CTE/psi at the final horizon step
+        declare_parameter("terminal_weight_factor", 4.0);
 
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
         reference_point_ = loadReferencePoint();
@@ -533,6 +545,7 @@ public:
         pub_lateral_error_ = create_publisher<std_msgs::msg::Float64>("lateral_error",                 10);
         pub_heading_error_ = create_publisher<std_msgs::msg::Float64>("heading_error",                 10);
         pub_pf_cmd_vel_    = create_publisher<geometry_msgs::msg::Twist>("path_follower/cmd_vel",       10);
+        pub_status_full_   = create_publisher<car_control::msg::MpcStatus>("lateral_mpc/status",         10);
 
         // ---- Load-path subscription (runtime path switching) -----------------
         load_path_sub_ = create_subscription<std_msgs::msg::String>(
@@ -671,6 +684,7 @@ private:
             u_prev_          = 0.0;
             u_prev_plus_     = 0.0;
             u_prev_minus_    = 0.0;
+            w_hat_           = 0.0;
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
             RCLCPP_INFO(get_logger(), "Path following STARTED.");
@@ -743,8 +757,32 @@ private:
         double cte  = path_.crossTrackError(ref_x, ref_y, s_ref);
         double dpsi = path_.headingError(s_ref, car_heading);
 
-        // Curvature-based desired steer angle (feedforward reference for debug only)
-        double desired_delta_rad = path_.curvature(s_ref) * WHEELBASE;
+        // Offset-free MPC (P1): leaky-integral estimate of the unmodeled lateral
+        // disturbance (camber, steering zero-trim, model bias) as a CTE drift rate
+        // [m/s]. Clamped for anti-windup. Fed into the CTE prediction in solveMpc so
+        // the controller rejects constant disturbances instead of leaving steady CTE.
+        // Anti-windup: only accumulate when the actuator is NOT saturated — while
+        // |torque|≈1 the controller can't act on extra error, so integrating it just
+        // winds up and causes the slow large-amplitude swings seen on the hard path.
+        // Curvature gate (P1b): fade the disturbance estimate to 0 in corners, where a
+        // constant-drift model is wrong and was making the MPC predict the corner offset
+        // would self-cancel (verified 3x optimism). 1 on straights, 0 for |kappa|>=gate.
+        const double kgate = get_parameter("disturbance_curvature_gate").as_double();
+        const double curv_gate_now = (kgate > 1e-9)
+            ? std::clamp(1.0 - std::abs(path_.curvature(s_ref)) / kgate, 0.0, 1.0) : 1.0;
+        mpc_dbg_.integrator_frozen = (std::abs(u_prev_) >= 0.97);
+        if (state_ == State::FOLLOWING && !mpc_dbg_.integrator_frozen) {
+            const double ki   = get_parameter("cte_integral_gain").as_double();
+            const double wmax = get_parameter("cte_integral_limit").as_double();
+            // scale integration by the gate so w_hat is learned from straights only
+            w_hat_ = std::clamp(w_hat_ + ki * cte * curv_gate_now * DT, -wmax, wmax);
+        }
+
+        // Curvature-based desired steer angle (feedforward reference for debug only),
+        // understeer-corrected: delta = kappa * L_eff(v), L_eff = L + Kus*v^2 (P2).
+        const double kus       = get_parameter("understeer_gradient").as_double();
+        const double l_eff_ref = WHEELBASE + kus * car_speed * car_speed;
+        double desired_delta_rad = path_.curvature(s_ref) * l_eff_ref;
 
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
@@ -814,6 +852,60 @@ private:
             pub_pf_cmd_vel_->publish(pf_cmd);
         }
 
+        // ---- Comprehensive MPC status ---------------------------------------
+        {
+            // Feedforward torque (steady-state torque to hold desired_delta) and the
+            // actuator's approx max steer rate, from the sched_fo2 model at this speed.
+            double ff_torque = 0.0, steer_rate_limit = 0.0;
+            if (use_sched_fo2_) {
+                const double vk      = car_speed * 3.6;
+                const double kss     = schedInterp(sched_v_kmh_, sched_kss_, vk, 1.0);
+                const double kss_rad = kss * (M_PI / 180.0) / STEERING_RATIO;  // rad/torque
+                const double tau     = schedInterp(sched_v_kmh_, sched_tau_r_, vk, 0.05);
+                if (kss_rad > 1e-9) ff_torque = std::clamp(desired_delta_rad / kss_rad, -1.0, 1.0);
+                if (tau > 1e-6)     steer_rate_limit = (kss_rad / tau) * (180.0 / M_PI);
+            }
+
+            car_control::msg::MpcStatus st;
+            st.header.stamp = this->now();
+            st.header.frame_id = "base_link";
+            st.state = (state_ == State::FOLLOWING) ? "FOLLOWING"
+                     : (state_ == State::STOPPING)  ? "STOPPING" : "IDLE";
+            st.progress_m     = s_rear;
+            st.path_length_m  = path_.totalLength();
+            st.vref_mps       = desired_speed;
+            st.v_ego_mps      = car_speed;
+
+            st.cte_m             = cte;
+            st.heading_error_deg = dpsi * 180.0 / M_PI;
+
+            st.w_hat_mps         = w_hat_;
+            st.disturbance_bias_m = w_hat_ * N_ * DT;
+            st.disturbance_gate  = curv_gate_now;
+            st.integrator_frozen = mpc_dbg_.integrator_frozen;
+
+            st.kappa_rad_m       = path_.curvature(s_ref);
+            st.l_eff_m           = l_eff_ref;
+            st.desired_delta_deg = desired_delta_rad * 180.0 / M_PI;
+            st.actual_delta_deg  = car_delta * 180.0 / M_PI;
+            st.delta_error_deg   = (car_delta - desired_delta_rad) * 180.0 / M_PI;
+            st.ff_torque         = ff_torque;
+            st.torque_cmd        = torque_cmd;
+            st.feedback_torque   = torque_cmd - ff_torque;
+            st.torque_saturated  = std::abs(torque_cmd) > 0.97;
+
+            st.steer_rate_deg_s       = car_delta_rate * 180.0 / M_PI;
+            st.steer_rate_limit_deg_s = steer_rate_limit;
+
+            st.pred_terminal_cte_m       = mpc_dbg_.pred_terminal_cte;
+            st.pred_terminal_heading_deg = mpc_dbg_.pred_terminal_psi * 180.0 / M_PI;
+            st.solve_status   = mpc_dbg_.solve_status;
+            st.solve_time_us  = mpc_dbg_.solve_time_us;
+            st.horizon        = N_;
+
+            pub_status_full_->publish(st);
+        }
+
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | dPsi=%.2f° | "
             "delta=%.2f° | torque=%.3f | v=%.2f m/s",
@@ -869,6 +961,14 @@ private:
         const double rate_rising  = get_parameter("rate_rising").as_double();
         const double rate_sinking = get_parameter("rate_sinking").as_double();
         const double tlim        = get_parameter("torque_limit").as_double();
+        const double kus         = get_parameter("understeer_gradient").as_double();   // L_eff = L + Kus*v^2 (P2)
+        const double w_term      = get_parameter("terminal_weight_factor").as_double(); // extra weight at final step (P3)
+        // Front-axle reference adds a direct steering term to the CTE dynamics:
+        //   rear:  dCTE/dt = v*dPsi              (steering reaches CTE only via heading; rel-degree 2)
+        //   front: dCTE/dt = v*(dPsi - delta)    (front wheels' velocity is rotated by delta; rel-degree 1)
+        // Without this term a front-axle CTE measurement is fed to a rear-axle predictor (mismatch).
+        const double front_term  = (reference_point_ == ReferencePoint::FrontAxle) ? 1.0 : 0.0;
+        const double kgate       = get_parameter("disturbance_curvature_gate").as_double();  // P1b
 
         const double v_fallback = std::max(0.5, v);  // used when no speed profile is available
         const double v_kmh = v * 3.6;
@@ -975,17 +1075,30 @@ private:
                 G_rate = G_rate_new;
             }
 
-            // dPsi_{k+1} = dPsi_k - (v_k * delta_k / L - kappa_k * v_k) * dt
-            double c_psi_new = c_psi - (v_k * c_delta / WHEELBASE - kappa * v_k) * dt;
+            // dPsi_{k+1} = dPsi_k - (v_k * delta_k / L_eff - kappa_k * v_k) * dt
+            // L_eff(v) = L + Kus*v^2 (understeer gradient, P2): the kinematic yaw rate
+            // v*delta/L overestimates real turn-in at speed, so the car rides wide in
+            // corners. Using L_eff makes the model demand (and the MPC command) the
+            // true steer. The path yaw-rate term kappa*v is geometric — left as-is.
+            const double l_eff = WHEELBASE + kus * v_k * v_k;
+            double c_psi_new = c_psi - (v_k * c_delta / l_eff - kappa * v_k) * dt;
             std::vector<double> G_psi_new(n, 0.0);
             for (int j = 0; j < n; j++)
-                G_psi_new[j] = G_psi[j] - v_k * dt / WHEELBASE * G_delta[j];
+                G_psi_new[j] = G_psi[j] - v_k * dt / l_eff * G_delta[j];
 
-            // CTE_{k+1} = CTE_k + v_k * dPsi_k * dt
-            double c_cte_new = c_cte + v_k * c_psi * dt;
+            // CTE_{k+1} = CTE_k + v_k * (dPsi_k - front_term*delta_k) * dt + w_hat * w_gate * dt
+            // front_term=1 for front-axle reference adds the direct steering term (rel-degree 1);
+            // c_delta/G_delta here are still delta_k (advanced after this block), matching the
+            // forward-Euler use of dPsi_k. w_hat_ is the exogenous disturbance estimate (P1),
+            // applied through the per-step curvature gate (P1b) so it acts on straight horizon
+            // segments but fades out where the path curves.
+            const double w_gate = (kgate > 1e-9)
+                ? std::clamp(1.0 - std::abs(kappa) / kgate, 0.0, 1.0) : 1.0;
+            double c_cte_new = c_cte + v_k * (c_psi - front_term * c_delta) * dt
+                             + w_hat_ * w_gate * dt;
             std::vector<double> G_cte_new(n, 0.0);
             for (int j = 0; j < n; j++)
-                G_cte_new[j] = G_cte[j] + v_k * dt * G_psi[j];
+                G_cte_new[j] = G_cte[j] + v_k * dt * (G_psi[j] - front_term * G_delta[j]);
 
             // Advance state
             c_delta = c_delta_new;  G_delta = G_delta_new;
@@ -997,11 +1110,16 @@ private:
             // Expand to 2n QP variables on-the-fly:  G_full[2j]=G[j], G_full[2j+1]=-G[j]
             // Upper-triangular pairs (a,b) in original space → 4 pairs in 2n space:
             //   (+a,+b): val,  (+a,-b): -val,  (-a,+b): -val (b>a only),  (-a,-b): val
+            // Terminal weighting (P3): scale the final step's CTE/psi cost by w_term to
+            // approximate a longer effective horizon without adding decision variables.
+            const double tf  = (k == n - 1) ? w_term : 1.0;
+            const double wc_k = w_cte * tf;
+            const double wp_k = w_psi * tf;
             for (int a = 0; a < n; a++) {
                 for (int b = a; b < n; b++) {
                     double val = static_cast<OSQPFloat>(
-                        2.0 * w_cte * G_cte[a] * G_cte[b] +
-                        2.0 * w_psi * G_psi[a] * G_psi[b]);
+                        2.0 * wc_k * G_cte[a] * G_cte[b] +
+                        2.0 * wp_k * G_psi[a] * G_psi[b]);
                     P_x[P_p[2*b]   + 2*a  ] += val;   // (+a, +b)
                     P_x[P_p[2*b+1] + 2*a  ] -= val;   // (+a, -b)
                     if (b > a) P_x[P_p[2*b] + 2*a+1] -= val;  // (-a, +b)
@@ -1009,8 +1127,8 @@ private:
                 }
             }
             for (int j = 0; j < n; j++) {
-                double dq = 2.0 * w_cte * c_cte * G_cte[j]
-                          + 2.0 * w_psi * c_psi * G_psi[j];
+                double dq = 2.0 * wc_k * c_cte * G_cte[j]
+                          + 2.0 * wp_k * c_psi * G_psi[j];
                 q_vec[2*j]   += static_cast<OSQPFloat>( dq);
                 q_vec[2*j+1] += static_cast<OSQPFloat>(-dq);
             }
@@ -1022,7 +1140,7 @@ private:
             // Guides MPC to reach the curvature-required steer angle, preventing pre-steer.
             if (w_d > 0.0) {
                 double s_next = s_k;  // already advanced to step k+1 position
-                double delta_ref = path_.curvature(s_next) * WHEELBASE;
+                double delta_ref = path_.curvature(s_next) * l_eff;  // understeer-corrected (P2)
                 double d = c_delta - delta_ref;
                 for (int a = 0; a < n; a++) {
                     for (int b = a; b < n; b++) {
@@ -1146,12 +1264,14 @@ private:
             osqp_solve(osqp_solver_);
             auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - t0).count();
+            mpc_dbg_.solve_time_us = static_cast<double>(dt_us);
             if (dt_us > 40000) {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                     "OSQP solve overrun: %ld µs (budget 40 ms)", dt_us);
             }
         }
         OSQPInt status_val = osqp_solver_->info->status_val;
+        mpc_dbg_.solve_status = static_cast<int>(status_val);
         if (status_val != OSQP_SOLVED && status_val != OSQP_SOLVED_INACCURATE) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                 "OSQP solve failed (status=%d); holding previous torque.",
@@ -1164,6 +1284,22 @@ private:
         double u_minus0 = std::max(0.0, static_cast<double>(osqp_solver_->solution->x[1]));
         out_u_plus  = u_plus0;
         out_u_minus = u_minus0;
+
+        // Predicted terminal state under the optimal solution. After the propagation
+        // loop, c_cte/G_cte and c_psi/G_psi hold the final-step (constant + sensitivity
+        // to signed u_j). Reconstruct the horizon-end prediction so the status topic
+        // shows whether the MPC itself believes it converges.
+        {
+            double term_cte = c_cte, term_psi = c_psi;
+            for (int j = 0; j < n; j++) {
+                double u_j = static_cast<double>(osqp_solver_->solution->x[2*j])
+                           - static_cast<double>(osqp_solver_->solution->x[2*j+1]);
+                term_cte += G_cte[j] * u_j;
+                term_psi += G_psi[j] * u_j;
+            }
+            mpc_dbg_.pred_terminal_cte = term_cte;
+            mpc_dbg_.pred_terminal_psi = term_psi;
+        }
         return std::clamp(u_plus0 - u_minus0, -tlim, tlim);
     }
 
@@ -1231,6 +1367,7 @@ private:
                 u_prev_       = 0.0;
                 u_prev_plus_  = 0.0;
                 u_prev_minus_ = 0.0;
+                w_hat_        = 0.0;
             }
             publishPathVisualization();
             RCLCPP_INFO(get_logger(), "Path unloaded.");
@@ -1432,7 +1569,17 @@ private:
     double u_prev_       = 0.0;  // effective torque sent last step (ramped)
     double u_prev_plus_  = 0.0;  // positive component of u_prev_
     double u_prev_minus_ = 0.0;  // negative magnitude component of u_prev_
+    double w_hat_        = 0.0;  // estimated lateral-disturbance CTE drift [m/s] (offset-free MPC)
     int    N_            = 40;
+
+    // Diagnostics filled by solveMpc, published on lateral_mpc/status each tick
+    struct MpcDebug {
+        double pred_terminal_cte = 0.0;
+        double pred_terminal_psi = 0.0;
+        int    solve_status      = 0;
+        double solve_time_us     = 0.0;
+        bool   integrator_frozen = false;
+    } mpc_dbg_;
 
     // sched_fo2 actuator model (loaded from sched_fo2_model_path if provided)
     bool use_sched_fo2_ = false;
@@ -1473,6 +1620,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_lateral_error_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_heading_error_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr    pub_pf_cmd_vel_;
+    rclcpp::Publisher<car_control::msg::MpcStatus>::SharedPtr  pub_status_full_;
 
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp::TimerBase::SharedPtr auto_enable_timer_;

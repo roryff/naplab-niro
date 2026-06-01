@@ -9,10 +9,20 @@ lateral_mpc_node:
     origin_lon: 10.4128
     horizon: 64   # max enforced by code; 3.2s / ~8.6m lookahead at 2.7 m/s
     # Cost weights
-    weight_cte:    100.0   # was 20 — more aggressive CTE pull
-    weight_psi:    30.0   # was 3  — stronger heading damping, kills 6s oscillation
-    weight_torque: 0.005  # was 0.01 — less torque penalty so controller acts faster
+    # NOTE: the steering actuator is rate-limited (~1 s to full torque, tau_r up to
+    # ~3 s at low corner speed) → it is a low-pass; high-freq actuation is impossible.
+    # Closed-loop bandwidth (set by these weights) must stay BELOW the actuator
+    # bandwidth or the result is a slow limit cycle. The Opus* bags showed weight_cte
+    # 250 + psi 10 + terminal×4 + a fast integral pushed past that → ~3 m swings on
+    # the hard path. Reverted to near-original damped gains; bias is now handled by
+    # the gentle disturbance estimator below, so high CTE gain is unnecessary.
+    weight_cte:    180.0   # Path3: model verified accurate (L_real~=L_eff), but corners held a
+                           # standing +0.18 m parallel offset — psi damping tolerated it. Raise
+                           # cte/psi ratio 4->6 to actively migrate back to the line (headroom exists).
+    weight_psi:    30.0    # restored — heading damping; the main stabiliser
+    weight_torque: 0.005   # reverted — actuator can't chatter, so no anti-chatter penalty needed
     weight_delta:  0.0   # bag3 showed this increased saturation without improving tracking
+    terminal_weight_factor: 1.0   # off — overweighting the 3.2 s-ahead step raised gain → overshoot
     reference_point: "rear_axle"
     path_spline_knot_m: 5.0   # B-spline knot spacing for path smoothing [m]; 0 = disabled
     rate_rising:  1.033   # |u| increasing (0→±1) [norm/s]
@@ -38,9 +48,13 @@ lateral_mpc_node:
     # the K_ss table: finds the max speed where the steering model can achieve
     # the required angle for each path curvature.  Backward/forward smoothing
     # passes then enforce braking and acceleration limits.
+    # Envelope was 0.5/0.5 — too gentle: braked early and recovered slowly, so the
+    # car sat below 4 m/s ~40% of the hard path (the "slows more than it needs to").
+    # accel raised most (faster recovery after corners — does NOT raise corner-entry
+    # speed, so corner tracking is unchanged); decel raised modestly.
     speed_profile_decel_mps2:  0.5   # max deceleration for backward pass [m/s²]
-    speed_profile_accel_mps2:  0.5    # max acceleration for forward pass  [m/s²]
-    curvature_speed_margin:    0.75  # use 85% of peak K_ss (safety margin)
+    speed_profile_accel_mps2:  0.5   # max acceleration for forward pass  [m/s²]
+    curvature_speed_margin:    0.75  # was 0.75 — more headroom for torque-saturated corner peaks (P4)
     v_ref_min_mps:             0.5    # speed floor in profile [m/s]
 
     # ── Runtime speed adjustments ─────────────────────────────────────────────
@@ -58,3 +72,34 @@ lateral_mpc_node:
     # Heading error penalty: same structure as CTE penalty.
     heading_speed_k:         0.0    # penalty gain [1/deg]; 0 = disabled
     heading_deadband_deg:    5.0    # heading error deadband [deg]
+
+    # ── Offset-free MPC: lateral-disturbance estimator (P1) ───────────────────
+    # Leaky integral of CTE estimates a constant lateral drift [m/s] (camber,
+    # steering zero-trim, model bias) and feeds it into the CTE prediction so the
+    # controller rejects it instead of leaving a steady ~0.2 m offset. Reset to 0
+    # on every enable / path load. cte_integral_limit bounds it (anti-windup).
+    # Tuning: raise gain until the straight offset clears in a few seconds without
+    # slow oscillation; back off if it oscillates. MUST be slow relative to the
+    # actuator (which is itself slow) — a fast/large integral stacks phase lag on the
+    # rate-limited steering and drives a slow limit cycle. Estimation is also frozen
+    # while torque is saturated (anti-windup, in the node). The 0.6 gain / 0.5 m/s
+    # limit in the Opus* bags wound up badly in the saturated corners.
+    cte_integral_gain:       0.15   # [1/s]  integral gain on CTE (gentle, ~6 s timescale)
+    cte_integral_limit:      0.15   # [m/s]  clamp on estimated drift (realistic camber/bias)
+    # Curvature gate (P1b): w_hat is a STRAIGHT-line drift estimate. On the Path4 bag the
+    # debug topic proved the global w_hat (-0.06 m/s) injected a phantom -0.20 m drift that
+    # opposed the +0.17 m corner offset 85% of the time -> MPC predicted self-cancel (3x
+    # optimism) and under-committed. Gate fades w_hat estimation AND application to 0 as
+    # |kappa| -> this value, so it helps straights without corrupting corners.
+    # 0.02 rad/m = R 50 m. Raise to gate only sharper corners; lower to gate more gently.
+    disturbance_curvature_gate: 0.02   # [rad/m]; set 0 to disable gating (old behaviour)
+
+    # ── Understeer-corrected feedforward (P2) ─────────────────────────────────
+    # Effective wheelbase L_eff(v) = L + Kus*v^2 replaces the pure-Ackermann L in
+    # the yaw dynamics, so the MPC commands enough steer at speed and stops riding
+    # wide in corners. Tuning: increase if corners still ride wide (rear axle
+    # outside); decrease if it cuts inside.
+    understeer_gradient:     0.010  # Kus [s^2/m]. nice5 (gated): sustained corners steer -1.27deg
+                                     # below FF with 6% sat (headroom) -> raise corner steer target.
+                                     # Now clean to tune since the gate removed the phantom-drift
+                                     # confound. Corner-local (kappa>0), so straight stability unaffected.
