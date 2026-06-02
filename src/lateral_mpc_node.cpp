@@ -263,7 +263,8 @@ public:
         double decel_mps2,
         double accel_mps2,
         double margin_factor,
-        double v_min_mps)
+        double v_min_mps,
+        double slew_budget_radps)
     {
         const int n = static_cast<int>(wpts_.size());
         v_ref_.resize(n);
@@ -297,6 +298,27 @@ public:
                     }
                 }
             }
+
+            // Curvature-RATE (slew) limit — the S-curve fix. Following the path
+            // demands a front-wheel angle rate dδ/dt = v·dδ/ds ≈ v·L·|dκ/ds|
+            // (small-angle δ≈κL). At an S-curve inflection |κ|≈0 (so the model
+            // limit above sees a "straight" and allows full speed) yet |dκ/ds| is
+            // large — exactly where the rate-limited actuator must reverse fastest.
+            // Cap the demanded slew at slew_budget_radps to give it time/distance:
+            //   v ≤ slew_budget / (L·|dκ/ds|).
+            if (slew_budget_radps > 1e-9 && n >= 3) {
+                const int  ip  = std::min(i + 1, n - 1);
+                const int  im  = std::max(i - 1, 0);
+                const double dss = s_[ip] - s_[im];
+                if (dss > 1e-6) {
+                    const double dkappa_ds =
+                        std::abs(curvature(s_[ip]) - curvature(s_[im])) / dss;
+                    const double denom = WHEELBASE * dkappa_ds;
+                    if (denom > 1e-9)
+                        v_limit = std::min(v_limit, slew_budget_radps / denom);
+                }
+            }
+
             v_ref_[i] = std::clamp(v_limit, v_min_mps, desired_speed_mps);
         }
 
@@ -594,6 +616,7 @@ public:
         declare_parameter("speed_profile_decel_mps2", 1.5);
         declare_parameter("speed_profile_accel_mps2", 0.5);
         declare_parameter("curvature_speed_margin",   0.85);
+        declare_parameter("curvature_rate_slew_budget_deg_s", 0.0);  // 0 = disabled
         declare_parameter("v_ref_min_mps",            0.5);
         declare_parameter("speed_lookahead_s",        1.5);
         declare_parameter("cte_speed_k",              0.0);
@@ -1597,7 +1620,8 @@ private:
             get_parameter("speed_profile_decel_mps2").as_double(),
             get_parameter("speed_profile_accel_mps2").as_double(),
             get_parameter("curvature_speed_margin").as_double(),
-            get_parameter("v_ref_min_mps").as_double());
+            get_parameter("v_ref_min_mps").as_double(),
+            get_parameter("curvature_rate_slew_budget_deg_s").as_double() * (M_PI / 180.0));
         auto [kappa_max, v_min, v_max] = path_.speedProfileStats();
         RCLCPP_INFO(get_logger(),
             "Speed profile built: %.2f–%.2f m/s (min–max) over %.1f m. "

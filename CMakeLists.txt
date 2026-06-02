@@ -34,6 +34,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VehicleState.msg"
   "msg/EsfSensor.msg"
   "msg/EsfStatus.msg"
+  "msg/MpcStatus.msg"
   DEPENDENCIES std_msgs
 )
 

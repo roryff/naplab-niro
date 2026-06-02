@@ -55,7 +55,20 @@ lateral_mpc_node:
     speed_profile_decel_mps2:  0.5   # max deceleration for backward pass [m/s²]
     speed_profile_accel_mps2:  0.5   # max acceleration for forward pass  [m/s²]
     curvature_speed_margin:    0.75  # was 0.75 — more headroom for torque-saturated corner peaks (P4)
-    v_ref_min_mps:             0.5    # speed floor in profile [m/s]
+    # ── Curvature-RATE (S-curve) speed limit ──────────────────────────────────
+    # HardPath10 showed the worst CTE (|CTE| 0.176 vs 0.093 elsewhere, 16% rate-
+    # limited) at turn->opposite-turn reversals: the actuator needs 0.5-0.7s to
+    # swing torque polarity, but at the inflection |kappa|~=0 so curvature_speed_
+    # margin above sees a "straight" and SPEEDS UP — least time for the hardest
+    # move. This caps the demanded steering slew dδ/dt = v*L*|dκ/ds| at the budget
+    # below, so v dips automatically at inflections (where |dκ/ds| is large) and is
+    # untouched on real straights (|dκ/ds|~0). Budget = road-wheel deg/s the PROFILE
+    # reserves for path-following slew; actuator does ~15.5 deg/s total, so leave
+    # headroom for feedback. Lower = slows more at S-curves. 0 = disabled.
+    # NOTE: bounded below by v_ref_min_mps, so raise that floor's headroom if you
+    # want deeper S-curve slowdowns.
+    curvature_rate_slew_budget_deg_s: 6.0
+    v_ref_min_mps:             3.0    # speed floor in profile [m/s]
 
     # ── Runtime speed adjustments ─────────────────────────────────────────────
     # speed_lookahead_s: preview window for speed reference. The controller reads
@@ -99,7 +112,9 @@ lateral_mpc_node:
     # the yaw dynamics, so the MPC commands enough steer at speed and stops riding
     # wide in corners. Tuning: increase if corners still ride wide (rear axle
     # outside); decrease if it cuts inside.
-    understeer_gradient:     0.010  # Kus [s^2/m]. nice5 (gated): sustained corners steer -1.27deg
-                                     # below FF with 6% sat (headroom) -> raise corner steer target.
-                                     # Now clean to tune since the gate removed the phantom-drift
-                                     # confound. Corner-local (kappa>0), so straight stability unaffected.
+    understeer_gradient:     0.010  # Kus [s^2/m]. 0.003->0.010 was a clean win (nice7 vs nice5:
+                                     # RMS 0.148->0.079, peak 0.81->0.24, corner|CTE| 0.122->0.078,
+                                     # corner sat 19%->12%). Still rides slightly wide (delta_error
+                                     # -1.43deg, no over-steer) -> headroom to push to 0.013. STOP if
+                                     # delta_error crosses toward 0 / CTE flips inside (over-steer).
+                                     # Corner-local (kappa>0), so straight stability unaffected.
