@@ -13,10 +13,10 @@ float64 v_ego_mps              # measured speed
 float64 cte_m                  # cross-track error (rear axle), + = car right of path
 float64 heading_error_deg      # + = car pointing right of path
 
-# --- Disturbance estimator (offset-free / integral, P1) ---
-float64 w_hat_mps              # estimated lateral drift [m/s] fed into prediction
-float64 disturbance_bias_m     # = w_hat * N * dt : predicted CTE shift the integral injects
-float64 disturbance_gate       # curvature gate [0..1]: how much w_hat is estimated/applied here (1=straight, 0=corner)
+# CTE integrator
+float64 cte_integrator_mps             
+float64 cte_integrator_bias_m    
+float64 integrator_gate      
 bool    integrator_frozen      # true when anti-windup froze it (torque saturated)
 
 # --- Steering: feedforward vs feedback breakdown ---

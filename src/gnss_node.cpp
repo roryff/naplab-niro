@@ -785,6 +785,10 @@ private:
      * Angular rates: int32 [deg/s * 1e-3] → rad/s (per-axis validity checked)
      * Accelerations: int32 [mg]           → m/s² (gravity-free, per-axis validity checked)
      *
+     * Output frame is ROS REP-103 base_link (X-fwd / Y-left / Z-up): the u-blox
+     * vehicle frame (X-fwd / Y-right / Z-down) is converted by negating Y and Z, so
+     * yaw rate z is CCW-positive and lateral accel y is left-positive.
+     *
      * NOTE: Fields are only meaningful when fusionMode == 1 (FUSION).
      * Publishes gnss/gyro [rad/s] and gnss/accel [m/s²].
      */
@@ -803,13 +807,16 @@ private:
                              UBX_ESF_INS_Z_ANG_RATE_VALID)) {
             geometry_msgs::msg::Vector3Stamped gyro_msg;
             gyro_msg.header.stamp    = stamp;
-            gyro_msg.header.frame_id = "imu";
+            gyro_msg.header.frame_id = "base_link";
+            // u-blox vehicle frame is X-fwd / Y-right / Z-down. Convert to ROS REP-103
+            // body frame (X-fwd / Y-left / Z-up) by negating Y and Z, so yaw rate z is
+            // CCW-positive (left turn +) and consumers don't each re-flip the sign.
             gyro_msg.vector.x = (ins.bitfield0 & UBX_ESF_INS_X_ANG_RATE_VALID)
-                                 ? ins.xAngRate * DEG_S_SCALE : 0.0;
+                                 ?  ins.xAngRate * DEG_S_SCALE : 0.0;
             gyro_msg.vector.y = (ins.bitfield0 & UBX_ESF_INS_Y_ANG_RATE_VALID)
-                                 ? ins.yAngRate * DEG_S_SCALE : 0.0;
+                                 ? -ins.yAngRate * DEG_S_SCALE : 0.0;
             gyro_msg.vector.z = (ins.bitfield0 & UBX_ESF_INS_Z_ANG_RATE_VALID)
-                                 ? ins.zAngRate * DEG_S_SCALE : 0.0;
+                                 ? -ins.zAngRate * DEG_S_SCALE : 0.0;
             gyro_pub_->publish(gyro_msg);
 
             RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -823,13 +830,15 @@ private:
                              UBX_ESF_INS_Z_ACCEL_VALID)) {
             geometry_msgs::msg::Vector3Stamped accel_msg;
             accel_msg.header.stamp    = stamp;
-            accel_msg.header.frame_id = "imu";
+            accel_msg.header.frame_id = "base_link";
+            // Same X-fwd/Y-right/Z-down → ROS REP-103 (X-fwd/Y-left/Z-up) conversion:
+            // negate Y and Z so lateral accel y is left-positive.
             accel_msg.vector.x = (ins.bitfield0 & UBX_ESF_INS_X_ACCEL_VALID)
-                                  ? ins.xAccel * MG_SCALE : 0.0;
+                                  ?  ins.xAccel * MG_SCALE : 0.0;
             accel_msg.vector.y = (ins.bitfield0 & UBX_ESF_INS_Y_ACCEL_VALID)
-                                  ? ins.yAccel * MG_SCALE : 0.0;
+                                  ? -ins.yAccel * MG_SCALE : 0.0;
             accel_msg.vector.z = (ins.bitfield0 & UBX_ESF_INS_Z_ACCEL_VALID)
-                                  ? ins.zAccel * MG_SCALE : 0.0;
+                                  ? -ins.zAccel * MG_SCALE : 0.0;
             accel_pub_->publish(accel_msg);
         }
     }

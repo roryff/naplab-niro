@@ -20,7 +20,7 @@
 
 /lidar_top/os_driver:
   ros__parameters:
-    sensor_hostname: '192.168.2.205'
+    sensor_hostname: '192.168.2.204'
     sensor_frame: 'lidar_top/os_sensor'
     lidar_frame:  'lidar_top/os_lidar'
     imu_frame:    'lidar_top/os_imu'

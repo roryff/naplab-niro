@@ -133,13 +133,13 @@ public:
         declare_parameter("curvature_rate_slew_budget_deg_s", 0.0);  // 0 = disabled
         declare_parameter("v_ref_min_mps",            0.5);
         declare_parameter("speed_lookahead_s",        1.5);
-        // Offset-free MPC: lateral-disturbance estimator (P1)
-        declare_parameter("cte_integral_gain",   0.6);   // [1/s] leaky-integral gain on CTE
-        declare_parameter("cte_integral_limit",  0.5);   // [m/s] clamp on estimated drift (anti-windup)
-        // Curvature gate (P1b): |kappa| [rad/m] at which the disturbance estimate is fully
-        // faded out. w_hat models a straight-line drift (camber); in corners it injected a
-        // phantom drift, so estimate + apply it only on straights and fade it in corners.
-        declare_parameter("disturbance_curvature_gate", 0.02);  // ~R<50 m corners gate it off
+        // CTE integrator: cte_int_ += ki*cte*dt, frozen while saturated or in corners.
+        // Warm-started to cte_drift_init so it skips the first-lap learning transient.
+        declare_parameter("cte_integral_gain",  0.15);  // [1/s]
+        declare_parameter("cte_integral_limit", 0.30);  // [m/s] anti-windup clamp
+        declare_parameter("cte_drift_init",    -0.12);  // [m/s] warm-start on enable
+        // Freeze integration above this |kappa|; learn on straights only. 0 = always learn.
+        declare_parameter("learn_curvature_gate", 0.02);  // [rad/m]
         // Understeer-corrected feedforward (P2): L_eff(v) = L + Kus*v^2
         declare_parameter("understeer_gradient", 0.003); // [s^2/m]
 
@@ -323,7 +323,7 @@ private:
             u_prev_          = 0.0;
             u_prev_plus_     = 0.0;
             u_prev_minus_    = 0.0;
-            w_hat_           = 0.0;
+            resetIntegrator();
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
             RCLCPP_INFO(get_logger(), "Path following STARTED.");
@@ -388,32 +388,25 @@ private:
         double cte  = path_.crossTrackError(ref_x, ref_y, s_ref);
         double dpsi = path_.headingError(s_ref, car_heading);
 
-        // Offset-free MPC (P1): leaky-integral estimate of the unmodeled lateral
-        // disturbance (camber, steering zero-trim, model bias) as a CTE drift rate
-        // [m/s]. Clamped for anti-windup. Fed into the CTE prediction in solveMpc so
-        // the controller rejects constant disturbances instead of leaving steady CTE.
-        // Anti-windup: only accumulate when the actuator is NOT saturated — while
-        // |torque|≈1 the controller can't act on extra error, so integrating it just
-        // winds up and causes the slow large-amplitude swings seen on the hard path.
-        // Curvature gate (P1b): fade the disturbance estimate to 0 in corners, where a
-        // constant-drift model is wrong and was making the MPC predict the corner offset
-        // would self-cancel (verified 3x optimism). 1 on straights, 0 for |kappa|>=gate.
-        const double kgate = get_parameter("disturbance_curvature_gate").as_double();
-        const double curv_gate_now = (kgate > 1e-9)
-            ? std::clamp(1.0 - std::abs(path_.curvature(s_ref)) / kgate, 0.0, 1.0) : 1.0;
-        mpc_dbg_.integrator_frozen = (std::abs(u_prev_) >= 0.97);
-        if (state_ == State::FOLLOWING && !mpc_dbg_.integrator_frozen) {
-            const double ki   = get_parameter("cte_integral_gain").as_double();
-            const double wmax = get_parameter("cte_integral_limit").as_double();
-            // scale integration by the gate so w_hat is learned from straights only
-            w_hat_ = std::clamp(w_hat_ + ki * cte * curv_gate_now * DT, -wmax, wmax);
-        }
-
         // Curvature-based desired steer angle (feedforward reference for debug only),
         // understeer-corrected: delta = kappa * L_eff(v), L_eff = L + Kus*v^2 (P2).
         const double kus       = get_parameter("understeer_gradient").as_double();
         const double l_eff_ref = WHEELBASE + kus * car_speed * car_speed;
-        double desired_delta_rad = path_.curvature(s_ref) * l_eff_ref;
+        const double kappa_ref = path_.curvature(s_ref);
+        double desired_delta_rad = kappa_ref * l_eff_ref;
+
+        // --- CTE integrator --------------------------------------------------
+        // I-term on CTE: cte_int_ += ki*cte*dt. Drives steady error to zero.
+        // Frozen while saturated (anti-windup). Gates integration in corners
+        // so actuator-lag transients don't corrupt the accumulated value.
+        const double learn_gate = get_parameter("learn_curvature_gate").as_double();
+        const bool in_turn = (learn_gate > 0.0) && (std::abs(kappa_ref) > learn_gate);
+        mpc_dbg_.integrator_frozen = (std::abs(u_prev_) >= 0.97);   // saturation (diagnostic)
+        if (state_ == State::FOLLOWING && !mpc_dbg_.integrator_frozen && !in_turn) {
+            const double ki   = get_parameter("cte_integral_gain").as_double();
+            const double wmax = get_parameter("cte_integral_limit").as_double();
+            cte_int_ = std::clamp(cte_int_ + ki * cte * DT, -wmax, wmax);
+        }
 
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
@@ -471,7 +464,7 @@ private:
         }
 
         publishMpcStatus(s_rear, s_ref, desired_speed, car_speed, cte, dpsi,
-                         curv_gate_now, l_eff_ref, desired_delta_rad,
+                         1.0 /*gate removed*/, l_eff_ref, desired_delta_rad,
                          car_delta, car_delta_rate, torque_cmd);
 
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -524,7 +517,6 @@ private:
         const double w_psi       = get_parameter("weight_psi").as_double();
         const double w_t         = get_parameter("weight_torque").as_double();
         const double kus         = get_parameter("understeer_gradient").as_double();   // L_eff = L + Kus*v^2 (P2)
-        const double kgate       = get_parameter("disturbance_curvature_gate").as_double();  // P1b
 
         const double v_fallback = std::max(0.5, v);  // used when no speed profile is available
 
@@ -596,14 +588,8 @@ private:
             for (int j = 0; j < n; j++)
                 G_psi_new[j] = G_psi[j] - v_k * dt / l_eff * G_delta[j];
 
-            // CTE_{k+1} = CTE_k + v_k * dPsi_k * dt + w_hat * w_gate * dt
-            // Rear-axle reference: steering reaches CTE only via heading (rel-degree 2).
-            // w_hat_ is the exogenous disturbance estimate (P1), applied through the
-            // per-step curvature gate (P1b) so it acts on straight horizon segments but
-            // fades out where the path curves.
-            const double w_gate = (kgate > 1e-9)
-                ? std::clamp(1.0 - std::abs(kappa) / kgate, 0.0, 1.0) : 1.0;
-            double c_cte_new = c_cte + v_k * c_psi * dt + w_hat_ * w_gate * dt;
+            // CTE_{k+1} = CTE_k + v_k*dPsi_k*dt + cte_int*dt
+            double c_cte_new = c_cte + v_k * c_psi * dt + cte_int_ * dt;
             std::vector<double> G_cte_new(n, 0.0);
             for (int j = 0; j < n; j++)
                 G_cte_new[j] = G_cte[j] + v_k * dt * G_psi[j];
@@ -812,7 +798,7 @@ private:
                 u_prev_       = 0.0;
                 u_prev_plus_  = 0.0;
                 u_prev_minus_ = 0.0;
-                w_hat_        = 0.0;
+                resetIntegrator();
             }
             publishPathVisualization();
             RCLCPP_INFO(get_logger(), "Path unloaded.");
@@ -832,6 +818,7 @@ private:
             u_prev_       = 0.0;
             u_prev_plus_  = 0.0;
             u_prev_minus_ = 0.0;
+            resetIntegrator();
         }
         publishPathVisualization();
         if (was_following) {
@@ -947,10 +934,10 @@ private:
         st.cte_m             = cte;
         st.heading_error_deg = dpsi * 180.0 / M_PI;
 
-        st.w_hat_mps         = w_hat_;
-        st.disturbance_bias_m = w_hat_ * N_ * DT;
-        st.disturbance_gate  = curv_gate_now;
-        st.integrator_frozen = mpc_dbg_.integrator_frozen;
+        st.cte_integrator_mps    = cte_int_;
+        st.cte_integrator_bias_m = cte_int_ * N_ * DT;
+        st.integrator_gate       = curv_gate_now;
+        st.integrator_frozen  = mpc_dbg_.integrator_frozen;
 
         st.kappa_rad_m       = path_.curvature(s_ref);
         st.l_eff_m           = l_eff_ref;
@@ -985,6 +972,14 @@ private:
         bd = kss_rad * (1.0 - ad);
     }
 
+    // Warm-start the CTE integrator to the known steady-state drift so it skips re-learning.
+    void resetIntegrator()
+    {
+        const double lim = get_parameter("cte_integral_limit").as_double();
+        cte_int_ = std::clamp(get_parameter("cte_drift_init").as_double(), -lim, lim);
+        RCLCPP_INFO(get_logger(), "CTE integrator reset: %.4f m/s", cte_int_);
+    }
+
     void publishPathVisualization()
     {
         if (path_.isEmpty()) return;
@@ -994,7 +989,12 @@ private:
         path_msg.header.frame_id = "map";
 
         const double total  = path_.totalLength();
-        const int    N_vis  = 200;
+        // Sample at a fixed spatial resolution so long paths stay smooth in
+        // Foxglove (a fixed point count would stretch the spacing on long paths
+        // and show straight chords between dots). Latched, published once per
+        // path load, so the point count is not a per-cycle cost.
+        const double VIS_RES_M = 0.05;                       // ~one pose every 0.05 m
+        int N_vis = std::max(2, static_cast<int>(total / VIS_RES_M) + 1);
         const double step   = total / (N_vis - 1);
 
         for (int i = 0; i < N_vis; ++i) {
@@ -1045,8 +1045,9 @@ private:
     double u_prev_       = 0.0;  // effective torque sent last step (ramped)
     double u_prev_plus_  = 0.0;  // positive component of u_prev_
     double u_prev_minus_ = 0.0;  // negative magnitude component of u_prev_
-    double w_hat_        = 0.0;  // estimated lateral-disturbance CTE drift [m/s] (offset-free MPC)
     int    N_            = 40;
+
+    double cte_int_ = 0.0;  // CTE integrator [m/s], warm-started on enable
 
     // Diagnostics filled by solveMpc, published on lateral_mpc/status each tick
     struct MpcDebug {
