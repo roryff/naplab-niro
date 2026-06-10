@@ -455,8 +455,7 @@ class DashboardNode(Node):
             _touch_topic("/vehicle/state")
             v = _state["vehicle"]
             v["v_ego_kmh"]         = round(float(msg.v_ego), 2)
-            # Negate: positive = left (CCW) to match conventional sign convention
-            v["steering_deg"]      = round(-float(msg.steering_angle_deg), 2)
+            v["steering_deg"]      = round(float(msg.steering_angle_deg), 2)
             v["wheel_left_mps"]    = round(float(msg.rear_wheel_speed_left), 3)
             v["wheel_right_mps"]   = round(float(msg.rear_wheel_speed_right), 3)
             v["lat_active"]        = bool(msg.lat_active)

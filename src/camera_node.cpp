@@ -31,6 +31,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <foxglove_msgs/msg/compressed_video.hpp>
+#include "car_control/rt_util.hpp"
 
 using Clock = std::chrono::steady_clock;
 using ms    = std::chrono::duration<double, std::milli>;
@@ -53,6 +54,10 @@ public:
         iface_  = declare_parameter<std::string>("multicast_iface", "enP2p1s0");
         frame_timeout_ms_   = declare_parameter<double>("frame_timeout_ms",   2000.0);
         restart_backoff_ms_ = declare_parameter<double>("restart_backoff_ms",  500.0);
+        // Real-time scheduling for the frame-pull thread. DISABLED by default (0):
+        // this is a throughput node whose CPU-bound thread should be PREEMPTED by
+        // the control nodes, not compete with them at RT. Enable only deliberately.
+        rt_priority_ = declare_parameter<int>("rt_priority", 0);
 
         pub_ = create_publisher<foxglove_msgs::msg::CompressedVideo>(topic_, 10);
 
@@ -199,6 +204,7 @@ private:
 
     void pull_loop()
     {
+        rt::set_realtime_priority(this->get_logger(), rt_priority_, "camera_pull");
         int    frame_count = 0;
         double sum_pull = 0, sum_pub = 0;
         double max_pull = 0, max_pub = 0;
@@ -277,6 +283,7 @@ private:
     int port_;
     double frame_timeout_ms_;
     double restart_backoff_ms_;
+    int rt_priority_;  // SCHED_FIFO priority for pull thread (0 = disabled)
 
     rclcpp::Publisher<foxglove_msgs::msg::CompressedVideo>::SharedPtr pub_;
     GstElement*  pipeline_ = nullptr;
@@ -291,7 +298,10 @@ RCLCPP_COMPONENTS_REGISTER_NODE(CameraNode)
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<CameraNode>());
+    auto node = std::make_shared<CameraNode>();
+    rt::set_realtime_priority(node->get_logger(),
+        node->get_parameter("rt_priority").as_int(), "camera_executor");
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
