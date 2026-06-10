@@ -90,24 +90,10 @@ target_link_libraries(comma_node ${cpp_typesupport_target})
 target_link_libraries(gnss_node ${cpp_typesupport_target})
 
 add_executable(path_follower_node src/path_follower_node.cpp)
-ament_target_dependencies(path_follower_node 
-  rclcpp 
-  std_msgs
-  sensor_msgs
-  nav_msgs 
-  geometry_msgs
-)
-target_link_libraries(path_follower_node ${cpp_typesupport_target})
+ament_target_dependencies(path_follower_node rclcpp std_msgs geometry_msgs nav_msgs)
+target_include_directories(path_follower_node PRIVATE ${osqp_SOURCE_DIR}/include)
+target_link_libraries(path_follower_node osqpstatic ${cpp_typesupport_target} Eigen3::Eigen)
 
-add_executable(steering_mpc_node src/steering_mpc_node.cpp)
-ament_target_dependencies(steering_mpc_node rclcpp std_msgs geometry_msgs)
-target_include_directories(steering_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
-target_link_libraries(steering_mpc_node osqpstatic ${cpp_typesupport_target})
-
-add_executable(lateral_mpc_node src/lateral_mpc_node.cpp)
-ament_target_dependencies(lateral_mpc_node rclcpp std_msgs geometry_msgs nav_msgs)
-target_include_directories(lateral_mpc_node PRIVATE ${osqp_SOURCE_DIR}/include)
-target_link_libraries(lateral_mpc_node osqpstatic ${cpp_typesupport_target} Eigen3::Eigen)
 add_executable(sysid_node src/sysid_node.cpp)
 ament_target_dependencies(sysid_node rclcpp std_msgs geometry_msgs)
 target_link_libraries(sysid_node ${cpp_typesupport_target})
@@ -148,8 +134,6 @@ install(TARGETS
   gnss_node
   comma_node
   path_follower_node
-  steering_mpc_node
-  lateral_mpc_node
   sysid_node
   camera_node
   foxglove_relay_node
@@ -166,10 +150,10 @@ install(TARGETS camera_node_component foxglove_relay_node_component
 # Install Python scripts
 install(PROGRAMS
   scripts/dashboard_server.py
-  scripts/Kia_niro_rosnode.py
-  scripts/Kia-rosnode_v2.py
-  scripts/nmpc_path_follower_node.py
-  scripts/nmpc_core.py
+  # scripts/Kia_niro_rosnode.py
+  # scripts/Kia-rosnode_v2.py
+  # scripts/nmpc_path_follower_node.py
+  # scripts/nmpc_core.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
