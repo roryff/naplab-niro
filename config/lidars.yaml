@@ -5,19 +5,22 @@
   ros__parameters:
     udp_dest: ''
     lidar_mode: ''
-    timestamp_mode: ''
+    # Stamp clouds/IMU with host ROS time so they share the GNSS /tf clock.
+    # Empty/sensor modes use the Ouster internal oscillator (seconds since power-on),
+    # which doesn't match utm32->base_link and pins clouds at the path origin in viz.
+    timestamp_mode: 'TIME_FROM_ROS_TIME'
     point_type: 'xyzir'
 
-/lidar_1/os_driver:
+/lidar_side/os_driver:
   ros__parameters:
-    sensor_hostname: '192.168.2.182'   # lidar_side
+    sensor_hostname: '192.168.2.181'
     sensor_frame: 'lidar_side/os_sensor'
     lidar_frame:  'lidar_side/os_lidar'
     imu_frame:    'lidar_side/os_imu'
 
-/lidar_2/os_driver:
+/lidar_top/os_driver:
   ros__parameters:
-    sensor_hostname: '192.168.2.206'   # lidar_top
+    sensor_hostname: '192.168.2.205'
     sensor_frame: 'lidar_top/os_sensor'
     lidar_frame:  'lidar_top/os_lidar'
     imu_frame:    'lidar_top/os_imu'

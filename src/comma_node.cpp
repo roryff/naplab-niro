@@ -16,6 +16,7 @@
 #include <mutex>
 #include <sys/mman.h>
 #include <iostream>
+#include "car_control/rt_util.hpp"
 
 using json = nlohmann::json;
 
@@ -30,7 +31,11 @@ public:
         this->declare_parameter("adb_host", "127.0.0.1");
         this->declare_parameter("adb_port", 5555);
         this->declare_parameter("reconnect_interval_sec", 5.0);
-        
+        // SCHED_FIFO priority for the link IO threads. High (80) so the 50 Hz
+        // command send and the sensor receive keep cadence under heavy load.
+        // Set 0 to disable real-time scheduling.
+        rt_priority_ = this->declare_parameter("rt_priority", 80);
+
         // Subscriber for control commands
         cmd_subscriber_ = this->create_subscription<car_control::msg::DriveCommand>(
             "cmd_vel", 10,
@@ -58,21 +63,15 @@ public:
         latest_state_.lat_active = false;         // bool
         latest_state_.long_active = false;        // bool
         
-        // Timer-based publisher at 50 Hz for smooth, jitter-free output
-        // Decouples receiving (minimal latency) from publishing (smooth rate)
-        publish_timer_ = this->create_wall_timer(
-            std::chrono::microseconds(20000),  // 50 Hz = 20ms = 20000us
-            std::bind(&CommaNode::timer_publish_callback, this));
-        
         // Start separate send and receive threads
         sender_thread_ = std::thread(&CommaNode::adb_sender_loop, this);
         reader_thread_ = std::thread(&CommaNode::adb_reader_loop, this);
         
         bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
         if (use_tcp_tunnel) {
-            RCLCPP_INFO(this->get_logger(), "Comma TCP Tunnel Node initialized (listening mode) with 50 Hz timer-based publishing");
+            RCLCPP_INFO(this->get_logger(), "Comma TCP Tunnel Node initialized (listening mode), publishing on data arrival");
         } else {
-            RCLCPP_INFO(this->get_logger(), "Comma ADB Node initialized with 50 Hz timer-based publishing");
+            RCLCPP_INFO(this->get_logger(), "Comma ADB Node initialized, publishing on data arrival");
         }
     }
     
@@ -101,6 +100,7 @@ public:
 private:
     void adb_sender_loop()
     {
+        rt::set_realtime_priority(this->get_logger(), rt_priority_, "comma_sender");
         // Drift-free 50 Hz loop: sleep_until advances an absolute deadline each tick.
         // Unlike sleep_for(remaining), this does NOT accumulate scheduler wake-up latency.
         auto next = std::chrono::steady_clock::now();
@@ -119,6 +119,7 @@ private:
     
     void adb_reader_loop()
     {
+        rt::set_realtime_priority(this->get_logger(), rt_priority_, "comma_reader");
         bool use_tcp_tunnel = this->get_parameter("use_tcp_tunnel").as_bool();
         
         if (use_tcp_tunnel) {
@@ -244,16 +245,22 @@ private:
     void optimize_socket(int fd)
     {
         // ===== LOW LATENCY SOCKET OPTIMIZATIONS =====
-        
-        // 1. Disable Nagle's algorithm - send small packets immediately
+
+        // 1. Disable Nagle's algorithm - send small packets immediately.
+        // This is what actually delivers low latency; it coalesces nothing.
         int nodelay = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        
-        // 2. Reduce socket buffer sizes to minimize buffering delay
-        int small_buffer = 8192;  // 8KB instead of default ~200KB
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small_buffer, sizeof(small_buffer));
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer));
-        
+
+        // 2. Do NOT shrink the receive buffer. A previous "optimization" set
+        // SO_RCVBUF to 8 KB, which holds only ~4 of the comma's ~2 KB sensor
+        // frames. When thor is under heavy load and the reader thread is
+        // scheduled late, that tiny buffer fills in ~80 ms, TCP flow control
+        // closes the window, and the comma's blocking sendall() stalls — which
+        // collapses its 50 Hz output and makes it look like the link died.
+        // Leaving SO_RCVBUF unset lets the kernel autotune (tcp_rmem) and absorb
+        // scheduling jitter without back-pressuring the comma. TCP_NODELAY above
+        // keeps latency low regardless of buffer size.
+
         // 3. Set socket priority for real-time traffic (requires CAP_NET_ADMIN or root)
         int priority = 6;  // High priority (0-7 scale)
         setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
@@ -460,10 +467,23 @@ private:
                 updated = true;
             }
             
+            // Publish on data arrival so /vehicle/state reflects the comma's true
+            // output rate. Previously a 50 Hz timer re-published the last state even
+            // when no fresh data had arrived, which made the dashboard report a
+            // steady 50 Hz while the comma was actually delivering data in sparse
+            // bursts (often <10 Hz). Publishing only when a message updates a field
+            // surfaces real dropouts instead of masking them with stale repeats.
             if (updated) {
                 ever_received_ = true;
+                latest_state_.header.stamp = this->now();
+                speed_publisher_->publish(latest_state_);
+
+                RCLCPP_DEBUG(this->get_logger(),
+                    "Published state: speed=%.2f km/h, steering=%.2f deg, ts=%ld ns",
+                    latest_state_.v_ego, latest_state_.steering_angle_deg,
+                    latest_state_.timestamp);
             }
-            
+
         } else if (msg_type == "pong") {
             RCLCPP_DEBUG(this->get_logger(), "Pong received");
         }
@@ -493,7 +513,7 @@ private:
         cmd["type"] = "joystick";
         cmd["axes"] = json::array({current_acceleration_, current_steering_});
         cmd["loggingEnabled"] = false;
-        cmd["time"] = rclcpp::Time().nanoseconds() / 1e9;
+        cmd["time"] = this->now().nanoseconds() / 1e9;
         cmd["seq"] = send_sequence_++;
         
         std::string cmd_str = cmd.dump() + "\n";
@@ -508,35 +528,16 @@ private:
         }
     }
     
-    // Timer callback - publishes at 50 Hz for smooth, jitter-free output
-    void timer_publish_callback()
-    {
-        std::lock_guard<std::mutex> lock(sensor_mutex_);
-        
-        if (!ever_received_) {
-            // Haven't received any data from comma yet - don't publish zeros
-            return;
-        }
-        
-        // Always publish latest state at steady 50 Hz (even if data unchanged since last tick)
-        // This keeps the dashboard Hz counter accurate and matches behaviour of all other nodes
-        latest_state_.header.stamp = this->now();
-        speed_publisher_->publish(latest_state_);
-        
-        RCLCPP_DEBUG(this->get_logger(),
-            "Published state: speed=%.2f km/h, steering=%.2f deg, ts=%ld ns",
-            latest_state_.v_ego, latest_state_.steering_angle_deg, latest_state_.timestamp);
-    }
 
     rclcpp::Subscription<car_control::msg::DriveCommand>::SharedPtr cmd_subscriber_;
     rclcpp::Publisher<car_control::msg::VehicleState>::SharedPtr speed_publisher_;
-    rclcpp::TimerBase::SharedPtr publish_timer_;
-    
+
     std::thread sender_thread_;
     std::thread reader_thread_;
     int socket_fd_;
     int listener_fd_;  // For TCP tunnel listen mode
     std::atomic<bool> running_;
+    int rt_priority_;  // SCHED_FIFO priority for link IO threads (0 = disabled)
     
     // Control state (for sending commands)
     std::mutex cmd_mutex_;
@@ -564,6 +565,11 @@ int main(int argc, char** argv)
     }
 
     auto node = std::make_shared<CommaNode>();
+
+    // Promote the executor thread (handles cmd_vel callbacks) to real-time.
+    rt::set_realtime_priority(node->get_logger(),
+        node->get_parameter("rt_priority").as_int(), "comma_executor");
+
     auto executor = rclcpp::executors::SingleThreadedExecutor();
     executor.add_node(node);
     executor.spin();

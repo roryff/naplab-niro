@@ -25,6 +25,7 @@
 #include <errno.h>
 #include "car_control/ubx_protocol.hpp"
 #include "car_control/geo_utils.hpp"
+#include "car_control/rt_util.hpp"
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -66,6 +67,10 @@ public:
         this->declare_parameter("host", "tppg2.lan");
         this->declare_parameter("port", 7799);
         this->declare_parameter("reconnect_interval_sec", 5.0);
+        // SCHED_FIFO priority for the UBX IO threads (10 Hz ESF-MEAS sender +
+        // receive/parse). Keeps the wheel-speed feed isochronous under load so
+        // the u-blox does not flag missing measurements. Set 0 to disable.
+        rt_priority_ = this->declare_parameter("rt_priority", 80);
         this->declare_parameter("auto_set_origin", true);
         this->declare_parameter("origin_lat", 0.0);
         this->declare_parameter("origin_lon", 0.0);
@@ -168,6 +173,7 @@ private:
      */
     void reader_loop()
     {
+        rt::set_realtime_priority(this->get_logger(), rt_priority_, "gnss_reader");
         while (running_) {
             if (socket_fd_ < 0) {
                 if (!running_) break;
@@ -861,6 +867,7 @@ private:
      */
     void sender_loop()
     {
+        rt::set_realtime_priority(this->get_logger(), rt_priority_, "gnss_sender");
         using namespace std::chrono;
         auto next = steady_clock::now();
 
@@ -980,7 +987,8 @@ private:
     std::thread reader_thread_;
     std::thread sender_thread_;
     std::atomic<bool> running_;
-    
+    int rt_priority_;  // SCHED_FIFO priority for UBX IO threads (0 = disabled)
+
     // UDP socket
     int socket_fd_;
     int reconnect_backoff_s_{2};  // exponential backoff: 2→4→8→16→30s, reset on connect
@@ -1026,7 +1034,10 @@ int main(int argc, char** argv)
             "mlockall failed: %s", strerror(errno));
     }
 
-    rclcpp::spin(std::make_shared<GNSSNode>());
+    auto node = std::make_shared<GNSSNode>();
+    rt::set_realtime_priority(node->get_logger(),
+        node->get_parameter("rt_priority").as_int(), "gnss_executor");
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }

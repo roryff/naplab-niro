@@ -62,7 +62,7 @@ def generate_launch_description():
     car_control_pkg_dir = get_package_share_directory('car_control')
     lidars_yaml = str(Path(car_control_pkg_dir) / 'config' / 'lidars.yaml')
 
-    sensors = ['lidar_1', 'lidar_2']  # lidar_3 (192.168.2.228) is in ERROR state
+    sensors = ['lidar_side', 'lidar_top']  # third sensor (192.168.2.228) is in ERROR state
 
     actions = []
     for ns in sensors:

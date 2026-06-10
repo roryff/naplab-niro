@@ -78,44 +78,44 @@
     <origin xyz="0.315595 0.001153 1.549018" rpy="0.0 0.0 0.0"/>
   </joint>
 
-  <!-- LiDAR 1 (side/rear, lidar_1 in rosbag topics) -->
-  <link name="lidar_1/os_sensor"/>
-  <joint name="base_link_to_lidar_1_os_sensor" type="fixed">
+  <!-- LiDAR side (side/rear, 192.168.2.181) -->
+  <link name="lidar_side/os_sensor"/>
+  <joint name="base_link_to_lidar_side_os_sensor" type="fixed">
     <parent link="base_link"/>
-    <child link="lidar_1/os_sensor"/>
+    <child link="lidar_side/os_sensor"/>
     <origin xyz="-0.579812 -0.820105 0.854643" rpy="0.0 0.0 -0.628322"/>
   </joint>
-  <link name="lidar_1/os_lidar"/>
-  <joint name="lidar_1_os_sensor_to_os_lidar" type="fixed">
-    <parent link="lidar_1/os_sensor"/>
-    <child link="lidar_1/os_lidar"/>
+  <link name="lidar_side/os_lidar"/>
+  <joint name="lidar_side_os_sensor_to_os_lidar" type="fixed">
+    <parent link="lidar_side/os_sensor"/>
+    <child link="lidar_side/os_lidar"/>
     <origin xyz="0.0 0.0 0.03618" rpy="0.0 0.0 3.141593"/>
   </joint>
-  <link name="lidar_1/os_imu"/>
-  <joint name="lidar_1_os_sensor_to_os_imu" type="fixed">
-    <parent link="lidar_1/os_sensor"/>
-    <child link="lidar_1/os_imu"/>
+  <link name="lidar_side/os_imu"/>
+  <joint name="lidar_side_os_sensor_to_os_imu" type="fixed">
+    <parent link="lidar_side/os_sensor"/>
+    <child link="lidar_side/os_imu"/>
     <origin xyz="0.006253 -0.011775 0.007645" rpy="0.0 0.0 0.0"/>
   </joint>
 
-  <!-- LiDAR 2 (top/roof, lidar_2 in rosbag topics) -->
-  <link name="lidar_2/os_sensor"/>
-  <joint name="base_link_to_lidar_2_os_sensor" type="fixed">
+  <!-- LiDAR top (top/roof, 192.168.2.205) -->
+  <link name="lidar_top/os_sensor"/>
+  <joint name="base_link_to_lidar_top_os_sensor" type="fixed">
     <parent link="base_link"/>
-    <child link="lidar_2/os_sensor"/>
+    <child link="lidar_top/os_sensor"/>
     <origin xyz="0.738882 0.006653 1.912894" rpy="0.053872 0.025846 0.000696"/>
   </joint>
-  <link name="lidar_2/os_lidar"/>
-  <joint name="lidar_2_os_sensor_to_os_lidar" type="fixed">
-    <parent link="lidar_2/os_sensor"/>
-    <child link="lidar_2/os_lidar"/>
+  <link name="lidar_top/os_lidar"/>
+  <joint name="lidar_top_os_sensor_to_os_lidar" type="fixed">
+    <parent link="lidar_top/os_sensor"/>
+    <child link="lidar_top/os_lidar"/>
     <!-- z=0.0743 matches original Ouster driver calibration from source bag -->
     <origin xyz="0.0 0.0 0.0743" rpy="0.0 0.0 3.141593"/>
   </joint>
-  <link name="lidar_2/os_imu"/>
-  <joint name="lidar_2_os_sensor_to_os_imu" type="fixed">
-    <parent link="lidar_2/os_sensor"/>
-    <child link="lidar_2/os_imu"/>
+  <link name="lidar_top/os_imu"/>
+  <joint name="lidar_top_os_sensor_to_os_imu" type="fixed">
+    <parent link="lidar_top/os_sensor"/>
+    <child link="lidar_top/os_imu"/>
     <origin xyz="0.006253 -0.011775 0.007645" rpy="0.0 0.0 0.0"/>
   </joint>
 </robot>

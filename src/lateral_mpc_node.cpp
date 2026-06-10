@@ -31,6 +31,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
+#include "car_control/rt_util.hpp"
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -1779,6 +1780,13 @@ int main(int argc, char** argv)
     }
 
     auto node = std::make_shared<LateralMpcNode>();
+
+    // Promote the executor thread to real-time so the control loop holds cadence
+    // under load. Below the comma/gnss link priority (80) so the link preempts a
+    // heavy MPC solve. Set rt_priority:=0 to disable.
+    rt::set_realtime_priority(node->get_logger(),
+        node->declare_parameter("rt_priority", 70), "lateral_mpc_executor");
+
     rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions{}, 2);
     exec.add_node(node);
     exec.spin();
