@@ -16,10 +16,10 @@ path_follower_node:
     # 250 + psi 10 + terminal×4 + a fast integral pushed past that → ~3 m swings on
     # the hard path. Reverted to near-original damped gains; bias is now handled by
     # the gentle disturbance estimator below, so high CTE gain is unnecessary.
-    weight_cte:    200.0   # Path3: model verified accurate (L_real~=L_eff), but corners held a
+    weight_cte:    1000.0   # Path3: model verified accurate (L_real~=L_eff), but corners held a
                            # standing +0.18 m parallel offset — psi damping tolerated it. Raise
                            # cte/psi ratio 4->6 to actively migrate back to the line (headroom exists).
-    weight_psi:    15.0    # restored — heading damping; the main stabiliser
+    weight_psi:    5.0    # restored — heading damping; the main stabiliser
     weight_torque: 0.005   # reverted — actuator can't chatter, so no anti-chatter penalty needed
     # NOTE: weight_delta, terminal_weight_factor, path_spline_knot_m, rate_rising,
     # rate_sinking, torque_limit and weight_complementarity are now compile-time
@@ -42,7 +42,7 @@ path_follower_node:
     # speed, so corner tracking is unchanged); decel raised modestly.
     speed_profile_decel_mps2:  0.4   # max deceleration for backward pass [m/s²]
     speed_profile_accel_mps2:  0.4   # max acceleration for forward pass  [m/s²]
-    curvature_speed_margin:    0.70 # was 0.75 — more headroom for torque-saturated corner peaks (P4)
+    curvature_speed_margin:    0.65 # was 0.75 — more headroom for torque-saturated corner peaks (P4)
     # ── Curvature-RATE (S-curve) speed limit ──────────────────────────────────
     # HardPath10 showed the worst CTE (|CTE| 0.176 vs 0.093 elsewhere, 16% rate-
     # limited) at turn->opposite-turn reversals: the actuator needs 0.5-0.7s to
@@ -55,7 +55,7 @@ path_follower_node:
     # headroom for feedback. Lower = slows more at S-curves. 0 = disabled.
     # NOTE: bounded below by v_ref_min_mps, so raise that floor's headroom if you
     # want deeper S-curve slowdowns.
-    curvature_rate_slew_budget_deg_s: 6.0
+    curvature_rate_slew_budget_deg_s: 12.0
     v_ref_min_mps:             3.0    # speed floor in profile [m/s]
     # Forward lookahead applied to the speed profile (Pass 4 in buildSpeedProfile).
     # For each waypoint, scans ahead by max(v_ref * lookahead_s, 20 m) and sets
@@ -64,7 +64,7 @@ path_follower_node:
     # through corner entries — preventing mid-corner acceleration.
     # A second backward pass (Pass 5) re-enforces the decel constraint.
     # 0 = disabled. 1.5 s is a good starting point.
-    speed_lookahead_s:         2.5
+    speed_lookahead_s:         0.0
 
     # ── Longitudinal acceleration feedforward ─────────────────────────────────
     # A pure-P speed controller lags the moving v_ref setpoint: LongPath8mpsFinal
@@ -78,6 +78,9 @@ path_follower_node:
     # brake. The FF picks the gain by the sign of the demanded acceleration.
     lon_accel_per_cmd:       2.0    # drive gain [m/s² per +cmd]
     lon_decel_per_cmd:       3.5    # brake gain [m/s² per -cmd]
+    accel_max_mps2:          0.7    # max drive accel [m/s²] → maps to +1.0 cmd
+    decel_max_mps2:          0.7    # max brake decel [m/s²] → maps to -1.0 cmd
+    accel_cmd_rate_per_s:    200.0    # jerk limit: max cmd change per second (4.0 → 0.2/tick at 20 Hz)
 
     # ── Offset-free disturbance estimator (P1) ────────────────────────────────
     # A leaky integral of the CTE error: d_cte += ki·cte·dt. This is the whole

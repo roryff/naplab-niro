@@ -312,6 +312,32 @@ public:
             v_ref_[i] = std::clamp(v_limit, v_min_mps, desired_speed_mps);
         }
 
+        // Pass 1b: corner plateau — flatten each corner to its minimum speed.
+        // A "corner" is any contiguous run of waypoints where v_ref < desired_speed_mps.
+        // Within each run find the minimum, then set every point in the run to that
+        // minimum.  This gives a flat bottom through the corner so dvds = 0 inside it;
+        // Passes 2/3 then build clean braking/accel ramps up to the plateau edges.
+        {
+            int i = 0;
+            while (i < n) {
+                if (v_ref_[i] < desired_speed_mps - 1e-6) {
+                    // found start of a corner region — scan to its end
+                    int j = i;
+                    double v_min_corner = v_ref_[i];
+                    while (j < n && v_ref_[j] < desired_speed_mps - 1e-6) {
+                        v_min_corner = std::min(v_min_corner, v_ref_[j]);
+                        j++;
+                    }
+                    // flatten the entire region to the minimum
+                    for (int k = i; k < j; k++)
+                        v_ref_[k] = v_min_corner;
+                    i = j;
+                } else {
+                    i++;
+                }
+            }
+        }
+
         // Pass 2: backward pass — braking constraint
         for (int i = n - 2; i >= 0; i--) {
             double ds      = s_[i + 1] - s_[i];

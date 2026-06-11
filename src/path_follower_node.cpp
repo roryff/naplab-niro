@@ -123,6 +123,9 @@ public:
         // Longitudinal plant is asymmetric: +1 cmd -> ~3.5 m/s², -1 cmd -> ~2.0 m/s².
         declare_parameter("lon_accel_per_cmd", 3.5);  // drive gain  [m/s² per +cmd]
         declare_parameter("lon_decel_per_cmd", 2.0);  // brake gain  [m/s² per -cmd]
+        declare_parameter("accel_max_mps2",    2.0);  // max drive acceleration [m/s²]
+        declare_parameter("decel_max_mps2",    3.5);  // max braking deceleration [m/s²]
+        declare_parameter("accel_cmd_rate_per_s", 4.0); // jerk limit: max cmd change per second
         declare_parameter("origin_lat", 0.0);
         declare_parameter("origin_lon", 0.0);
         // Speed-scheduled first-order (SchedFO2) actuator model breakpoints.
@@ -397,10 +400,9 @@ private:
             double dvds = (s_hi - s_lo > 1e-6)
                 ? (path_.vref(s_hi) - path_.vref(s_lo)) / (s_hi - s_lo) : 0.0;
             a_ff = path_.vref(s_ref) * dvds;   // [m/s^2]
-            a_ff = std::min(a_ff, 0.0);  // FF assists braking only; acceleration is P-only (smooth lag)
         }
-        // Asymmetric plant: divide by the brake gain (a_ff is always ≤ 0 here).
-        // Keep the accel branch for the lon_gain select in case ff_gain is ever re-enabled.
+        // Asymmetric plant: divide by the drive gain when speeding up, the brake
+        // gain when slowing down, so the FF command produces the planned m/s² either way.
         const double lon_gain = (a_ff >= 0.0)
             ? get_parameter("lon_accel_per_cmd").as_double()
             : get_parameter("lon_decel_per_cmd").as_double();
@@ -409,6 +411,16 @@ private:
         double accel_ff = (lon_gain > 1e-6) ? (ramp * ff_gain * a_ff / lon_gain) : 0.0;
         double accel_fb = kp_speed * (desired_speed - car_speed);
         double accel_cmd = std::clamp(accel_ff + accel_fb, -1.0, 1.0);
+
+        // Max cmd clamp (in m/s², mapped through asymmetric plant gains) then jerk limiter
+        const double cmd_max_pos = get_parameter("accel_max_mps2").as_double()
+                                   / get_parameter("lon_accel_per_cmd").as_double();
+        const double cmd_max_neg = get_parameter("decel_max_mps2").as_double()
+                                   / get_parameter("lon_decel_per_cmd").as_double();
+        accel_cmd = std::clamp(accel_cmd, -cmd_max_neg, cmd_max_pos);
+        const double max_delta = get_parameter("accel_cmd_rate_per_s").as_double() * DT;
+        accel_cmd = std::clamp(accel_cmd, prev_accel_cmd_ - max_delta, prev_accel_cmd_ + max_delta);
+        prev_accel_cmd_ = accel_cmd;
 
         // --- Publish ---------------------------------------------------------
         publishCmd(accel_cmd, torque_cmd);
@@ -1010,6 +1022,7 @@ private:
     double car_delta_rate_ = 0.0;   // steer rate [rad/s], estimated from history
     double prev_delta_rad_ = 0.0;
     double prev_delta_time_= 0.0;
+    double prev_accel_cmd_ = 0.0;  // for jerk limiting
     bool   gnss_valid_         = false;
 
     // MPC state
