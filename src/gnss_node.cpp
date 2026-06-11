@@ -492,6 +492,16 @@ private:
         // else: hold last valid heading (fusion momentarily unavailable)
         double enu_yaw = last_valid_enu_yaw_;
 
+        // headVeh is referenced to TRUE north, but position (east/north) lives in
+        // the UTM grid, whose north differs from true north by the grid convergence
+        // γ.  Rotate the heading into the grid frame so orientation and position
+        // share one frame: enu_yaw_grid = enu_yaw_true + γ.  γ is computed from the
+        // live lat/lon, so it stays correct anywhere (different latitude, or across
+        // a UTM zone).  Without this, the path follower's headingError() differences
+        // a grid-frame path tangent against a true-frame heading and sees a constant
+        // phantom γ (~1.27° at Trondheim → ~0.18 m/s of false cross-track drift).
+        enu_yaw += geo::utm32_convergence(navsat_msg.latitude, navsat_msg.longitude);
+
         // Correct antenna position to rear axle: antenna is antenna_forward_offset_m
         // ahead of the rear axle along the vehicle heading direction.
         double ant_offset = this->get_parameter("antenna_forward_offset_m").as_double();

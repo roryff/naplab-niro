@@ -74,13 +74,13 @@ path_follower_node:
     # so it doesn't re-learn from 0 — kills the ~60 s first-lap transient. The IMU
     # sideslip/yaw-discrepancy are measured ~0 in this regime and are NOT fed to the
     # controller — only published as diagnostics.
-    cte_integral_gain:   0.15   # [1/s] leaky-integral gain on CTE
+    cte_integral_gain:   0.0 #was 0.15   # [1/s] leaky-integral gain on CTE
     cte_integral_limit:  0.30   # [m/s] clamp on estimated drift (anti-windup)
-    cte_drift_init:     -0.12   # [m/s] warm-start value for d_cte on enable (converged drift)
-    # Freeze LEARNING (not applying) above this |kappa| so corner-transient CTE from hard
-    # tracking doesn't corrupt the estimate — learn on straights, apply everywhere.
-    # 0.02 rad/m ≈ R 50 m; raise to learn in gentler curves, 0 = learn everywhere.
-    learn_curvature_gate: 0.02  # [rad/m]
+    cte_drift_init:      0.0    # [m/s] warm-start value for d_cte on enable (converged drift)
+    # Freeze INTEGRATION (not application) above this |kappa| so corner-transient CTE from
+    # hard tracking doesn't corrupt the accumulated drift — integrate on straights, apply
+    # everywhere. 0.02 rad/m ≈ R 50 m; raise to integrate in gentler curves, 0 = always integrate.
+    integrator_curvature_gate: 0.02  # [rad/m]
 
     # ── Understeer-corrected feedforward (P2) ─────────────────────────────────
     # Effective wheelbase L_eff(v) = L + Kus*v^2 replaces the pure-Ackermann L in

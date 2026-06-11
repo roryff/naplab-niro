@@ -73,6 +73,40 @@ inline void latlon_to_utm32(
 }
 
 /**
+ * Grid convergence γ at a WGS-84 point for UTM zone 32N: the signed angle from
+ * grid (UTM) north to true north, in radians.  Positive east of the 9 °E central
+ * meridian on the northern hemisphere; at Trondheim (~10.4 °E) γ ≈ +1.27°.
+ *
+ * Add γ to a true-north-referenced ENU yaw to express it in the UTM grid frame,
+ * so a heading and a UTM position share one frame.  GRS80 ellipsoid, matching
+ * latlon_to_utm32.  Series truncated after the third-order term: error < 1 µrad
+ * anywhere in zone 32.
+ *
+ * @param lat_deg  Latitude  [degrees, WGS-84]
+ * @param lon_deg  Longitude [degrees, WGS-84]
+ * @return         Grid convergence γ [radians]
+ */
+inline double utm32_convergence(double lat_deg, double lon_deg)
+{
+    constexpr double a   = 6378137.0;
+    constexpr double f   = 1.0 / 298.257222101;
+    constexpr double e2  = 2.0 * f - f * f;
+    constexpr double ep2 = e2 / (1.0 - e2);          // second eccentricity squared
+    constexpr double lon0 = 9.0 * M_PI / 180.0;      // UTM zone 32 central meridian
+
+    const double phi  = lat_deg * M_PI / 180.0;
+    const double dlam = lon_deg * M_PI / 180.0 - lon0;
+
+    const double sin_phi = std::sin(phi);
+    const double cos_phi = std::cos(phi);
+    const double C = ep2 * cos_phi * cos_phi;
+
+    return dlam * sin_phi * (
+        1.0
+      + dlam * dlam / 3.0 * cos_phi * cos_phi * (1.0 + 3.0 * C + 2.0 * C * C));
+}
+
+/**
  * Legacy flat-Earth ENU helper (kept for reference; prefer latlon_to_utm32).
  */
 inline void latlon_to_enu(

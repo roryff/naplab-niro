@@ -139,7 +139,7 @@ public:
         declare_parameter("cte_integral_limit", 0.30);  // [m/s] anti-windup clamp
         declare_parameter("cte_drift_init",    -0.12);  // [m/s] warm-start on enable
         // Freeze integration above this |kappa|; learn on straights only. 0 = always learn.
-        declare_parameter("learn_curvature_gate", 0.02);  // [rad/m]
+        declare_parameter("integrator_curvature_gate", 0.02);  // [rad/m]
         // Understeer-corrected feedforward (P2): L_eff(v) = L + Kus*v^2
         declare_parameter("understeer_gradient", 0.003); // [s^2/m]
 
@@ -399,8 +399,8 @@ private:
         // I-term on CTE: cte_int_ += ki*cte*dt. Drives steady error to zero.
         // Frozen while saturated (anti-windup). Gates integration in corners
         // so actuator-lag transients don't corrupt the accumulated value.
-        const double learn_gate = get_parameter("learn_curvature_gate").as_double();
-        const bool in_turn = (learn_gate > 0.0) && (std::abs(kappa_ref) > learn_gate);
+        const double curv_gate = get_parameter("integrator_curvature_gate").as_double();
+        const bool in_turn = (curv_gate > 0.0) && (std::abs(kappa_ref) > curv_gate);
         mpc_dbg_.integrator_frozen = (std::abs(u_prev_) >= 0.97);   // saturation (diagnostic)
         if (state_ == State::FOLLOWING && !mpc_dbg_.integrator_frozen && !in_turn) {
             const double ki   = get_parameter("cte_integral_gain").as_double();
