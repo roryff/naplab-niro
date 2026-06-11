@@ -134,6 +134,7 @@ public:
         declare_parameter("curvature_speed_margin",   0.60);
         declare_parameter("curvature_rate_slew_budget_deg_s", 0.0);  // 0 = disabled
         declare_parameter("v_ref_min_mps",            2.5);
+        declare_parameter("speed_lookahead_s",        0.0);  // 0 = disabled
         // CTE integrator: cte_int_ += ki*cte*dt, frozen while saturated or in corners.
         // Warm-started to cte_drift_init so it skips the first-lap learning transient.
         declare_parameter("cte_integral_gain",  0.15);  // [1/s]
@@ -279,7 +280,7 @@ private:
                 RCLCPP_WARN(get_logger(), "Cannot start: path is empty.");
                 return;
             }
-            hint_rear_       = 0;
+            seedHintToNearestWaypoint();
             u_prev_          = 0.0;
             u_prev_plus_     = 0.0;
             u_prev_minus_    = 0.0;
@@ -396,9 +397,10 @@ private:
             double dvds = (s_hi - s_lo > 1e-6)
                 ? (path_.vref(s_hi) - path_.vref(s_lo)) / (s_hi - s_lo) : 0.0;
             a_ff = path_.vref(s_ref) * dvds;   // [m/s^2]
+            a_ff = std::min(a_ff, 0.0);  // FF assists braking only; acceleration is P-only (smooth lag)
         }
-        // Asymmetric plant: divide by the drive gain when speeding up, the brake
-        // gain when slowing down, so the FF command produces the planned m/s² either way.
+        // Asymmetric plant: divide by the brake gain (a_ff is always ≤ 0 here).
+        // Keep the accel branch for the lon_gain select in case ff_gain is ever re-enabled.
         const double lon_gain = (a_ff >= 0.0)
             ? get_parameter("lon_accel_per_cmd").as_double()
             : get_parameter("lon_decel_per_cmd").as_double();
@@ -795,6 +797,44 @@ private:
         applyPathSmoothing(filename.c_str(), count);
     }
 
+    void seedHintToNearestWaypoint()
+    {
+        const size_t n_wpts = path_.waypointCount();
+        if (n_wpts < 2) {
+            hint_rear_ = 0;
+            return;
+        }
+
+        double car_x = 0.0;
+        double car_y = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            car_x = car_x_;
+            car_y = car_y_;
+        }
+
+        // findClosest() searches forward from hint over a fixed local window,
+        // so do a one-time coarse global sweep at start to seed hint near the car.
+        static constexpr size_t SEARCH_WINDOW_SEGMENTS = 300;
+        size_t best_hint = 0;
+        double best_dist2 = std::numeric_limits<double>::max();
+
+        for (size_t start = 0; start + 1 < n_wpts; start += SEARCH_WINDOW_SEGMENTS) {
+            size_t h = start;
+            const double s = path_.findClosest(car_x, car_y, h);
+            auto [px, py] = path_.position(s);
+            const double d2 = (car_x - px) * (car_x - px) + (car_y - py) * (car_y - py);
+            if (d2 < best_dist2) {
+                best_dist2 = d2;
+                best_hint = h;
+            }
+        }
+
+        // Refine once from the best coarse window.
+        hint_rear_ = best_hint;
+        (void)path_.findClosest(car_x, car_y, hint_rear_);
+    }
+
     void applyPathSmoothing(const char* path_label, int waypoint_count)
     {
         if (PATH_SPLINE_KNOT_M > 0.0) {
@@ -822,7 +862,8 @@ private:
             get_parameter("speed_profile_accel_mps2").as_double(),
             get_parameter("curvature_speed_margin").as_double(),
             get_parameter("v_ref_min_mps").as_double(),
-            get_parameter("curvature_rate_slew_budget_deg_s").as_double() * (M_PI / 180.0));
+            get_parameter("curvature_rate_slew_budget_deg_s").as_double() * (M_PI / 180.0),
+            get_parameter("speed_lookahead_s").as_double());
         auto [kappa_max, v_min, v_max] = path_.speedProfileStats();
         RCLCPP_INFO(get_logger(),
             "Speed profile built: %.2f–%.2f m/s (min–max) over %.1f m. "
