@@ -21,22 +21,22 @@
  *
  * Publications:
  *   cmd_vel                       (car_control/DriveCommand) — accel [-1,1], torque [-1,1]
- *   lateral_mpc/cte_m             (std_msgs/Float64)
- *   lateral_mpc/heading_error_deg (std_msgs/Float64)
- *   lateral_mpc/desired_delta_deg (std_msgs/Float64)      — curvature-based feedforward [deg fw]
- *   lateral_mpc/actual_delta_deg  (std_msgs/Float64)      — measured front-axle steer [deg fw]
- *   lateral_mpc/torque_cmd        (std_msgs/Float64)
- *   lateral_mpc/progress_m        (std_msgs/Float64)
+ *   lateral_mpc/status            (car_control/MpcStatus) — full per-tick diagnostics
  *   path_following_status         (std_msgs/Bool)         — latched
  *   path_visualization            (nav_msgs/Path)         — latched
+ *
+ * MpcStatus is the single diagnostic message; the dashboard subscribes to it directly.
+ * The old per-signal topics — lateral_mpc/{cte_m,heading_error_deg,desired_delta_deg,
+ * actual_delta_deg,torque_cmd,progress_m,vref_mps}, plus lateral_error / heading_error /
+ * path_follower/cmd_vel — were removed, each being a strict subset of MpcStatus (e.g. the
+ * curvature feedforward is MpcStatus.desired_delta_deg). Offline analysis should read
+ * MpcStatus (recorded bags retain the old per-signal topics).
  */
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include "car_control/msg/drive_command.hpp"
 #include "car_control/msg/vehicle_state.hpp"
@@ -58,7 +58,7 @@
 #include <cstring>
 
 // ============================================================
-// sched_fo2 helpers (piecewise-linear interpolation)
+// scheduled speed model of torque->steering-angle 
 // ============================================================
 
 // Piecewise-linear interpolation with clamping at endpoints.
@@ -114,13 +114,15 @@ public:
             rclcpp::CallbackGroupType::MutuallyExclusive);
         // ---- Parameters --------------------------------------------------------
         declare_parameter("desired_speed_mps", 4.0);
-        declare_parameter("horizon",           40);
-        declare_parameter("weight_cte",        2.0);   // [1/m²]
-        declare_parameter("weight_psi",        1.0);   // [1/rad²]
-        declare_parameter("weight_torque",     0.1);
+        declare_parameter("horizon",           64);
+        declare_parameter("weight_cte",        120.0);   // [1/m²]
+        declare_parameter("weight_psi",        30.0);   // [1/rad²]
+        declare_parameter("weight_torque",     0.005);
         declare_parameter("kp_speed",          0.3);
-        declare_parameter<std::string>("path_csv_file", "");
-        declare_parameter<bool>("auto_enable", false);
+        declare_parameter("speed_feedforward_gain", 1.0);  
+        // Longitudinal plant is asymmetric: +1 cmd -> ~3.5 m/s², -1 cmd -> ~2.0 m/s².
+        declare_parameter("lon_accel_per_cmd", 3.5);  // drive gain  [m/s² per +cmd]
+        declare_parameter("lon_decel_per_cmd", 2.0);  // brake gain  [m/s² per -cmd]
         declare_parameter("origin_lat", 0.0);
         declare_parameter("origin_lon", 0.0);
         // Speed-scheduled first-order (SchedFO2) actuator model breakpoints.
@@ -129,10 +131,9 @@ public:
         declare_parameter<std::vector<double>>("sched_kss",   std::vector<double>{});
         declare_parameter("speed_profile_decel_mps2", 1.5);
         declare_parameter("speed_profile_accel_mps2", 0.5);
-        declare_parameter("curvature_speed_margin",   0.85);
+        declare_parameter("curvature_speed_margin",   0.60);
         declare_parameter("curvature_rate_slew_budget_deg_s", 0.0);  // 0 = disabled
-        declare_parameter("v_ref_min_mps",            0.5);
-        declare_parameter("speed_lookahead_s",        1.5);
+        declare_parameter("v_ref_min_mps",            2.5);
         // CTE integrator: cte_int_ += ki*cte*dt, frozen while saturated or in corners.
         // Warm-started to cte_drift_init so it skips the first-lap learning transient.
         declare_parameter("cte_integral_gain",  0.15);  // [1/s]
@@ -177,16 +178,6 @@ public:
         path_vis_pub_ = create_publisher<nav_msgs::msg::Path>(
             "path_visualization", latched_qos);
 
-        pub_cte_           = create_publisher<std_msgs::msg::Float64>("lateral_mpc/cte_m",             10);
-        pub_hdg_err_       = create_publisher<std_msgs::msg::Float64>("lateral_mpc/heading_error_deg", 10);
-        pub_desired_delta_ = create_publisher<std_msgs::msg::Float64>("lateral_mpc/desired_delta_deg", 10);
-        pub_actual_delta_  = create_publisher<std_msgs::msg::Float64>("lateral_mpc/actual_delta_deg",  10);
-        pub_torque_cmd_    = create_publisher<std_msgs::msg::Float64>("lateral_mpc/torque_cmd",        10);
-        pub_progress_      = create_publisher<std_msgs::msg::Float64>("lateral_mpc/progress_m",        10);
-        pub_vref_          = create_publisher<std_msgs::msg::Float64>("lateral_mpc/vref_mps",          10);
-        pub_lateral_error_ = create_publisher<std_msgs::msg::Float64>("lateral_error",                 10);
-        pub_heading_error_ = create_publisher<std_msgs::msg::Float64>("heading_error",                 10);
-        pub_pf_cmd_vel_    = create_publisher<geometry_msgs::msg::Twist>("path_follower/cmd_vel",       10);
         pub_status_full_   = create_publisher<car_control::msg::MpcStatus>("lateral_mpc/status",         10);
 
         // ---- Load-path subscription (runtime path switching) -----------------
@@ -206,15 +197,6 @@ public:
             }
         }
 
-        // ---- Build path --------------------------------------------------------
-        std::string csv_file = get_parameter("path_csv_file").as_string();
-        if (!csv_file.empty()) {
-            loadPathFromCSV(csv_file);
-            publishPathVisualization();
-        } else {
-            RCLCPP_INFO(get_logger(),
-                "No path loaded. Publish a CSV filename to ~/load_path to load one.");
-        }
 
         // ---- Control timer -----------------------------------------------------
         control_timer_ = create_wall_timer(
@@ -222,17 +204,7 @@ public:
             std::bind(&PathFollowerNode::controlLoop, this),
             timer_cb_group_);
 
-        auto_enable_ = get_parameter("auto_enable").as_bool();
 
-        RCLCPP_INFO(get_logger(),
-            "PathFollowerNode ready. Path: %.1f m  N=%d  spline_knot=%.2f m. "
-            "Publish 'true' on ~/enable_path_following to start.",
-            path_.totalLength(), N_, PATH_SPLINE_KNOT_M);
-
-        if (auto_enable_) {
-            RCLCPP_INFO(get_logger(),
-                "auto_enable=true: will start automatically after first GNSS fix.");
-        }
     }
 
     ~PathFollowerNode()
@@ -259,20 +231,8 @@ private:
             2.0*(q.w*q.z + q.x*q.y),
             1.0 - 2.0*(q.y*q.y + q.z*q.z));
 
-        bool was_valid = gnss_valid_;
         gnss_valid_ = true;
 
-        if (auto_enable_ && !was_valid && !auto_enable_fired_) {
-            auto_enable_fired_ = true;
-            auto_enable_timer_ = create_wall_timer(
-                std::chrono::seconds(1),
-                [this]() {
-                    auto_enable_timer_.reset();  // one-shot
-                    auto m = std::make_shared<std_msgs::msg::Bool>();
-                    m->data = true;
-                    enableCallback(m);
-                });
-        }
     }
 
     void vehicleStateCallback(const car_control::msg::VehicleState::SharedPtr msg)
@@ -400,13 +360,6 @@ private:
         // Frozen while saturated (anti-windup). Gates integration in corners
         // so actuator-lag transients don't corrupt the accumulated value.
         const double curv_gate = get_parameter("integrator_curvature_gate").as_double();
-        const bool in_turn = (curv_gate > 0.0) && (std::abs(kappa_ref) > curv_gate);
-        mpc_dbg_.integrator_frozen = (std::abs(u_prev_) >= 0.97);   // saturation (diagnostic)
-        if (state_ == State::FOLLOWING && !mpc_dbg_.integrator_frozen && !in_turn) {
-            const double ki   = get_parameter("cte_integral_gain").as_double();
-            const double wmax = get_parameter("cte_integral_limit").as_double();
-            cte_int_ = std::clamp(cte_int_ + ki * cte * DT, -wmax, wmax);
-        }
 
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
@@ -425,47 +378,44 @@ private:
         if (state_ == State::STOPPING) {
             desired_speed = 0.0;
         } else if (path_.hasSpeedProfile()) {
-            // Scan vref over [s_ref, s_ref + car_speed * lookahead_s] and take the
-            // minimum.  Time-based lookahead so the preview window scales with speed,
-            // giving a constant braking-time budget regardless of current velocity.
-            double lookahead_m = car_speed * get_parameter("speed_lookahead_s").as_double();
-            double s_end = std::min(s_ref + lookahead_m, path_.totalLength());
-            double v_lookahead = path_.vref(s_ref);
-            for (double ss = s_ref + 1.0; ss <= s_end; ss += 1.0)
-                v_lookahead = std::min(v_lookahead, path_.vref(ss));
-
-            desired_speed = std::max(v_lookahead, get_parameter("v_ref_min_mps").as_double());
+            desired_speed = std::max(path_.vref(s_ref),
+                                     get_parameter("v_ref_min_mps").as_double());
         } else {
             desired_speed = get_parameter("desired_speed_mps").as_double();
         }
-        double kp_speed = get_parameter("kp_speed").as_double();
-        double accel_cmd = std::clamp(kp_speed * (desired_speed - car_speed), -1.0, 1.0);
+        // Longitudinal command = feedforward + feedback.
+        //   FF: the acceleration the speed profile actually plans at this point,
+        //       a_ff = v_ref * dv_ref/ds (chain rule: dv/dt = dv/ds * ds/dt, ds/dt=v),
+        //       inverted through the longitudinal plant gain (accel_cmd -> m/s^2).
+        //   FB: kp on the speed error
+        double a_ff = 0.0;
+        if (state_ == State::FOLLOWING && path_.hasSpeedProfile()) {
+            const double h = 2.0;  // central-difference half-window [m]
+            double s_lo = std::max(0.0, s_ref - h);
+            double s_hi = std::min(path_.totalLength(), s_ref + h);
+            double dvds = (s_hi - s_lo > 1e-6)
+                ? (path_.vref(s_hi) - path_.vref(s_lo)) / (s_hi - s_lo) : 0.0;
+            a_ff = path_.vref(s_ref) * dvds;   // [m/s^2]
+        }
+        // Asymmetric plant: divide by the drive gain when speeding up, the brake
+        // gain when slowing down, so the FF command produces the planned m/s² either way.
+        const double lon_gain = (a_ff >= 0.0)
+            ? get_parameter("lon_accel_per_cmd").as_double()
+            : get_parameter("lon_decel_per_cmd").as_double();
+        const double ff_gain  = get_parameter("speed_feedforward_gain").as_double();
+        const double kp_speed = get_parameter("kp_speed").as_double();
+        double accel_ff = (lon_gain > 1e-6) ? (ramp * ff_gain * a_ff / lon_gain) : 0.0;
+        double accel_fb = kp_speed * (desired_speed - car_speed);
+        double accel_cmd = std::clamp(accel_ff + accel_fb, -1.0, 1.0);
 
         // --- Publish ---------------------------------------------------------
         publishCmd(accel_cmd, torque_cmd);
 
-        auto f64 = [](double v) { std_msgs::msg::Float64 m; m.data = v; return m; };
-        pub_cte_          ->publish(f64(cte));
-        pub_hdg_err_      ->publish(f64(dpsi * 180.0 / M_PI));
-        pub_desired_delta_->publish(f64(desired_delta_rad * 180.0 / M_PI));
-        pub_actual_delta_ ->publish(f64(car_delta * 180.0 / M_PI));
-        pub_torque_cmd_   ->publish(f64(torque_cmd));
-        pub_progress_     ->publish(f64(s_rear));
-        pub_vref_         ->publish(f64(desired_speed));
-
-        // Dashboard-compatible topics (mirror cascade node interface)
-        pub_lateral_error_->publish(f64(cte));
-        pub_heading_error_->publish(f64(dpsi));   // [rad] – dashboard calls math.degrees()
-        {
-            geometry_msgs::msg::Twist pf_cmd;
-            pf_cmd.linear.x  = desired_speed;
-            pf_cmd.angular.z = desired_delta_rad;  // front-axle [rad]
-            pub_pf_cmd_vel_->publish(pf_cmd);
-        }
-
+        // All controller diagnostics — 
         publishMpcStatus(s_rear, s_ref, desired_speed, car_speed, cte, dpsi,
-                         1.0 /*gate removed*/, l_eff_ref, desired_delta_rad,
-                         car_delta, car_delta_rate, torque_cmd);
+                         l_eff_ref, desired_delta_rad,
+                         car_delta, car_delta_rate, torque_cmd,
+                         accel_cmd);
 
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | dPsi=%.2f° | "
@@ -904,22 +854,12 @@ private:
 
     // Comprehensive per-tick diagnostics on lateral_mpc/status (MpcStatus).
     void publishMpcStatus(double s_rear, double s_ref, double desired_speed,
-                          double car_speed, double cte, double dpsi,
-                          double curv_gate_now, double l_eff_ref,
+                          double car_speed, double cte, double dpsi, double l_eff_ref,
                           double desired_delta_rad, double car_delta,
-                          double car_delta_rate, double torque_cmd)
+                          double car_delta_rate, double torque_cmd,
+                          double accel_cmd)
     {
-        // Feedforward torque (steady-state torque to hold desired_delta) and the
-        // actuator's approx max steer rate, from the SchedFO2 model at this speed.
-        double ff_torque = 0.0, steer_rate_limit = 0.0;
-        {
-            const double vk      = car_speed * 3.6;
-            const double kss     = schedInterp(sched_v_kmh_, sched_kss_, vk, 1.0);
-            const double kss_rad = kss * (M_PI / 180.0) / STEERING_RATIO;  // rad/torque
-            const double tau     = schedInterp(sched_v_kmh_, sched_tau_r_, vk, 0.05);
-            if (kss_rad > 1e-9) ff_torque = std::clamp(desired_delta_rad / kss_rad, -1.0, 1.0);
-            if (tau > 1e-6)     steer_rate_limit = (kss_rad / tau) * (180.0 / M_PI);
-        }
+
 
         car_control::msg::MpcStatus st;
         st.header.stamp = this->now();
@@ -930,28 +870,20 @@ private:
         st.path_length_m  = path_.totalLength();
         st.vref_mps       = desired_speed;
         st.v_ego_mps      = car_speed;
-
+        st.accel_cmd      = accel_cmd;
         st.cte_m             = cte;
         st.heading_error_deg = dpsi * 180.0 / M_PI;
-
         st.cte_integrator_mps    = cte_int_;
         st.cte_integrator_bias_m = cte_int_ * N_ * DT;
-        st.integrator_gate       = curv_gate_now;
-        st.integrator_frozen  = mpc_dbg_.integrator_frozen;
-
         st.kappa_rad_m       = path_.curvature(s_ref);
         st.l_eff_m           = l_eff_ref;
         st.desired_delta_deg = desired_delta_rad * 180.0 / M_PI;
         st.actual_delta_deg  = car_delta * 180.0 / M_PI;
         st.delta_error_deg   = (car_delta - desired_delta_rad) * 180.0 / M_PI;
-        st.ff_torque         = ff_torque;
         st.torque_cmd        = torque_cmd;
-        st.feedback_torque   = torque_cmd - ff_torque;
         st.torque_saturated  = std::abs(torque_cmd) > 0.97;
 
         st.steer_rate_deg_s       = car_delta_rate * 180.0 / M_PI;
-        st.steer_rate_limit_deg_s = steer_rate_limit;
-
         st.pred_terminal_cte_m       = mpc_dbg_.pred_terminal_cte;
         st.pred_terminal_heading_deg = mpc_dbg_.pred_terminal_psi * 180.0 / M_PI;
         st.solve_status   = mpc_dbg_.solve_status;
@@ -1038,8 +970,6 @@ private:
     double prev_delta_rad_ = 0.0;
     double prev_delta_time_= 0.0;
     bool   gnss_valid_         = false;
-    bool   auto_enable_        = false;
-    bool   auto_enable_fired_  = false;
 
     // MPC state
     double u_prev_       = 0.0;  // effective torque sent last step (ramped)
@@ -1055,7 +985,6 @@ private:
         double pred_terminal_psi = 0.0;
         int    solve_status      = 0;
         double solve_time_us     = 0.0;
-        bool   integrator_frozen = false;
     } mpc_dbg_;
 
     // SchedFO2 actuator model breakpoints (loaded from params at startup)
@@ -1084,20 +1013,9 @@ private:
     rclcpp::Publisher<car_control::msg::DriveCommand>::SharedPtr  cmd_vel_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr          path_vis_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr          status_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_cte_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_hdg_err_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_desired_delta_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_actual_delta_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_torque_cmd_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_progress_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_vref_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_lateral_error_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr       pub_heading_error_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr    pub_pf_cmd_vel_;
     rclcpp::Publisher<car_control::msg::MpcStatus>::SharedPtr  pub_status_full_;
 
     rclcpp::TimerBase::SharedPtr control_timer_;
-    rclcpp::TimerBase::SharedPtr auto_enable_timer_;
     rclcpp::CallbackGroup::SharedPtr timer_cb_group_;
 };
 

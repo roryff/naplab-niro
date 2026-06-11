@@ -9,6 +9,9 @@ float64 path_length_m
 float64 vref_mps               # commanded speed (profile + lookahead)
 float64 v_ego_mps              # measured speed
 
+# --- Longitudinal: feedforward vs feedback breakdown ---
+float64 accel_cmd              # total longitudinal command sent [-1,1]
+
 # --- Tracking errors (the things we want at zero) ---
 float64 cte_m                  # cross-track error (rear axle), + = car right of path
 float64 heading_error_deg      # + = car pointing right of path
@@ -16,8 +19,6 @@ float64 heading_error_deg      # + = car pointing right of path
 # CTE integrator
 float64 cte_integrator_mps             
 float64 cte_integrator_bias_m    
-float64 integrator_gate      
-bool    integrator_frozen      # true when anti-windup froze it (torque saturated)
 
 # --- Steering: feedforward vs feedback breakdown ---
 float64 kappa_rad_m            # path curvature at current projection
@@ -25,14 +26,11 @@ float64 l_eff_m                # effective wheelbase L + Kus*v^2 (understeer mod
 float64 desired_delta_deg      # FF steer = kappa * L_eff  (front axle)
 float64 actual_delta_deg       # measured front-axle steer
 float64 delta_error_deg        # actual - desired  (+ = over-steering FF)
-float64 ff_torque              # steady-state torque to hold desired_delta (actuator model)
 float64 torque_cmd             # total torque sent [-1,1]
-float64 feedback_torque        # torque_cmd - ff_torque  (the correction part)
 bool    torque_saturated       # |torque_cmd| > 0.97
 
 # --- Actuator rate (is it rate-limited here?) ---
 float64 steer_rate_deg_s       # measured d(delta)/dt
-float64 steer_rate_limit_deg_s # approx max achievable rate at this speed (model)
 
 # --- MPC internal prediction (does the MPC THINK it will converge?) ---
 float64 pred_terminal_cte_m    # predicted CTE at end of horizon under optimal solution
