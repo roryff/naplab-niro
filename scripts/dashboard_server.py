@@ -12,9 +12,8 @@ New ROS 2 topics consumed
 --------------------------
   /cmd_vel                   car_control/DriveCommand  – controller output
   /path_visualization        nav_msgs/Path            – ENU path waypoints
-  /lateral_error             std_msgs/Float64         – cross-track error [m]
-  /heading_error             std_msgs/Float64         – heading error [rad]
-  /path_following_status     std_msgs/Bool            – active flag
+  /lateral_mpc/status        car_control/MpcStatus    – CTE, heading, vref, desired steer
+  /path_following_status     std_msgs/Bool            – active flag (latched)
 
 HTTP endpoints
 --------------
@@ -27,11 +26,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import NavSatFix
-from geometry_msgs.msg import TwistStamped, PoseStamped, Twist, Vector3Stamped
+from geometry_msgs.msg import TwistStamped, PoseStamped, Vector3Stamped
 from car_control.msg import DriveCommand
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool, Float64, String
-from car_control.msg import VehicleState, EsfStatus
+from std_msgs.msg import Bool, String
+from car_control.msg import VehicleState, EsfStatus, MpcStatus
 
 import threading
 import json
@@ -119,11 +118,9 @@ _state = {
         "/gnss/esf_status":         {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/gyro":               {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/gnss/accel":              {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/path_follower/cmd_vel":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
+        "/lateral_mpc/status":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/cmd_vel":                 {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_visualization":      {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/lateral_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
-        "/heading_error":           {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
         "/path_following_status":   {"last_recv": None, "count": 0, "hz": 0.0, "_hz_window": []},
     },
 
@@ -434,13 +431,13 @@ class DashboardNode(Node):
         self.create_subscription(Vector3Stamped,  "/gnss/accel",      self._cb_accel,    10)
 
         # Path-follower topics
-        # path_follower/cmd_vel: desired steer angle [rad] + desired speed [m/s]
-        self.create_subscription(Twist,   "/path_follower/cmd_vel",  self._cb_pf_cmd,    10)
+        # lateral_mpc/status: CTE [m], heading error [deg], vref [m/s], desired steer [deg].
+        # Single diagnostic message; replaces the old lateral_error / heading_error /
+        # path_follower/cmd_vel Float64+Twist topics (all subsets of MpcStatus).
+        self.create_subscription(MpcStatus, "/lateral_mpc/status",    self._cb_mpc_status, 10)
         # cmd_vel: MPC torque [-1,1] + accel command [-1,1]
         self.create_subscription(DriveCommand, "/cmd_vel",            self._cb_cmd_vel,   10)
         self.create_subscription(Path,    "/path_visualization",     self._cb_path,      latched_qos)
-        self.create_subscription(Float64, "/lateral_error",          self._cb_lat_err,   10)
-        self.create_subscription(Float64, "/heading_error",          self._cb_hdg_err,   10)
         self.create_subscription(Bool,    "/path_following_status",  self._cb_pf_status, latched_qos)
 
         # Publisher – allows dashboard to start/stop path following
@@ -539,15 +536,23 @@ class DashboardNode(Node):
 
     # ── Path-follower callbacks ──────────────────────────────────────────────
 
-    def _cb_pf_cmd(self, msg: Twist):
-        """path_follower/cmd_vel: angular.z = desired front-axle angle [rad], linear.x = speed [m/s]"""
+    def _cb_mpc_status(self, msg: MpcStatus):
+        """lateral_mpc/status: per-tick controller diagnostics (CTE, heading, vref, desired steer).
+        Single source for what used to arrive on lateral_error / heading_error /
+        path_follower/cmd_vel. desired_delta_deg and heading_error_deg are already in
+        degrees, so no conversion is needed here."""
         with _state_lock:
-            _touch_topic("/path_follower/cmd_vel")
+            _touch_topic("/lateral_mpc/status")
             c = _state["controller"]
-            c["target_speed_mps"] = round(float(msg.linear.x), 3)
-            deg = math.degrees(float(msg.angular.z))  # positive = left
-            c["target_steer_deg"] = round(deg, 3)
-            _push_history(c["steer_cmd_history"], deg)
+            c["target_speed_mps"]  = round(float(msg.vref_mps), 3)
+            steer_deg = float(msg.desired_delta_deg)            # positive = left
+            c["target_steer_deg"]  = round(steer_deg, 3)
+            _push_history(c["steer_cmd_history"], steer_deg)
+            c["lateral_error_m"]   = round(float(msg.cte_m), 4)
+            _push_history(c["lat_err_history"], float(msg.cte_m))
+            hdg_deg = float(msg.heading_error_deg)
+            c["heading_error_deg"] = round(hdg_deg, 3)
+            _push_history(c["hdg_err_history"], hdg_deg)
 
     def _cb_cmd_vel(self, msg: DriveCommand):
         """cmd_vel: torque [-1,1], accel cmd [-1,1]"""
@@ -557,20 +562,6 @@ class DashboardNode(Node):
             c["mpc_torque"]    = round(float(msg.torque), 4)
             c["mpc_accel_cmd"] = round(float(msg.accel), 3)
             _push_history(c["torque_history"], float(msg.torque))
-
-    def _cb_lat_err(self, msg: Float64):
-        with _state_lock:
-            _touch_topic("/lateral_error")
-            c = _state["controller"]
-            c["lateral_error_m"] = round(float(msg.data), 4)
-            _push_history(c["lat_err_history"], float(msg.data))
-
-    def _cb_hdg_err(self, msg: Float64):
-        with _state_lock:
-            _touch_topic("/heading_error")
-            c = _state["controller"]
-            c["heading_error_deg"] = round(math.degrees(float(msg.data)), 3)
-            _push_history(c["hdg_err_history"], math.degrees(float(msg.data)))
 
     def _cb_pf_status(self, msg: Bool):
         with _state_lock:

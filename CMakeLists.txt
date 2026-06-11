@@ -94,10 +94,6 @@ ament_target_dependencies(path_follower_node rclcpp std_msgs geometry_msgs nav_m
 target_include_directories(path_follower_node PRIVATE ${osqp_SOURCE_DIR}/include)
 target_link_libraries(path_follower_node osqpstatic ${cpp_typesupport_target} Eigen3::Eigen)
 
-add_executable(sysid_node src/sysid_node.cpp)
-ament_target_dependencies(sysid_node rclcpp std_msgs geometry_msgs)
-target_link_libraries(sysid_node ${cpp_typesupport_target})
-
 add_executable(camera_node src/camera_node.cpp)
 ament_target_dependencies(camera_node rclcpp rclcpp_components sensor_msgs foxglove_msgs)
 target_include_directories(camera_node PRIVATE ${GST_INCLUDE_DIRS})
@@ -134,7 +130,6 @@ install(TARGETS
   gnss_node
   comma_node
   path_follower_node
-  sysid_node
   camera_node
   foxglove_relay_node
   DESTINATION lib/${PROJECT_NAME}
