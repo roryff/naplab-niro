@@ -31,7 +31,7 @@
 // ============================================================
 // Vehicle constants (shared by Path and the controller node)
 // ============================================================
-static constexpr double WHEELBASE      = 2.79;    // Kia Niro [m]
+static constexpr double WHEELBASE      = 2.70;    // Kia Niro [m]
 static constexpr double STEERING_RATIO = 13.3;    // sw-deg per road-wheel deg (measured; 460°/34.6°)
 
 // ============================================================
@@ -96,6 +96,11 @@ public:
     double totalLength() const
     {
         return s_.empty() ? 0.0 : s_.back();
+    }
+
+    size_t waypointCount() const
+    {
+        return wpts_.size();
     }
 
     /** Find arc-length of closest point to (qx, qy). Updates hint in place. */
@@ -234,7 +239,8 @@ public:
         double accel_mps2,
         double margin_factor,
         double v_min_mps,
-        double slew_budget_radps)
+        double slew_budget_radps,
+        double speed_lookahead_s = 0.0)
     {
         const int n = static_cast<int>(wpts_.size());
         v_ref_.resize(n);
@@ -276,9 +282,23 @@ public:
             // large — exactly where the rate-limited actuator must reverse fastest.
             // Cap the demanded slew at slew_budget_radps to give it time/distance:
             //   v ≤ slew_budget / (L·|dκ/ds|).
+            //
+            // IMPORTANT: use a ±3 m distance-based window to compute dκ/ds, not
+            // index ±1. Index ±1 is only ~0.2 m on a dense path and measures noise
+            // (max dkappa/ds 600+ rad/m²), which slew-caps 87 % of waypoints to
+            // v_min regardless of actual path curvature. A 3 m window reduces that
+            // to ~17 % and gives physically meaningful S-curve slowdowns only.
             if (slew_budget_radps > 1e-9 && n >= 3) {
-                const int  ip  = std::min(i + 1, n - 1);
-                const int  im  = std::max(i - 1, 0);
+                constexpr double SLEW_HALF_WINDOW_M = 3.0;
+                // Find indices ±3 m from current arc-length
+                const double s_lo = s_[i] - SLEW_HALF_WINDOW_M;
+                const double s_hi = s_[i] + SLEW_HALF_WINDOW_M;
+                // Lower bound: walk backward
+                int im = i;
+                while (im > 0     && s_[im - 1] >= s_lo) --im;
+                // Upper bound: walk forward
+                int ip = i;
+                while (ip < n - 1 && s_[ip + 1] <= s_hi) ++ip;
                 const double dss = s_[ip] - s_[im];
                 if (dss > 1e-6) {
                     const double dkappa_ds =
@@ -304,6 +324,29 @@ public:
             double ds      = s_[i] - s_[i - 1];
             double v_accel = std::sqrt(v_ref_[i - 1] * v_ref_[i - 1] + 2.0 * accel_mps2 * ds);
             v_ref_[i] = std::min(v_ref_[i], v_accel);
+        }
+
+        // Pass 4: time-based forward lookahead — for each waypoint, scan ahead by
+        // max(v_ref[i] * lookahead_s, 20 m) and pull v_ref[i] down to the minimum
+        // over that window.  The 20 m floor ensures the scan always reaches into the
+        // braking ramp even at low speed, keeping dvds ≤ 0 through corner entries so
+        // the FF term a_ff = v·dv/ds never commands acceleration mid-corner.
+        // A re-run of the backward pass (Pass 5) then ensures decel feasibility.
+        constexpr double LOOKAHEAD_MIN_M = 20.0;
+        if (speed_lookahead_s > 1e-6) {
+            for (int i = 0; i < n; i++) {
+                double lookahead_m = std::max(v_ref_[i] * speed_lookahead_s, LOOKAHEAD_MIN_M);
+                double s_end = s_[i] + lookahead_m;
+                for (int j = i + 1; j < n && s_[j] <= s_end; j++)
+                    v_ref_[i] = std::min(v_ref_[i], v_ref_[j]);
+            }
+
+            // Pass 5: backward pass again to restore braking feasibility after lookahead
+            for (int i = n - 2; i >= 0; i--) {
+                double ds      = s_[i + 1] - s_[i];
+                double v_brake = std::sqrt(v_ref_[i + 1] * v_ref_[i + 1] + 2.0 * decel_mps2 * ds);
+                v_ref_[i] = std::min(v_ref_[i], v_brake);
+            }
         }
 
         for (auto& vv : v_ref_) vv = std::max(vv, v_min_mps);
