@@ -327,15 +327,12 @@ public:
         }
 
         // Pass 4: time-based forward lookahead — for each waypoint, scan ahead by
-        // max(v_ref[i] * lookahead_s, 20 m) and pull v_ref[i] down to the minimum
-        // over that window.  The 20 m floor ensures the scan always reaches into the
-        // braking ramp even at low speed, keeping dvds ≤ 0 through corner entries so
-        // the FF term a_ff = v·dv/ds never commands acceleration mid-corner.
+        // v_ref[i] * lookahead_s metres (pure time window: same seconds regardless of
+        // speed) and pull v_ref[i] down to the minimum over that window.
         // A re-run of the backward pass (Pass 5) then ensures decel feasibility.
-        constexpr double LOOKAHEAD_MIN_M = 20.0;
         if (speed_lookahead_s > 1e-6) {
             for (int i = 0; i < n; i++) {
-                double lookahead_m = std::max(v_ref_[i] * speed_lookahead_s, LOOKAHEAD_MIN_M);
+                double lookahead_m = v_ref_[i] * speed_lookahead_s;
                 double s_end = s_[i] + lookahead_m;
                 for (int j = i + 1; j < n && s_[j] <= s_end; j++)
                     v_ref_[i] = std::min(v_ref_[i], v_ref_[j]);

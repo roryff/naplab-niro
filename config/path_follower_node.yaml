@@ -40,8 +40,8 @@ path_follower_node:
     # car sat below 4 m/s ~40% of the hard path (the "slows more than it needs to").
     # accel raised most (faster recovery after corners — does NOT raise corner-entry
     # speed, so corner tracking is unchanged); decel raised modestly.
-    speed_profile_decel_mps2:  0.8   # max deceleration for backward pass [m/s²]
-    speed_profile_accel_mps2:  0.5   # max acceleration for forward pass  [m/s²]
+    speed_profile_decel_mps2:  0.4   # max deceleration for backward pass [m/s²]
+    speed_profile_accel_mps2:  0.4   # max acceleration for forward pass  [m/s²]
     curvature_speed_margin:    0.70 # was 0.75 — more headroom for torque-saturated corner peaks (P4)
     # ── Curvature-RATE (S-curve) speed limit ──────────────────────────────────
     # HardPath10 showed the worst CTE (|CTE| 0.176 vs 0.093 elsewhere, 16% rate-
@@ -64,7 +64,7 @@ path_follower_node:
     # through corner entries — preventing mid-corner acceleration.
     # A second backward pass (Pass 5) re-enforces the decel constraint.
     # 0 = disabled. 1.5 s is a good starting point.
-    speed_lookahead_s:         1.5
+    speed_lookahead_s:         2.5
 
     # ── Longitudinal acceleration feedforward ─────────────────────────────────
     # A pure-P speed controller lags the moving v_ref setpoint: LongPath8mpsFinal
