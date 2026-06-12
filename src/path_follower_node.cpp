@@ -426,8 +426,12 @@ private:
         // d = delta - L_eff*psidot/v: the steer that produces no yaw. LPF'd and
         // clamped; fed into the MPC psi dynamics so it commands extra steer to
         // cancel. Updated only at speed (division by v) and while following.
+        // Gated by the soft-start ramp: right after enable v is barely above the
+        // gate and the start transient leaks ~1 deg of fake disturbance into the
+        // LPF (verified in observer_replay.png); learn only once fully ramped.
         const double obs_gain = get_parameter("dist_obs_gain").as_double();
-        if (state_ == State::FOLLOWING && car_speed > 2.0 && obs_gain > 0.0) {
+        if (state_ == State::FOLLOWING && car_speed > 2.0 && obs_gain > 0.0
+            && ramp >= 1.0) {
             const double obs_tau = std::max(DT, get_parameter("dist_obs_tau_s").as_double());
             const double obs_max = get_parameter("dist_obs_max_deg").as_double() * M_PI / 180.0;
             const double d_raw   = car_delta - l_eff_ref * yaw_rate / car_speed;
