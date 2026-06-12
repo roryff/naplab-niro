@@ -38,3 +38,7 @@ float64 pred_terminal_heading_deg
 int32   solve_status           # OSQP status_val
 float64 solve_time_us
 int32   horizon
+
+# --- Friction-aware steering (stiction fix) ---
+float64 friction_comp          # signed breakaway assist added on top of the MPC torque
+float64 dist_delta_deg         # yaw-rate observer: steer-equivalent disturbance (camber, slip)

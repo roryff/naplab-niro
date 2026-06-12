@@ -152,3 +152,44 @@ path_follower_node:
                                      # Fix R alone → +0.025 deg mean (near zero). With Kus=0.010 the
                                      # corrected corner mean becomes +0.139 deg (slight over-steer).
                                      # RETUNE: reduce toward 0.003-0.005 after running a test bag.
+
+    # ── Friction-aware steering (stiction fix) ─────────────────────────────────
+    # longFFFinalTuneTune analysis: every limit-cycling corner (rostime 52-62,
+    # 125-138, 143-154) runs at 13-16 km/h with moderate hold torques. There the
+    # real rack LOADS 2-7x slower than the step-test SchedFO2 model (rate ratio
+    # 0.14 in the worst corner, even saturated), freezes outright for up to 2.4 s
+    # (stiction), then snaps back at >20 deg/s once the torque crosses the friction
+    # band. Result: torque builds too late -> understeer -> saturation -> snap ->
+    # repeat. The sharp corner at rostime 261-270 tracks at <=7 cm because it runs
+    # at 10.5-11 km/h with sustained near-saturated torque: big-signal regime where
+    # the step-identified model is accurate and stiction never engages.
+    #
+    # tau_load_scale: tau multiplier for horizon steps where |kappa| RISES along
+    # the preview (corner entries). K_ss equilibrium unchanged; the model just
+    # stops believing loading is fast, so the plan builds torque earlier and
+    # harder. Release keeps nominal tau (reality IS fast there — pessimism would
+    # release early and undershoot the exit). 1.0 = off.
+    tau_load_scale:            1.8
+    # Breakaway assist: extra torque ramped in when the model expects wheel motion
+    # but the measured rate says stuck; dropped to zero the instant motion starts
+    # (kinetic friction is low — leftover assist feeds the snap). Keyed on intended
+    # motion, NOT tracking error: errors are still ~0 when stiction first bites.
+    # The MPC is not told about the assist (u_prev_ stays its own command); the
+    # assist's job is to make the real plant behave like the linear model.
+    friction_comp_max:         0.20   # assist cap [torque units]
+    friction_comp_rate:        0.40   # assist ramp rate [torque/s]; escalation finds
+                                      # the breakaway band (~0.1-0.3, not constant)
+    friction_plan_rate_min_deg_s: 1.5 # model wants motion above this [front-axle deg/s]
+    friction_meas_rate_max_deg_s: 0.8 # considered stuck while measured rate below this
+    friction_stuck_ticks:      4      # consecutive ticks (x50 ms) before assist engages
+
+    # ── Yaw-rate disturbance observer (camber / crown / slip) ──────────────────
+    # d = delta_meas - L_eff*psidot_gyro/v : the steer that produces no yaw.
+    # Low-passed, clamped, fed into the MPC psi dynamics (effective steer =
+    # delta - d) so the controller commands extra steer to cancel it. Works IN
+    # corners (unlike the curvature-gated CTE integrator) and reacts in ~tau_s
+    # instead of waiting for CTE to accumulate. The cambered corner (rostime
+    # 52-62) measures d = +0.2..+0.45 deg; straights ~0.
+    dist_obs_gain:             1.0    # 0 = observer off
+    dist_obs_tau_s:            2.0    # LPF time constant [s]
+    dist_obs_max_deg:          1.5    # clamp [front-axle deg]

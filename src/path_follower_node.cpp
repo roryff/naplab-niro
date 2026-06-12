@@ -36,6 +36,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 #include "car_control/msg/drive_command.hpp"
@@ -153,6 +154,43 @@ public:
         // Understeer-corrected feedforward (P2): L_eff(v) = L + Kus*v^2
         declare_parameter("understeer_gradient", 0.003); // [s^2/m]
 
+        // ── Friction-aware steering (stiction fix) ─────────────────────────────
+        // Bag analysis (longFFFinalTuneTune): while LOADING (|δ| moving away from
+        // centre) the real rack is 2-7x slower than the step-test SchedFO2 model
+        // (rate ratio 0.14-0.74 at 13-16 km/h); during RELEASE it first sticks,
+        // then snaps at >20 °/s. The symmetric model is optimistic exactly where
+        // the MPC operates → torque builds too late → understeer → saturation →
+        // snap-back limit cycle every corner.
+        // tau_load_scale: multiply tau for horizon steps where |kappa| is RISING
+        // along the preview (corner entries). K_ss (equilibrium) is unchanged —
+        // the model just stops believing loading is fast, so the optimal plan
+        // builds torque earlier and harder. Release steps keep nominal tau
+        // (reality is fast there; pessimism would cause early release + exit
+        // undershoot). 1.0 = off.
+        declare_parameter("tau_load_scale", 1.8);
+        // Breakaway assist: when the model expects the wheel to move
+        // (|K_ss*u - delta|/tau above the plan threshold) but the measured rate
+        // says it is stuck, ramp a small extra torque in the intended direction
+        // until motion starts, then drop it INSTANTLY (kinetic friction is low;
+        // leftover assist would feed the snap). Keyed on intended MOTION, not
+        // tracking error — errors are still ~0 when stiction first bites.
+        declare_parameter("friction_comp_max", 0.20);        // assist cap [torque]
+        declare_parameter("friction_comp_rate", 0.40);       // assist ramp [torque/s]
+        declare_parameter("friction_plan_rate_min_deg_s", 1.5);  // model wants motion above this
+        declare_parameter("friction_meas_rate_max_deg_s", 0.8);  // stuck below this
+        declare_parameter("friction_stuck_ticks", 4);        // consecutive ticks before assist
+
+        // ── Yaw-rate disturbance observer (camber, crown, slip) ───────────────
+        // d = delta_meas - L_eff*psidot_gyro/v : the part of the measured steer
+        // that produces no yaw. Low-passed and fed into the MPC psi dynamics so
+        // the controller commands extra steer to cancel it. Unlike the CTE
+        // integrator it works IN corners (no curvature gate) and reacts in
+        // ~dist_obs_tau_s instead of waiting for CTE to accumulate. Measured
+        // +0.2..+0.45 deg on the cambered corner (ros 52-62), ~0 elsewhere.
+        declare_parameter("dist_obs_gain", 1.0);    // 0 = observer off
+        declare_parameter("dist_obs_tau_s", 2.0);   // LPF time constant [s]
+        declare_parameter("dist_obs_max_deg", 1.5); // clamp [front-axle deg]
+
         N_ = static_cast<int>(std::max(1L, std::min(get_parameter("horizon").as_int(), (int64_t)64)));
 
         // ---- Actuator model (speed-scheduled first-order, SchedFO2) ------------
@@ -177,6 +215,10 @@ public:
         enable_sub_ = create_subscription<std_msgs::msg::Bool>(
             "enable_path_following", 10,
             std::bind(&PathFollowerNode::enableCallback, this, std::placeholders::_1));
+
+        gyro_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
+            "gnss/gyro", rclcpp::SensorDataQoS(),
+            std::bind(&PathFollowerNode::gyroCallback, this, std::placeholders::_1));
 
         // ---- Publishers --------------------------------------------------------
         cmd_vel_pub_ = create_publisher<car_control::msg::DriveCommand>("cmd_vel", 10);
@@ -265,6 +307,12 @@ private:
         car_delta_rad_   = new_delta;
     }
 
+    void gyroCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        yaw_rate_radps_ = msg->vector.z;   // ENU: +z = CCW (left turn)
+    }
+
     void enableCallback(const std_msgs::msg::Bool::SharedPtr msg)
     {
         if (!msg->data) {
@@ -292,6 +340,9 @@ private:
             u_prev_          = 0.0;
             u_prev_plus_     = 0.0;
             u_prev_minus_    = 0.0;
+            dist_delta_rad_  = 0.0;
+            friction_comp_   = 0.0;
+            stuck_ticks_     = 0;
             resetIntegrator();
             path_start_time_ = this->now();
             state_           = State::FOLLOWING;
@@ -314,7 +365,7 @@ private:
     {
         if (state_ == State::IDLE) return;
 
-        double car_x, car_y, car_heading, car_speed, car_delta, car_delta_rate;
+        double car_x, car_y, car_heading, car_speed, car_delta, car_delta_rate, yaw_rate;
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             car_x          = car_x_;
@@ -323,6 +374,7 @@ private:
             car_speed      = car_speed_mps_;
             car_delta      = car_delta_rad_;
             car_delta_rate = car_delta_rate_;
+            yaw_rate       = yaw_rate_radps_;
         }
 
         // --- Stopping check --------------------------------------------------
@@ -370,17 +422,71 @@ private:
         // so actuator-lag transients don't corrupt the accumulated value.
         const double curv_gate = get_parameter("integrator_curvature_gate").as_double();
 
+        // --- Yaw-rate disturbance observer (camber etc.) ----------------------
+        // d = delta - L_eff*psidot/v: the steer that produces no yaw. LPF'd and
+        // clamped; fed into the MPC psi dynamics so it commands extra steer to
+        // cancel. Updated only at speed (division by v) and while following.
+        const double obs_gain = get_parameter("dist_obs_gain").as_double();
+        if (state_ == State::FOLLOWING && car_speed > 2.0 && obs_gain > 0.0) {
+            const double obs_tau = std::max(DT, get_parameter("dist_obs_tau_s").as_double());
+            const double obs_max = get_parameter("dist_obs_max_deg").as_double() * M_PI / 180.0;
+            const double d_raw   = car_delta - l_eff_ref * yaw_rate / car_speed;
+            dist_delta_rad_ += (DT / obs_tau) * (d_raw - dist_delta_rad_);
+            dist_delta_rad_  = std::clamp(dist_delta_rad_, -obs_max, obs_max);
+        }
+        const double d_delta = obs_gain * dist_delta_rad_;
+
         // --- Solve MPC -------------------------------------------------------
         double torque_cmd = 0.0;
         if (state_ == State::FOLLOWING) {
             double out_plus = 0.0, out_minus = 0.0;
             torque_cmd = ramp * solveMpc(cte, dpsi, car_delta,
-                                         car_speed, s_ref, out_plus, out_minus);
+                                         car_speed, s_ref, d_delta,
+                                         out_plus, out_minus);
             u_prev_plus_  = ramp * out_plus;
             u_prev_minus_ = ramp * out_minus;
         }
         torque_cmd = std::clamp(torque_cmd, -1.0, 1.0);
         u_prev_    = torque_cmd;
+
+        // --- Breakaway assist (stick-slip compensation) ------------------------
+        // Keyed on intended MOTION (model-expected steer rate under the command),
+        // not on tracking error — errors are still near zero when stiction first
+        // bites. While stuck, ramp extra torque in the intended direction; the
+        // moment the wheel moves, drop it (kinetic friction is low — leftover
+        // assist would feed the snap-back). The MPC keeps seeing its own command
+        // (u_prev_ above): the assist exists to make the real plant behave like
+        // the linear model, not to be part of the plan.
+        double torque_out = torque_cmd;
+        if (state_ == State::FOLLOWING) {
+            const double tau_v   = schedInterp(sched_v_kmh_, sched_tau_r_, car_speed * 3.6, 0.05);
+            const double kss_rad = schedInterp(sched_v_kmh_, sched_kss_,   car_speed * 3.6, 1.0)
+                                   * (M_PI / 180.0) / STEERING_RATIO;
+            const double plan_rate = (kss_rad * torque_cmd - car_delta) / tau_v;  // [rad/s]
+            const double plan_min  = get_parameter("friction_plan_rate_min_deg_s").as_double() * M_PI / 180.0;
+            const double meas_max  = get_parameter("friction_meas_rate_max_deg_s").as_double() * M_PI / 180.0;
+            const bool wants_motion = std::abs(plan_rate) > plan_min;
+            const bool moving       = std::abs(car_delta_rate) > meas_max;
+            const int  dir          = (plan_rate > 0.0) ? 1 : -1;
+
+            if (wants_motion && !moving) {
+                if (dir != stuck_dir_) { stuck_ticks_ = 0; friction_comp_ = 0.0; }
+                stuck_dir_ = dir;
+                stuck_ticks_++;
+                if (stuck_ticks_ >= get_parameter("friction_stuck_ticks").as_int()) {
+                    friction_comp_ = std::min(
+                        get_parameter("friction_comp_max").as_double(),
+                        friction_comp_ + get_parameter("friction_comp_rate").as_double() * DT);
+                }
+            } else {
+                stuck_ticks_   = 0;
+                friction_comp_ = 0.0;   // moving (or no motion wanted): kinetic regime, no assist
+            }
+            torque_out = std::clamp(torque_cmd + stuck_dir_ * friction_comp_, -1.0, 1.0);
+        } else {
+            stuck_ticks_   = 0;
+            friction_comp_ = 0.0;
+        }
 
         // --- Speed P-controller ----------------------------------------------
         double desired_speed;
@@ -428,13 +534,14 @@ private:
         prev_accel_cmd_ = accel_cmd;
 
         // --- Publish ---------------------------------------------------------
-        publishCmd(accel_cmd, torque_cmd);
+        publishCmd(accel_cmd, torque_out);
 
-        // All controller diagnostics — 
+        // All controller diagnostics — torque_cmd field carries what was SENT
+        // (incl. breakaway assist); the assist itself is in friction_comp.
         publishMpcStatus(s_rear, s_ref, desired_speed, car_speed, cte, dpsi,
                          l_eff_ref, desired_delta_rad,
-                         car_delta, car_delta_rate, torque_cmd,
-                         accel_cmd);
+                         car_delta, car_delta_rate, torque_out,
+                         accel_cmd, stuck_dir_ * friction_comp_, d_delta);
 
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
             "[%s]  s=%.1f/%.1f m | CTE=%.3f m | dPsi=%.2f° | "
@@ -471,7 +578,7 @@ private:
     // =========================================================================
 
     double solveMpc(double cte0, double dpsi0, double delta0,
-                    double v,    double s_ref,
+                    double v,    double s_ref, double d_delta,
                     double& out_u_plus, double& out_u_minus)
     {
         const int n  = N_;
@@ -486,6 +593,7 @@ private:
         const double w_psi       = get_parameter("weight_psi").as_double();
         const double w_t         = get_parameter("weight_torque").as_double();
         const double kus         = get_parameter("understeer_gradient").as_double();   // L_eff = L + Kus*v^2 (P2)
+        const double tau_load    = get_parameter("tau_load_scale").as_double();        // loading-phase tau multiplier
 
         const double v_fallback = std::max(0.5, v);  // used when no speed profile is available
 
@@ -530,9 +638,18 @@ private:
             // Curvature feedforward at the predicted position for this step
             double kappa = path_.curvature(std::min(s_k, path_.totalLength()));
 
+            // Loading vs release classification by curvature-magnitude trend
+            // along the preview: |kappa| rising = corner entry = the wheel must
+            // move away from centre against friction + self-aligning torque —
+            // the regime where the step-test model is 2-7x optimistic. Release
+            // (|kappa| falling) keeps nominal tau: reality is fast there.
+            const double kappa_next =
+                path_.curvature(std::min(s_k + v_k * dt, path_.totalLength()));
+            const bool loading = std::abs(kappa_next) > std::abs(kappa) + 1e-5;
+
             // Per-step actuator coefficients at the predicted speed
             double ad_k, bd_k;
-            schedFo2Coeffs(v_k * 3.6, ad_k, bd_k);
+            schedFo2Coeffs(v_k * 3.6, ad_k, bd_k, loading ? tau_load : 1.0);
 
             // ---- Actuator model: delta_{k+1} = ad_k*delta_k + bd_k*u_ratelimit_k ----
             double c_delta_new = ad_k * c_delta + bd_k * c_torque;
@@ -552,7 +669,11 @@ private:
             // corners. Using L_eff makes the model demand (and the MPC command) the
             // true steer. The path yaw-rate term kappa*v is geometric — left as-is.
             const double l_eff = WHEELBASE + kus * v_k * v_k;
-            double c_psi_new = c_psi - (v_k * c_delta / l_eff - kappa * v_k) * dt;
+            // d_delta: steer-equivalent disturbance (yaw-rate observer; camber
+            // etc.) — the part of delta that produces no yaw, so the effective
+            // steer is (delta - d). Constant over the horizon; shifts only the
+            // propagation constant, sensitivities are unchanged.
+            double c_psi_new = c_psi - (v_k * (c_delta - d_delta) / l_eff - kappa * v_k) * dt;
             std::vector<double> G_psi_new(n, 0.0);
             for (int j = 0; j < n; j++)
                 G_psi_new[j] = G_psi[j] - v_k * dt / l_eff * G_delta[j];
@@ -919,7 +1040,7 @@ private:
                           double car_speed, double cte, double dpsi, double l_eff_ref,
                           double desired_delta_rad, double car_delta,
                           double car_delta_rate, double torque_cmd,
-                          double accel_cmd)
+                          double accel_cmd, double friction_comp, double d_delta)
     {
 
 
@@ -951,14 +1072,18 @@ private:
         st.solve_status   = mpc_dbg_.solve_status;
         st.solve_time_us  = mpc_dbg_.solve_time_us;
         st.horizon        = N_;
+        st.friction_comp  = friction_comp;
+        st.dist_delta_deg = d_delta * 180.0 / M_PI;
 
         pub_status_full_->publish(st);
     }
 
     // SchedFO2 actuator coefficients at speed v_kmh: delta[k+1] = ad*delta[k] + bd*u[k].
-    void schedFo2Coeffs(double v_kmh, double& ad, double& bd) const
+    // tau_scale stretches the time constant (loading-phase pessimism) while
+    // leaving the K_ss equilibrium untouched.
+    void schedFo2Coeffs(double v_kmh, double& ad, double& bd, double tau_scale = 1.0) const
     {
-        const double tau_v  = schedInterp(sched_v_kmh_, sched_tau_r_, v_kmh, 0.05);
+        const double tau_v  = schedInterp(sched_v_kmh_, sched_tau_r_, v_kmh, 0.05) * tau_scale;
         const double kss_v  = schedInterp(sched_v_kmh_, sched_kss_,   v_kmh, 1.0);
         // Convert K_ss from [sw-deg/torque] to [front-axle rad/torque].
         const double kss_rad = kss_v * (M_PI / 180.0) / STEERING_RATIO;
@@ -1029,6 +1154,7 @@ private:
     double car_speed_mps_  = 0.0;
     double car_delta_rad_  = 0.0;   // front-axle steer angle [rad]
     double car_delta_rate_ = 0.0;   // steer rate [rad/s], estimated from history
+    double yaw_rate_radps_ = 0.0;   // gyro yaw rate [rad/s], ENU +z = CCW
     double prev_delta_rad_ = 0.0;
     double prev_delta_time_= 0.0;
     double prev_accel_cmd_ = 0.0;  // for jerk limiting
@@ -1041,6 +1167,12 @@ private:
     int    N_            = 40;
 
     double cte_int_ = 0.0;  // CTE integrator [m/s], warm-started on enable
+
+    // Friction-aware steering state
+    double dist_delta_rad_ = 0.0;  // yaw-rate observer: steer-equivalent disturbance [rad]
+    double friction_comp_  = 0.0;  // breakaway assist magnitude [torque]
+    int    stuck_ticks_    = 0;    // consecutive stuck ticks
+    int    stuck_dir_      = 1;    // intended motion direction while stuck
 
     // Diagnostics filled by solveMpc, published on lateral_mpc/status each tick
     struct MpcDebug {
@@ -1071,6 +1203,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  gnss_pose_sub_;
     rclcpp::Subscription<car_control::msg::VehicleState>::SharedPtr   vehicle_state_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              enable_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr gyro_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr            load_path_sub_;
 
     rclcpp::Publisher<car_control::msg::DriveCommand>::SharedPtr  cmd_vel_pub_;
