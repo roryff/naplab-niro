@@ -47,6 +47,7 @@ public:
         wpts_.clear();
         s_.clear();
         v_ref_.clear();
+        in_curve_.clear();
         knots_.clear();
         cx_.resize(0);
         cy_.resize(0);
@@ -240,7 +241,11 @@ public:
         double margin_factor,
         double v_min_mps,
         double slew_budget_radps,
-        double speed_lookahead_s = 0.0)
+        double speed_lookahead_s = 0.0,
+        double curve_hold_kappa_radpm = 0.0,   // 0 = curvature-hold disabled
+        double s_turn_bridge_m = 0.0,          // bridge gap across a sign reversal
+        double curve_bridge_m = 0.0,           // bridge gap between same-sign bends
+        double jerk_mps3 = 0.0)                // 0 = jerk-limiting (Pass 6) disabled
     {
         const int n = static_cast<int>(wpts_.size());
         v_ref_.resize(n);
@@ -312,29 +317,55 @@ public:
             v_ref_[i] = std::clamp(v_limit, v_min_mps, desired_speed_mps);
         }
 
-        // Pass 1b: corner plateau — flatten each corner to its minimum speed.
-        // A "corner" is any contiguous run of waypoints where v_ref < desired_speed_mps.
-        // Within each run find the minimum, then set every point in the run to that
-        // minimum.  This gives a flat bottom through the corner so dvds = 0 inside it;
-        // Passes 2/3 then build clean braking/accel ramps up to the plateau edges.
-        {
+        // Pass 1b: constant-speed curve zones (with S-turn merging).
+        //
+        // A waypoint is "in a curve" if the path is meaningfully bent there
+        // (|kappa| > curve_hold_kappa_radpm) OR its Pass-1 speed was already capped
+        // below cruise. Contiguous in-curve waypoints form a zone; the zone is then
+        // frozen to its slowest point so speed is held CONSTANT through the bend
+        // instead of being accelerated through the middle (Pass 3 below also forbids
+        // acceleration inside a zone, so even a light bend that never caps v_ref is
+        // taken at constant speed rather than accelerating through it).
+        //
+        // Crucially, two zones separated by a near-straight GAP are MERGED into one
+        // when the gap is short enough — so the two opposite-sign lobes of an S-turn,
+        // which are split by the |kappa|~=0 inflection, become a SINGLE zone held at
+        // the slower lobe's speed (no speed recovery at the inflection). A wider
+        // budget is allowed across a sign reversal (s_turn_bridge_m) than between
+        // same-sign bends (curve_bridge_m).
+        //
+        // `in_curve_` records the merged zones for Pass 3.
+        in_curve_.assign(n, 0);
+        if (curve_hold_kappa_radpm > 0.0) {
+            std::vector<char> bent(n, 0);
+            for (int i = 0; i < n; i++) {
+                const bool is_bent    = std::abs(curvature(s_[i])) > curve_hold_kappa_radpm;
+                const bool is_limited = v_ref_[i] < desired_speed_mps - 1e-6;
+                bent[i] = (is_bent || is_limited) ? 1 : 0;
+            }
             int i = 0;
             while (i < n) {
-                if (v_ref_[i] < desired_speed_mps - 1e-6) {
-                    // found start of a corner region — scan to its end
-                    int j = i;
-                    double v_min_corner = v_ref_[i];
-                    while (j < n && v_ref_[j] < desired_speed_mps - 1e-6) {
-                        v_min_corner = std::min(v_min_corner, v_ref_[j]);
-                        j++;
-                    }
-                    // flatten the entire region to the minimum
-                    for (int k = i; k < j; k++)
-                        v_ref_[k] = v_min_corner;
-                    i = j;
-                } else {
-                    i++;
+                if (!bent[i]) { i++; continue; }
+                const int zs = i;       // zone start
+                int ze = i;             // last confirmed in-curve index of the zone
+                int j = i + 1;
+                while (j < n) {
+                    if (bent[j]) { ze = j; j++; continue; }
+                    // gap: find the next bent waypoint and decide whether to bridge it
+                    int k = j;
+                    while (k < n && !bent[k]) k++;
+                    if (k >= n) break;
+                    const double gap      = s_[k] - s_[ze];
+                    const bool   reversal = (curvature(s_[ze]) * curvature(s_[k])) < 0.0;
+                    const double max_gap  = reversal ? s_turn_bridge_m : curve_bridge_m;
+                    if (gap <= max_gap) { j = k; }   // bridge: extend the zone
+                    else break;
                 }
+                // freeze [zs, ze] to its slowest point and mark the merged zone
+                double v_zone = desired_speed_mps;
+                for (int k = zs; k <= ze; k++) v_zone = std::min(v_zone, v_ref_[k]);
+                for (int k = zs; k <= ze; k++) { v_ref_[k] = v_zone; in_curve_[k] = 1; }
+                i = ze + 1;
             }
         }
 
@@ -345,10 +376,14 @@ public:
             v_ref_[i] = std::min(v_ref_[i], v_brake);
         }
 
-        // Pass 3: forward pass — acceleration constraint
+        // Pass 3: forward pass — acceleration constraint.
+        // Inside a curve zone (Pass 1b) acceleration is disabled (a = 0), so the car
+        // carries its entry speed flat through the bend rather than accelerating
+        // through it; on straights the normal accel limit applies.
         for (int i = 1; i < n; i++) {
             double ds      = s_[i] - s_[i - 1];
-            double v_accel = std::sqrt(v_ref_[i - 1] * v_ref_[i - 1] + 2.0 * accel_mps2 * ds);
+            double a       = (i < n && in_curve_[i]) ? 0.0 : accel_mps2;
+            double v_accel = std::sqrt(v_ref_[i - 1] * v_ref_[i - 1] + 2.0 * a * ds);
             v_ref_[i] = std::min(v_ref_[i], v_accel);
         }
 
@@ -369,6 +404,78 @@ public:
                 double ds      = s_[i + 1] - s_[i];
                 double v_brake = std::sqrt(v_ref_[i + 1] * v_ref_[i + 1] + 2.0 * decel_mps2 * ds);
                 v_ref_[i] = std::min(v_ref_[i], v_brake);
+            }
+        }
+
+        // Pass 6: jerk-limited smoothing — round the acceleration steps.
+        // Passes 2/3 bound |a| but step it discontinuously between ±limit and 0 at
+        // every plateau edge (corner entry/exit, cruise top before a turn). The FF
+        // (a_ff = v_ref·dv/ds) reproduces that step, so the car jerks at each v_ref
+        // peak. This spreads each step into a ramp whose spatial slope keeps the
+        // longitudinal jerk (≈ v·da/ds) under jerk_mps3, by iterating:
+        //   (a) smooth the segment acceleration over a jerk-derived distance window,
+        //   (b) re-integrate v from the start, (c) clamp to the feasible envelope
+        //       (never speed up past Pass 2-5), (d) re-enforce braking feasibility.
+        // The result is always ≤ the pre-filter profile, so corner-speed and braking
+        // limits are preserved; corners are taken slightly slower (rounded). Offline
+        // on longFFFinalTuneTune: FF-scale peak jerk 1.57 → 0.43 m/s³.
+        if (jerk_mps3 > 1e-9 && n >= 3) {
+            std::vector<double> v_env = v_ref_;
+            std::vector<double> smid(n - 1), a(n - 1), a_s(n - 1);
+            for (int i = 0; i < n - 1; i++) smid[i] = 0.5 * (s_[i] + s_[i + 1]);
+            // Representative window to spread a full accel↔decel step into a ramp:
+            // da = accel+decel, time to ramp = da/jerk, distance ≈ v·da/jerk.
+            const double da     = accel_mps2 + decel_mps2;
+            const double win_m  = std::clamp(desired_speed_mps * da / jerk_mps3, 1.0, 8.0);
+            // Relax the clamp envelope at curve-hold SHOULDERS: a hard flat plateau
+            // (corner-hold zone, often pinned at v_min) lets the braking ramp meet it
+            // with a sharp da step → a jerk spike at the curve-hold ENTRY (the speed
+            // can't dip below the floor to round the corner). Lifting the envelope to
+            // max(v_env, mean(v_env over ±win_m)) rounds the inner corners of each
+            // plateau (lets v ease into the hold ~0.1 m/s above the floor for a few
+            // metres) WITHOUT lowering peaks — max() keeps any local maximum intact.
+            {
+                std::vector<double> v_relax(n);
+                int lo = 0, hi = 0; double run = v_env[0];
+                for (int i = 0; i < n; i++) {
+                    while (lo < i     && s_[i] - s_[lo] > win_m) { run -= v_env[lo]; lo++; }
+                    while (hi < n - 1 && s_[hi + 1] - s_[i] <= win_m) { hi++; run += v_env[hi]; }
+                    if (hi < lo) { hi = lo; run = v_env[lo]; }
+                    v_relax[i] = std::max(v_env[i], run / std::max(hi - lo + 1, 1));
+                }
+                v_env.swap(v_relax);
+            }
+            constexpr int ITERS = 24;
+            for (int it = 0; it < ITERS; it++) {
+                for (int i = 0; i < n - 1; i++) {
+                    const double ds = s_[i + 1] - s_[i];
+                    a[i] = (v_ref_[i + 1] * v_ref_[i + 1] - v_ref_[i] * v_ref_[i]) / (2.0 * ds);
+                }
+                // distance-average a over ±win_m (two-pointer; s_ is monotone)
+                int lo = 0, hi = 0;
+                double run = a[0];  // running sum a[lo..hi], inclusive
+                for (int i = 0; i < n - 1; i++) {
+                    while (lo < i        && smid[i] - smid[lo] > win_m) { run -= a[lo]; lo++; }
+                    while (hi < n - 2    && smid[hi + 1] - smid[i] <= win_m) { hi++; run += a[hi]; }
+                    if (hi < lo) { hi = lo; run = a[lo]; }
+                    a_s[i] = run / std::max(hi - lo + 1, 1);
+                }
+                // re-integrate forward (free), THEN clamp to the envelope. Clamping
+                // as-you-go would feed the clamped value back as the next base and
+                // ratchet the whole profile down toward v_min over the iterations.
+                for (int i = 1; i < n; i++) {
+                    const double ds = s_[i] - s_[i - 1];
+                    v_ref_[i] = std::sqrt(std::max(
+                        v_ref_[i - 1] * v_ref_[i - 1] + 2.0 * a_s[i - 1] * ds,
+                        v_min_mps * v_min_mps));
+                }
+                for (int i = 0; i < n; i++) v_ref_[i] = std::min(v_ref_[i], v_env[i]);
+                // re-enforce braking feasibility
+                for (int i = n - 2; i >= 0; i--) {
+                    const double ds = s_[i + 1] - s_[i];
+                    v_ref_[i] = std::min(v_ref_[i],
+                                         std::sqrt(v_ref_[i + 1] * v_ref_[i + 1] + 2.0 * decel_mps2 * ds));
+                }
             }
         }
 
@@ -467,6 +574,7 @@ private:
     std::vector<std::pair<double,double>> wpts_;
     std::vector<double>                   s_;
     std::vector<double>                   v_ref_;
+    std::vector<char>                     in_curve_;   // Pass 1b constant-speed curve zones
 
     // ── Cubic B-spline geometry (filled by smoothSpline) ──────────────────
     // Persisting these lets the controller evaluate κ analytically instead

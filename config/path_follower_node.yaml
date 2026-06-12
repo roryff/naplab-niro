@@ -42,6 +42,18 @@ path_follower_node:
     # speed, so corner tracking is unchanged); decel raised modestly.
     speed_profile_decel_mps2:  0.4   # max deceleration for backward pass [m/s²]
     speed_profile_accel_mps2:  0.4   # max acceleration for forward pass  [m/s²]
+    # ── Jerk-limited profile (Pass 6) ─────────────────────────────────────────
+    # The accel/decel passes above are jerk-UNBOUNDED: at every plateau edge (corner
+    # entry/exit, cruise top before a turn) the planned acceleration steps between
+    # ±limit and 0, so the FF (a_ff = v_ref·dv/ds) reproduces that step → a jerk
+    # spike at the v_ref peaks. Pass 6 spreads each step into a ramp bounded by this
+    # jerk budget (rounds the v_ref corners; profile stays ≤ the feasible envelope).
+    # The smoothing window ≈ v·(accel+decel)/jerk, so LOWER jerk = wider window =
+    # smoother but it also eats narrow peaks (J=1.0 crushed the s≈330 peak 4.9→3.6).
+    # J=2.0 (window ~3.2 m) keeps peaks (s≈330: 4.3) and caps FF-scale jerk uniformly
+    # at ~0.43 m/s³ (trapezoidal was 1.57), corner tops and entry bottoms alike.
+    # Raise toward the accel/decel-implied peak jerk to preserve peaks further; 0 = off.
+    speed_profile_jerk_mps3:   2.0   # [m/s³] longitudinal jerk budget for the profile
     curvature_speed_margin:    0.65 # was 0.75 — more headroom for torque-saturated corner peaks (P4)
     # ── Curvature-RATE (S-curve) speed limit ──────────────────────────────────
     # HardPath10 showed the worst CTE (|CTE| 0.176 vs 0.093 elsewhere, 16% rate-
@@ -55,8 +67,24 @@ path_follower_node:
     # headroom for feedback. Lower = slows more at S-curves. 0 = disabled.
     # NOTE: bounded below by v_ref_min_mps, so raise that floor's headroom if you
     # want deeper S-curve slowdowns.
-    curvature_rate_slew_budget_deg_s: 12.0
+    # Lowered 12 -> 6: at 12 the slew cap landed ~13 m/s and never bound on the
+    # gentle S at progress ~200 m (|dκ/ds| ~0.006 over the 3 m window); 6 re-arms
+    # it so the S lobes are actually slowed.
+    curvature_rate_slew_budget_deg_s: 6.0
     v_ref_min_mps:             3.0    # speed floor in profile [m/s]
+    # ── Constant-speed curve holding (Pass 1b) ────────────────────────────────
+    # A waypoint counts as "in a curve" if |kappa| exceeds this OR its speed was
+    # already limited below cruise. Contiguous in-curve waypoints form a zone that
+    # is frozen to its slowest point and not accelerated through (see s_turn /
+    # curve bridge below). 0.015 rad/m ~= R 67 m catches light turns too.
+    curve_hold_kappa_radpm:    0.015
+    # Two curve zones are MERGED into one (held at the slower of the two) when the
+    # near-straight gap between them is shorter than this. s_turn applies across a
+    # curvature SIGN REVERSAL (the inflection of an S, ~23 m on this path); curve
+    # applies between same-sign bends (noise / short straight). This is what stops
+    # the profile recovering speed at an S-turn inflection.
+    s_turn_bridge_m:           30.0
+    curve_bridge_m:            6.0
     # Forward lookahead applied to the speed profile (Pass 4 in buildSpeedProfile).
     # For each waypoint, scans ahead by max(v_ref * lookahead_s, 20 m) and sets
     # v_ref[i] to the minimum over that window. The 20 m floor ensures the scan
@@ -74,13 +102,22 @@ path_follower_node:
     # the longitudinal plant gain, so feedback only trims the residual. Offline
     # closed-loop sim on this bag: lag 1.25 s → 0.05 s, RMS 0.49 → 0.15 m/s.
     speed_feedforward_gain:  1.0    # scales the FF term (0 = disable, pure P)
-    # Longitudinal plant gain — asymmetric: +1 cmd ≈ 2.0 m/s² drive, -1 cmd ≈ 3.5 m/s²
-    # brake. The FF picks the gain by the sign of the demanded acceleration.
-    lon_accel_per_cmd:       2.0    # drive gain [m/s² per +cmd]
-    lon_decel_per_cmd:       3.5    # brake gain [m/s² per -cmd]
-    accel_max_mps2:          0.7    # max drive accel [m/s²] → maps to +1.0 cmd
-    decel_max_mps2:          0.7    # max brake decel [m/s²] → maps to -1.0 cmd
-    accel_cmd_rate_per_s:    200.0    # jerk limit: max cmd change per second (4.0 → 0.2/tick at 20 Hz)
+    # Longitudinal plant gain. The receiver (joystickd) maps our accel_cmd to
+    # physical accel by accel = clip(4.0*cmd, -3.5, +2.0): a SYMMETRIC 4.0 m/s²
+    # per unit cmd in the linear region; the 2.0/3.5 are downstream safety SATURATION
+    # caps, NOT gains. The old 2.0/3.5 here mistook the caps for the plant gain, so
+    # the FF (a_ff/gain) over-commanded drive by 4.0/2.0=2x → v_ego ran ~0.3 m/s
+    # above v_ref on every rising ramp (pure-P loop, no integrator, can't null it).
+    # Set both to the true 4.0 → FF inversion is exact both ways. We stay well inside
+    # the caps (accel_max 0.7 << 2.0), so the saturation asymmetry never bites.
+    lon_accel_per_cmd:       4.0    # drive gain [m/s² per +cmd]  (was 2.0)
+    lon_decel_per_cmd:       4.0    # brake gain [m/s² per -cmd]  (was 3.5)
+    accel_max_mps2:          0.7    # max drive accel [m/s²] → maps to +cmd via /lon_accel_per_cmd
+    decel_max_mps2:          0.7    # max brake decel [m/s²] → maps to -cmd via /lon_decel_per_cmd
+    # Backstop slew on accel_cmd. ×4 (receiver gain) → physical jerk cap = rate*4.
+    # 1.0 → 4 m/s³, above the FF's legitimate onset demand (~0.34 cmd/s) so it only
+    # clips disturbance/reversal spikes. Was 200.0 (= no-op, never bound).
+    accel_cmd_rate_per_s:    1.0    # [cmd/s]; ×4 = 4 m/s³ jerk backstop
 
     # ── Offset-free disturbance estimator (P1) ────────────────────────────────
     # A leaky integral of the CTE error: d_cte += ki·cte·dt. This is the whole

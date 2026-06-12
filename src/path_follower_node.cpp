@@ -138,6 +138,11 @@ public:
         declare_parameter("curvature_rate_slew_budget_deg_s", 0.0);  // 0 = disabled
         declare_parameter("v_ref_min_mps",            2.5);
         declare_parameter("speed_lookahead_s",        0.0);  // 0 = disabled
+        // Constant-speed curve holding (Pass 1b). 0 kappa = disabled.
+        declare_parameter("curve_hold_kappa_radpm",   0.0);
+        declare_parameter("s_turn_bridge_m",          0.0);   // bridge an S-turn inflection
+        declare_parameter("curve_bridge_m",           0.0);   // bridge same-sign bends
+        declare_parameter("speed_profile_jerk_mps3",  0.0);   // 0 = jerk-limiting (Pass 6) off
         // CTE integrator: cte_int_ += ki*cte*dt, frozen while saturated or in corners.
         // Warm-started to cte_drift_init so it skips the first-lap learning transient.
         declare_parameter("cte_integral_gain",  0.15);  // [1/s]
@@ -875,7 +880,11 @@ private:
             get_parameter("curvature_speed_margin").as_double(),
             get_parameter("v_ref_min_mps").as_double(),
             get_parameter("curvature_rate_slew_budget_deg_s").as_double() * (M_PI / 180.0),
-            get_parameter("speed_lookahead_s").as_double());
+            get_parameter("speed_lookahead_s").as_double(),
+            get_parameter("curve_hold_kappa_radpm").as_double(),
+            get_parameter("s_turn_bridge_m").as_double(),
+            get_parameter("curve_bridge_m").as_double(),
+            get_parameter("speed_profile_jerk_mps3").as_double());
         auto [kappa_max, v_min, v_max] = path_.speedProfileStats();
         RCLCPP_INFO(get_logger(),
             "Speed profile built: %.2f–%.2f m/s (min–max) over %.1f m. "
